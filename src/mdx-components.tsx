@@ -5,6 +5,9 @@ import { CorsFlow } from "@/components/widgets/CorsFlow";
 import { StatusCodeFinder } from "@/components/widgets/StatusCodeFinder";
 import { CacheFlow } from "@/components/widgets/CacheFlow";
 import { IdempotencyLab } from "@/components/widgets/IdempotencyLab";
+import { RequestJourney } from "@/components/widgets/RequestJourney";
+import { RoadmapExplorer } from "@/components/widgets/RoadmapExplorer";
+import { ConceptTranslator } from "@/components/widgets/ConceptTranslator";
 
 const components: MDXComponents = {
   // Wide tables scroll inside their own box instead of the page.
@@ -19,6 +22,9 @@ const components: MDXComponents = {
   StatusCodeFinder,
   CacheFlow,
   IdempotencyLab,
+  RequestJourney,
+  RoadmapExplorer,
+  ConceptTranslator,
 };
 
 export function useMDXComponents(): MDXComponents {

@@ -2,12 +2,20 @@ import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import GithubSlugger from "github-slugger";
+import { roadmapQuiz } from "./01-roadmap/quiz";
+import { pathQuiz } from "./02-path-of-a-backend-engineer/quiz";
+import { backendQuiz } from "./03-what-is-a-backend/quiz";
+import { principlesQuiz } from "./04-first-principles/quiz";
 import { httpQuiz } from "./05-http/quiz";
 import { lectures } from "./lectures";
 import type { Question } from "@/lib/types";
 
 /** Every lecture folder's quiz, keyed by folder name (e.g. "05-http"). */
 const quizzes: Record<string, Question[]> = {
+  "01-roadmap": roadmapQuiz,
+  "02-path-of-a-backend-engineer": pathQuiz,
+  "03-what-is-a-backend": backendQuiz,
+  "04-first-principles": principlesQuiz,
   "05-http": httpQuiz,
 };
 

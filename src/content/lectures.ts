@@ -8,7 +8,7 @@ export const lectures: Lecture[] = [
     summary: "The map of everything a backend engineer needs, and the order to learn it in.",
     videoUrl: "https://www.youtube.com/watch?v=0Rwb4Xmlcwc",
     minutes: 31,
-    available: false,
+    available: true,
   },
   {
     id: 2,
@@ -17,7 +17,7 @@ export const lectures: Lecture[] = [
     summary: "Why fundamentals beat frameworks.",
     videoUrl: "https://www.youtube.com/watch?v=3qFjZbFRSAU",
     minutes: 4,
-    available: false,
+    available: true,
   },
   {
     id: 3,
@@ -26,7 +26,7 @@ export const lectures: Lecture[] = [
     summary: "What a backend is, how a request reaches it, and why we need one.",
     videoUrl: "https://www.youtube.com/watch?v=6Ss4dJD9Kzg",
     minutes: 19,
-    available: false,
+    available: true,
   },
   {
     id: 4,
@@ -35,7 +35,7 @@ export const lectures: Lecture[] = [
     summary: "Concepts transfer across languages; syntax doesn't.",
     videoUrl: "https://www.youtube.com/watch?v=6fqZs5Z3k9A",
     minutes: 10,
-    available: false,
+    available: true,
   },
   {
     id: 5,

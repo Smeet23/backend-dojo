@@ -1,0 +1,60 @@
+## What backend engineering really is
+
+It's tempting to think backend work means "write CRUD endpoints". That's the visible 10%. The real job is building systems that are **reliable** (they keep working), **scalable** (they keep working with more users), **fault-tolerant** (they keep working when parts break) and **maintainable** (other people can keep them working for years).
+
+CRUD is where you start. Everything else in this course is what makes CRUD survive production.
+
+## Why learning it is hard
+
+There's no shortage of tutorials. The problem is **prioritising** and seeing **how the pieces fit together**. Most people learn in two ways that leave gaps:
+
+- **Learning by accident.** A college course, a bootcamp or one tutorial gets you started. After that you fill holes by trial and error for years.
+- **Learning through one framework.** If Express, Django or Rails is your whole world, you see every problem through that framework's lens. When your team moves to Go for performance, very little of your knowledge travels with you, because you knew the *framework*, not the *system underneath it*.
+
+<Callout kind="remember">
+This course goes the other way: **concepts first, framework second**. Concepts like "validate at the edge" or "never block a request on slow work" are true in every language.
+</Callout>
+
+## The map
+
+Here is the whole territory, grouped into five stages. Each stage answers one big question.
+
+<RoadmapExplorer />
+
+## A few previews worth knowing now
+
+Some ideas from later lectures are useful even before you get there.
+
+### Middleware order matters
+
+Middleware is code that runs before and after your handlers. A sensible default order is:
+
+1. **Logging**, so you see every request, even ones that fail later
+2. **Authentication**, to work out who's calling
+3. **Validation**, to reject bad input early
+4. **Route handler**, which does the actual work
+5. **Error handling**, which turns any failure into a consistent response
+
+### Push slow work to the background
+
+If a user clicks "delete all my data" and that touches 20 tables, don't make them wait. Respond right away ("we're on it") and put a **background job** on a queue to do the heavy lifting.
+
+### Three layers per request
+
+| Layer | Contains | Job |
+|---|---|---|
+| **Presentation** | Routes, validation, middleware, handlers | Accept input, send output |
+| **Business logic** | Services, domain rules | Decide what should happen |
+| **Data access** | Repositories, queries | Read and write storage |
+
+### Timing attacks are real
+
+If "wrong password" takes 200 ms (because you hash the password) but "unknown user" takes 2 ms (because you skip hashing), an attacker can tell which usernames exist just by timing your responses. Make both paths take the same time.
+
+### Concurrency vs parallelism
+
+**Concurrency** helps when you mostly **wait** (network, database, disk): I/O-bound work. **Parallelism** helps when you mostly **compute** (image resizing, encryption): CPU-bound work.
+
+## How to use this course
+
+Read each lesson, play with the widgets, then take the **scenario quiz**. The quizzes put you in real situations ("a user does X: which endpoint, which status code, why?") rather than asking for definitions. Questions you miss come back later in **Mixed practice** until they stick.

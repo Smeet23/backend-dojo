@@ -1,0 +1,55 @@
+## The problem
+
+Picture three situations:
+
+- You're a frontend developer asked to fix a bug in a backend you've never seen. The language is new, and you don't know **where to even start**.
+- You're building an API from scratch. How do you lay it out so it follows standards and doesn't fall apart later?
+- You've written TypeScript backends for years, and now the team moves to **Rust**. Do you start over?
+
+They're all the same question: **how do you reuse what you know in a new environment?** The answer is first principles, the habit of breaking a system into **small, universal building blocks**.
+
+## Benefit 1: Seeing the big picture
+
+Experienced engineers can glance at an unfamiliar codebase and say "the bug is probably in the auth middleware". That isn't magic. It's **pattern recognition**: they've seen routing layers, service layers and database code so many times that they spot them instantly, and they can tell what's core logic and what's noise.
+
+Most people pick this up slowly and without noticing over many years. You can learn it **deliberately**, by naming the patterns as you learn them.
+
+## Benefit 2: Faster onboarding
+
+If you understand HTTP, how requests flow through middleware, and how APIs talk to databases, a new codebase is mostly **familiar shapes with unfamiliar syntax**. You look for the router, the auth check, the data layer, and you're oriented in an hour instead of a week.
+
+## Benefit 3: Faster new projects
+
+Starting from scratch, you already know what a production system needs: routes, validation, DB connections, caching, error handling and logging. You can build an MVP with **production-quality structure** instead of copying a tutorial's boilerplate.
+
+## Benefit 4: Less syntax fatigue
+
+Learning a language is hard. Learning a language **and** the concepts at the same time is how people burn out. If the concepts are already solid, switching languages becomes "what's the idiomatic way to do X here?" for a list of X's you already know.
+
+### How to switch languages
+
+1. List the building blocks you already know: routing, middleware, validation, DB access, auth, logging, error handling.
+2. Start from the language's **community-recommended project layout**.
+3. Take **one block at a time**: "how does Rust do validation?" Find the standard library or crate, then apply the best practices you already know.
+4. Repeat until every block is done.
+
+<ConceptTranslator />
+
+## Benefit 5: Choosing the right tool
+
+Labels like "I'm a Node developer" make people reach for the same tool every time. If you understand the underlying **problem**, you pick the right tool for it:
+
+| Problem | Good fit |
+|---|---|
+| Fast caching, counters, rate limits | **Redis** |
+| Relational data with strong consistency | **Postgres** |
+| Flexible, document-shaped data | **MongoDB** |
+| High-volume event streaming | **Kafka** |
+
+## Benefit 6: More employable
+
+Teams want engineers who can **join any codebase** and contribute quickly, and who can reason about trade-offs rather than recite one framework's docs. Concepts that are the same in every backend (routing, databases, auth, errors) are exactly the ones worth mastering.
+
+<Callout kind="remember">
+First principles aren't a rulebook. They're a **map of the backend territory**: the same handful of building blocks, rearranged in every codebase you'll ever see.
+</Callout>

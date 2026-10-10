@@ -1,0 +1,97 @@
+## What a backend is
+
+At its simplest, a backend is **a computer listening for requests on an open port** that the internet can reach. Usually that's **80** (HTTP) or **443** (HTTPS). Clients connect to it to **send data** or **get data**, over HTTP, WebSockets, gRPC and so on.
+
+It's called a *server* because it **serves**: HTML, images and JavaScript files, or JSON from an API. It also accepts data clients send it.
+
+## The journey of a request
+
+Say your API lives at `api.notes.dev` on a cloud VM. When a browser asks for `/users`, the request passes through several hops before it reaches your code.
+
+### DNS
+
+The browser only has a **name**. DNS turns it into an **address**:
+
+- An **A record** maps a name to an **IP address** (e.g. `api.notes.dev → 54.210.10.7`).
+- A **CNAME record** maps a name to **another name** (e.g. `www.notes.dev → notes.dev`).
+
+### Firewall
+
+Cloud providers put a firewall in front of every machine. On AWS it's called a **security group**. It lists which ports are open to the internet. A typical web server allows:
+
+- **22**: SSH, so you can log in
+- **80**: HTTP
+- **443**: HTTPS
+
+If 443 isn't open, the request is dropped **before it ever reaches your machine**. Your app logs show nothing, and the browser just times out.
+
+### Reverse proxy
+
+A **reverse proxy** (commonly **Nginx**) sits in front of your app processes. It:
+
+- handles TLS certificates (often managed by Certbot) and redirects HTTP → HTTPS
+- routes by hostname: `api.notes.dev` → `localhost:3001`, `notes.dev` → `localhost:3000`
+- gives you **one central place** for routing, redirects and limits
+
+```nginx
+server {
+    server_name api.notes.dev;
+    location / {
+        proxy_pass http://localhost:3001;
+    }
+}
+```
+
+### Your app
+
+Finally the request reaches your process (Node, Go, Python…), kept alive by a process manager like **PM2** or systemd. From your app's point of view it's just serving `localhost:3001`. DNS, the firewall and Nginx are what make that reachable from the internet.
+
+<RequestJourney />
+
+<Callout kind="remember">
+When "the API is down", walk the hops in order: **DNS → firewall → proxy → app**. The symptom tells you where to look. A timeout points to the network or firewall. A `502` points to a proxy that's up while your app isn't.
+</Callout>
+
+## Why backends exist
+
+Think about liking a friend's photo:
+
+1. Your app sends a request: "user 17 liked post 902".
+2. The server works out **who you are**.
+3. It **saves** the like in a database.
+4. It finds **whose post** it was.
+5. It **notifies** that person's phone.
+
+Your phone only knows about you. Your friend's phone only knows about them. Something has to hold **shared state for everyone** and coordinate between users. That's the backend.
+
+**The backend's job, in one word: data.** Receiving it, storing it, fetching it, and everything in between.
+
+## Frontend vs backend: who runs the code?
+
+When you visit a frontend app, the server sends you **code** (HTML, CSS, JS). Your browser downloads it, **paints** the page once the CSS arrives, then **hydrates** it once the JS arrives, which is when buttons start working.
+
+| | Backend | Frontend |
+|---|---|---|
+| Server sends | **Results** of processing | **Code** to run |
+| Logic runs | On the **server** | In the **user's browser** |
+
+### The browser sandbox
+
+Browsers run code from strangers, so they **sandbox** it. A website's JavaScript can touch:
+
+- the DOM
+- browser storage (localStorage, cookies)
+- other domains' APIs, **only if those APIs allow it** via CORS headers
+
+It **can't** read your files or talk to other programs, and that's a good thing. Otherwise any website could read your hard drive.
+
+## Why not put backend logic in the frontend?
+
+1. **No file system or environment.** Backends write logs and read secrets from environment variables. Browsers forbid both.
+2. **CORS.** Backends call many third-party APIs. From a browser, you can only call APIs that explicitly allow your origin, and you don't control other people's APIs.
+3. **Databases.** Real database drivers need raw socket connections and binary protocols that browsers don't offer. Backends also keep a **connection pool**: a handful of open connections reused across thousands of requests. If every user's browser opened its own connection, the database would collapse. (And your database credentials would be shipped to every visitor.)
+4. **Compute.** Users show up on old phones and cheap laptops. A server's CPU and memory can be scaled up whenever you need; your users' devices can't.
+
+<Callout kind="warn">
+Anything sent to the browser is **public**. API keys, database passwords and business rules you must enforce all belong on the server.
+</Callout>
