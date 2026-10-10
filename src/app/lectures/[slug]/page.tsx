@@ -28,10 +28,18 @@ export default function LecturePage({ params }: PageProps<"/lectures/[slug]">) {
 
 async function LectureContent({ params }: { params: PageProps<"/lectures/[slug]">["params"] }) {
   const { slug } = await params;
-  const lecture = getLecture(slug);
-  const lesson = lessons[slug];
-  if (!lecture || !lesson) notFound();
+  if (!getLecture(slug) || !lessons[slug]) notFound();
+  return <LectureBody slug={slug} />;
+}
 
+/**
+ * Lesson content depends only on the slug, so it's cached. That lets <Link prefetch>
+ * fetch the whole lesson ahead of the click instead of only the loading fallback.
+ */
+async function LectureBody({ slug }: { slug: string }) {
+  "use cache";
+  const lecture = getLecture(slug)!;
+  const lesson = lessons[slug];
   const { Lesson } = lesson;
 
   return (

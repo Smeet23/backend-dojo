@@ -14,6 +14,7 @@ export function LectureList() {
       {last && (
         <Link
           href={`/lectures/${last.slug}`}
+          prefetch={true}
           className="mt-6 flex items-center justify-between rounded-xl bg-accent px-4 py-3 text-white dark:text-bg"
         >
           <span>
@@ -51,7 +52,7 @@ export function LectureList() {
           return (
             <li key={l.id}>
               {l.available ? (
-                <Link href={`/lectures/${l.slug}`} className="block rounded-xl border border-border bg-surface p-4 transition-colors hover:border-accent">
+                <Link href={`/lectures/${l.slug}`} prefetch={true} className="block rounded-xl border border-border bg-surface p-4 transition-colors hover:border-accent">
                   {body}
                 </Link>
               ) : (
