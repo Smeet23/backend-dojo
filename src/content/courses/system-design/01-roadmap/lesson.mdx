@@ -1,0 +1,156 @@
+import { SdRequirementsLens } from "@/components/widgets/SdRequirementsLens";
+
+## What system design is
+
+Every web product, at its core, is a client asking a server for something. **System design** is the work of making that conversation keep working as the product grows: more users, more data, users spread across continents, machines that crash, networks that drop packets.
+
+A design is judged on a handful of qualities:
+
+- **Scalability**: can it serve ten times the traffic by adding resources, without a rewrite?
+- **Latency**: how long does one request take, especially for the slowest users?
+- **Availability**: what fraction of the time does it answer at all?
+- **Reliability and correctness**: does it keep data safe and right when things fail?
+- **Security**: can only the right people reach the right data?
+
+There is rarely one correct design. A design is a set of **trade-offs** chosen to fit a particular set of requirements, and a good engineer can say *why* each piece is there and what it costs. That's also how design interviews are graded: not on matching a reference answer, but on the reasoning.
+
+## How the plan is organised
+
+A practical way to learn system design is a 12-week plan in three blocks:
+
+| Block | Weeks | Goal |
+|---|---|---|
+| Foundations (optional) | 1 to 4 | The computer-science basics every design leans on |
+| Core building blocks | 5 to 8 | Scaling, caching, databases, queues |
+| Design practice | 9 to 12 | Design thinking, patterns, real architectures, revision |
+
+The first block is optional. If you've prepared for coding interviews or have a CS background, a few days of revision replaces four weeks. The core block is where system design proper begins.
+
+## Foundations
+
+### Data structures
+
+A few structures keep showing up inside real systems:
+
+- **Hash maps**: the heart of caches, key-value stores and in-memory indexes.
+- **Stacks and queues**: queues model job pipelines and message brokers.
+- **Priority queues (heaps)**: schedulers, rate-limit timers, "top K" problems.
+- **B-trees**: how most relational databases index data on disk. Wide, shallow trees mean few disk reads per lookup.
+- **Tries**: prefix search and autocomplete.
+
+The point isn't to implement them, but to recognise *why* a database uses a B-tree, or why a cache is basically a giant hash map.
+
+### Networking
+
+Distributed systems are programs that talk over a network, so this is the most important prerequisite:
+
+- **HTTP vs HTTPS**: HTTPS is HTTP inside TLS encryption.
+- **TCP vs UDP**: TCP is reliable and ordered; UDP is fire-and-forget. Video calls and multiplayer games use UDP because a late packet is useless anyway. Most video streaming (including most "live" streams, delivered as HLS or DASH segments) runs over TCP, or QUIC, because a few seconds of buffering is acceptable.
+- **DNS resolution** and the **TCP three-way handshake**: what happens before the first byte of a request.
+- **REST APIs and status codes**: services rely on codes to decide what to do. A `503` says "retry later"; a `404` says "this doesn't exist, stop asking". Return the wrong one and a caller may retry pointlessly or give up on something that would have worked.
+- **Latency, throughput and bandwidth**: latency is how long one request takes, throughput is how many complete per second, bandwidth is the maximum data rate a link can carry. A highway analogy helps: bandwidth is the number of lanes, latency is the drive time, throughput is cars arriving per hour.
+
+### Operating systems
+
+- **Processes vs threads**: processes have separate memory; threads in one process share memory (and so share bugs, like race conditions).
+- **CPU scheduling and context switching**: why ten thousand threads is slower than ten.
+- **Blocking vs asynchronous I/O**: why Node.js or Go can hold thousands of idle connections cheaply.
+- **Virtual memory and paging**, **file systems and storage**: why disk is slow, why "fits in RAM" matters so much.
+
+### Databases
+
+Know the difference between **relational (SQL)** and **NoSQL** databases and when each fits, and be fluent with SQL queries and joins. When a design mentions Cassandra or DynamoDB, you should immediately know what you gain and what you give up compared with PostgreSQL.
+
+## Core building blocks
+
+### Week 5 scaling and load balancing
+
+- **Vertical vs horizontal scaling**: a bigger machine vs more machines.
+- **Load balancers**: **layer 4** (routes on IP and port) vs **layer 7** (reads HTTP paths, headers, cookies), and **DNS-based** balancing across regions.
+- **Health checks and failover**: stop sending traffic to dead servers.
+- **Consistent hashing**: spread keys across nodes so adding a node moves little data.
+
+### Week 6 caching
+
+- Why caching matters, and **Redis vs Memcached** (Redis has rich data types, persistence and replication; Memcached is a simpler, multithreaded string cache).
+- **Eviction policies**: LRU, LFU, FIFO.
+- **Write strategies**: write-through (cache and database together) vs write-back (cache first, database later).
+
+### Week 7 databases in depth
+
+- **Sharding / partitioning**: splitting data across machines once one machine can't hold it.
+- **Replication**: copies of the data. The most common setup is **single-leader**: one primary takes writes, read replicas serve reads. If the primary dies, a replica is promoted. (Multi-leader and leaderless designs exist too, at the cost of conflict handling.)
+- **CAP theorem**: during a network partition, choose consistency or availability.
+- **Strong vs eventual consistency**: a bank balance must be strongly consistent; a view counter showing 80k while the true number is 100k is fine, because it will converge.
+
+### Week 8 queues and messaging
+
+- **Message brokers** like Kafka and RabbitMQ.
+- **Synchronous vs asynchronous** communication between services.
+- **Publish/subscribe**: the concept underneath most brokers. Know the idea, not just the product names.
+- **Delivery guarantees and ordering**: at-most-once, at-least-once, effectively-once; per-partition ordering.
+- **Retries and dead-letter queues**: a message that keeps failing is moved aside to a DLQ so it doesn't block the rest, and engineers can inspect it later.
+
+## Design practice
+
+### Week 9 design thinking
+
+Before drawing any boxes:
+
+- **Clarify requirements.** Who uses it, how many, where, doing what? 1,000 users means a monolith on one server is perfect. 1 million users needs horizontal scaling and caching. Users on several continents add CDNs, regional deployments and data partitioning.
+- **Find the bottleneck.** Which resource runs out first: database writes, bandwidth, a hot key?
+- **Data flow and control flow.** Do services call each other directly, or communicate through events? If events, which broker and why?
+- **Stateful vs stateless.** Stateless servers keep nothing between requests, so any server can take any request. State goes into a shared store.
+- **Failure handling.** What happens when each component dies?
+
+<SdRequirementsLens />
+
+### Week 10 patterns
+
+- **Rate limiting**: any public API will be abused. Token bucket, leaky bucket and sliding window are the classic algorithms.
+- **Circuit breakers and retries**: stop hammering a failing dependency; retry with backoff when it's worth it.
+- **Leader election**: how replicas pick a new primary.
+- **Health checks and heartbeats**: how a system notices a dead node.
+- **CQRS and event sourcing**: separate the write model from read models, and store the history of changes as events instead of only the latest state.
+
+### Week 11 real architectures
+
+You can't study every product, and you don't need to. Most products are variations of a few **archetypes**:
+
+| Learn this | And you can design |
+|---|---|
+| Ride sharing (Uber) | Lyft, Ola, Rapido, food delivery dispatch |
+| Short video (Reels) | TikTok, YouTube Shorts |
+| Social feed (Twitter) | LinkedIn, Facebook, Instagram feeds |
+| E-commerce (Amazon) | Flipkart, eBay, Myntra |
+| Video platform (YouTube) | Netflix-style streaming |
+| URL shortener | Pastebin and other key-to-content services |
+
+The details change (a ride-sharing app needs geo indexing; a feed needs fan-out), but the bones are the same. The **URL shortener** is the most common entry-level interview problem, so practise it first. Spend extra weeks here if you can: breadth of practice is what builds design instinct.
+
+### Week 12 revision
+
+Summarise the common bottlenecks and their fixes, write notes on anything that confused you, and go deeper on weak spots.
+
+## Two habits that matter most
+
+<Callout kind="remember">
+**Always clarify requirements first.** The right design for 1,000 users is wrong for 100 million, and vice versa.
+</Callout>
+
+<Callout kind="warn">
+**Microservices are not the default answer.** They add network calls, deployment overhead and harder debugging. A well-structured monolith is the right call until scale or team size forces a split.
+</Callout>
+
+## Cheat sheet
+
+- System design is keeping client-to-server communication fast, reliable and secure as load grows.
+- There is no single right answer; there are trade-offs you can justify.
+- Foundations: hash maps, B-trees, TCP vs UDP, DNS, status codes, threads vs processes, SQL vs NoSQL.
+- Core blocks: scaling, load balancing, caching, sharding, replication, CAP, queues.
+- Latency is time per request; throughput is requests per second; bandwidth is link capacity.
+- Single-leader replication: one primary for writes, replicas for reads, promote on failure.
+- Dead-letter queues park messages that keep failing so they don't block the rest.
+- Learn archetypes (ride sharing, short video, feed, e-commerce, URL shortener), not every product.
+- Clarify requirements before drawing boxes; scale and geography drive the design.
+- Start with a monolith; split into services when scale or team size demands it.

@@ -1,0 +1,182 @@
+import { SdReplicationFailover } from "@/components/widgets/SdReplicationFailover";
+
+## Why replicate
+
+**Replication** means keeping copies of the same data on several database servers. The copies are called **replicas**. You do it for four reasons:
+
+- **Scale reads.** Most applications read far more than they write. Spreading reads across copies multiplies read capacity.
+- **Survive failures.** If the only database dies, so does your service, and possibly your data. A copy elsewhere lets you recover.
+- **Availability.** With a spare copy ready, an outage lasts seconds (a failover) rather than hours (a restore).
+- **Latency.** A copy in Europe serves European users without a round trip across the Atlantic.
+
+With a single database, every read and every write lands on one machine. As traffic grows it becomes a **bottleneck**, and it's always a **single point of failure**.
+
+## Leader and followers
+
+The most common setup is **single-leader** (also called primary/replica or leader/follower):
+
+- One node, the **leader** or **primary**, accepts all **writes**. It is the source of truth.
+- The other nodes, **followers** or **replicas**, copy every change from the leader and serve **reads**.
+
+```text
+          writes                    reads (nearest copy)
+ app ───────────────▶ primary ──┬──▶ replica 1 (Mumbai)
+                                ├──▶ replica 2 (Frankfurt)
+                                └──▶ replica 3 (Virginia)
+```
+
+A user in Asia writes to the primary and gets an acknowledgement; a user in Europe reading the same row moments later is served by the Frankfurt replica. Thousands of reads spread across replicas while writes go to one place.
+
+Two questions follow. What if the primary dies? And because there's still only one writer, what if writes outgrow it? The first is answered by **failover**, below. The second is not solved by replication at all: replicas add read capacity, not write capacity. Scaling writes needs **sharding** (splitting data across several leaders) or a multi-leader design.
+
+## How changes reach replicas
+
+### Logs, not tables
+
+Replicas don't periodically copy whole tables. A new replica starts from a **snapshot** (a backup of the primary at some log position), then continuously applies the **stream of changes** made after that position. That stream comes from the database's log.
+
+Every serious database writes changes to a **write-ahead log (WAL)** before applying them to its data files. The WAL exists first for crash safety: if the server dies mid-write, it replays the log on restart to reach a consistent state. Replication reuses it: ship the log to replicas and let them replay it.
+
+```text
+primary WAL:  ... | 0/16B3F20  UPDATE reels SET likes=150 WHERE id=7 | 0/16B3F98  INSERT ... |
+replica:      applied up to 0/16B3F20  → still shows likes=140
+```
+
+There are a few flavours of what gets shipped:
+
+| Method | What's shipped | Notes |
+|---|---|---|
+| Physical (WAL shipping) | Low-level byte changes to pages | Exact copy; replicas must run the same version (PostgreSQL streaming replication) |
+| Logical (row-based) | "Row with id 7 now has likes=150" | Works across versions and to other systems; basis of change data capture |
+| Statement-based | The SQL text itself | Breaks on non-deterministic SQL like `NOW()` or `RAND()`; mostly historical |
+
+<Callout kind="remember">
+The WAL is a recovery and replication mechanism, not a history feature. Old segments are recycled once they're no longer needed, so you can't use it to ask "what was this row three days ago". That's what audit tables or event sourcing are for.
+</Callout>
+
+## Sync, async and semi-sync
+
+The big design choice is **when the primary tells the client "your write succeeded"**.
+
+### Synchronous
+
+The primary waits until replicas confirm they have the change, then acknowledges. Any acknowledged write is guaranteed to exist on several machines, so a primary crash loses nothing.
+
+The costs: every write is as slow as the slowest replica, and if a replica is down or unreachable, writes **stall**. Waiting for *all* replicas is therefore rare in practice. Systems that need this guarantee usually wait for a **majority quorum** instead: with 5 nodes, the write commits once 3 have it, so the cluster keeps working with 2 nodes down. That's how consensus-based databases (built on Raft or Paxos, such as etcd, CockroachDB and Spanner) work.
+
+Typical users: banking ledgers, payments, anything where losing an acknowledged write is unacceptable.
+
+### Asynchronous
+
+The primary commits locally, acknowledges immediately, and streams changes to replicas in the background.
+
+Writes are **fast** and unaffected by slow or far-away replicas, so it scales easily, including across continents. The costs: replicas are **eventually consistent** (reads from them may be stale), and if the primary crashes, writes it acknowledged but hadn't yet shipped are **lost**.
+
+This is the default in most MySQL and PostgreSQL deployments, and it suits posts, comments, product views and like counts, where losing the last second of data in a rare crash is acceptable.
+
+### Semi-synchronous
+
+The primary waits for **at least one** replica (not all) to confirm it has **received** the change, then acknowledges. Other replicas catch up asynchronously.
+
+This guarantees every acknowledged write exists on at least two machines, at the cost of one round trip to the nearest replica rather than the slowest one. It's a popular middle ground (MySQL ships it as a plugin; PostgreSQL can name one synchronous standby). Reads from the other replicas are still eventually consistent: semi-sync improves **durability**, not read freshness.
+
+| | Synchronous / quorum | Semi-synchronous | Asynchronous |
+|---|---|---|---|
+| Ack after | All replicas, or a majority | One replica received it | Primary's own commit |
+| Write latency | Highest | Medium | Lowest |
+| Data loss on primary crash | None | None, if the confirming replica is promoted | Recent writes can be lost |
+| Replica down | All-replicas mode stalls; quorum tolerates a minority | Falls back or waits | No effect on writes |
+| Typical use | Ledgers, coordination stores | Orders, important business data | Social content, analytics, most web apps |
+
+<Callout kind="warn">
+Semi-sync does **not** stop two people buying the last item. If the stock check reads from an async replica that hasn't seen the previous sale, it can still oversell. Checks that must be correct (stock, balances, uniqueness) belong on the primary, inside a transaction or with a conditional update such as `UPDATE stock SET qty = qty - 1 WHERE sku = 'X' AND qty > 0`.
+</Callout>
+
+## Failover
+
+When the primary dies, a replica must take over:
+
+1. **Detect** the failure, usually by missed heartbeats for a few seconds. Too short a timeout causes needless failovers during a GC pause; too long means a longer outage.
+2. **Choose** a new primary, normally the replica with the most data (the highest log position), via a **leader election** among nodes or an external coordinator.
+3. **Reconfigure**: other replicas follow the new primary, and clients' writes are routed to it (a DNS change, a virtual IP, or a proxy).
+
+Two dangers come with it:
+
+- **Lost writes.** Under async replication, writes the old primary acknowledged but never shipped vanish with it. If the old primary comes back, those orphaned writes conflict with what the new primary has accepted since, and are usually discarded.
+- **Split brain.** If the old primary was only partitioned, not dead, two nodes may both think they're the leader and both accept writes. Prevent it by fencing the old leader (revoking its access, or rejecting writes carrying a stale leader epoch) before promoting a new one.
+
+<SdReplicationFailover />
+
+## Replication lag
+
+**Replication lag** is the delay between a write committing on the primary and becoming visible on a replica:
+
+```text
+lag(replica) = time the replica applied the change − time the primary committed it
+```
+
+Each replica has its own lag. It's measured in time (seconds behind) or in log distance (bytes or transactions behind). Lag is **not a bug**; with asynchronous replication it's normal and never exactly zero. Usually it's milliseconds. The question is what happens when it isn't.
+
+### What causes lag
+
+| Cause | Why it slows replicas |
+|---|---|
+| Network distance | A replica on another continent is at least one long round trip behind |
+| Heavy write volume | The primary produces changes faster than a replica can apply them |
+| Large transactions | A huge batch update must be shipped and applied in full before anything after it becomes visible |
+| Busy replicas | A replica saturated with read queries has less CPU and disk I/O left for applying changes |
+
+### What lag breaks
+
+Lag causes three anomalies that users notice:
+
+- **Reading your own write fails.** You post a comment, the page reloads from a replica that hasn't got it, and your comment has vanished.
+- **Time goes backwards.** Successive reads hit different replicas: the like count shows 140, then 80, then 120.
+- **Very stale data.** A replica that's minutes behind keeps serving a view count of 10,000 for a video that has a million.
+
+## Handling replication lag
+
+### Lag-aware read routing
+
+Continuously measure each replica's lag and set a **staleness threshold**. Route reads only to replicas under the threshold; if none qualify, send the read to the primary.
+
+```python
+def pick_node(replicas, primary, max_lag_s=2.0):
+    healthy = [r for r in replicas if r.lag_seconds() < max_lag_s]
+    return min(healthy, key=lambda r: r.load) if healthy else primary
+```
+
+A replica that falls behind during a spike is automatically taken out of rotation, given time to catch up, and returned when healthy. Make sure the primary can absorb the extra reads if every replica falls behind at once.
+
+### Read your own writes
+
+Guarantee that a user always sees **their own** changes, while everyone else may still read from replicas. Common implementations:
+
+- After a user writes, route **that user's** reads to the primary for a short window (say 10 seconds).
+- Remember the log position of the user's last write (in their session), and read only from a replica that has applied at least that position, otherwise from the primary.
+- Always read data the user owns (their profile, their settings) from the primary.
+
+Other users seeing your comment a second later is fine. You not seeing it is not.
+
+### Monotonic reads with sticky sessions
+
+Pin each user to **one replica** for a while, for example by hashing the user id to choose the replica. Their data may still be stale, but it's **consistently** stale: it can only move forward, never backwards. Seeing 140 likes three times in a row, then 150, is far less confusing than 140, 80, 120. If the pinned replica fails, the user must be moved to another, ideally one at least as far ahead.
+
+| Problem | Technique |
+|---|---|
+| Very stale replicas | Lag-aware routing with a threshold |
+| "My comment disappeared" | Read your own writes |
+| Values jumping backwards | Monotonic reads via sticky sessions |
+
+## Cheat sheet
+
+- Replication copies data to several nodes to scale reads, survive failures and cut latency.
+- Single-leader: all writes go to the primary; replicas apply its change log and serve reads.
+- Replicas add read capacity, not write capacity; writes scale with sharding.
+- Replicas start from a snapshot and then replay the WAL stream (physical or logical).
+- Synchronous or quorum loses no acknowledged writes but costs latency; async is fast but can lose recent writes.
+- Semi-sync waits for one replica: better durability, but reads from other replicas are still stale.
+- Failover: detect, promote the most up-to-date replica, repoint clients, and fence the old primary.
+- Lag comes from distance, write volume, big transactions and busy replicas.
+- Route reads by lag, read your own writes from the primary, and pin users to a replica for monotonic reads.
+- Correctness checks like stock or balances belong on the primary, not a replica.

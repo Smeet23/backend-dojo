@@ -1,0 +1,305 @@
+import { SdOtConflictLab } from "@/components/widgets/SdOtConflictLab";
+
+## What we are designing
+
+Google Docs is a **real-time collaborative editor**. Several people open the same document, type at the same time, and each sees the others' changes within a fraction of a second. Nobody presses "save", nobody gets a "this file was changed by someone else" dialog, and when the dust settles every screen shows exactly the same text.
+
+That last property is the hard part. Storing documents is easy; a document is a few hundred kilobytes of text. The interesting engineering is **concurrency**: two people editing the same version of the same paragraph at the same instant, over networks with different delays, and the system still converging on one sensible result.
+
+## Requirements
+
+### Functional requirements
+
+- Create, open, edit and share documents.
+- **Real-time collaborative editing**: many users edit one document simultaneously and see each other's changes live.
+- **Conflict resolution**: concurrent edits never corrupt the document, and all copies converge on the same text.
+- **Presence**: show who is in the document and where each person's cursor and selection are.
+- **Version history**: browse and restore earlier versions; undo and redo your own changes.
+
+### Non-functional requirements
+
+- **Low latency for your own typing.** Keystrokes must appear instantly, even on a slow connection.
+- **Fast propagation.** Other people's edits should show up within a few hundred milliseconds.
+- **Durability.** Once an edit is acknowledged, it must survive a server crash.
+- **Availability** across regions, and the ability to edit offline and sync later.
+
+## Scale estimates
+
+Assumptions (state them out loud in an interview, and let the interviewer adjust them):
+
+| Quantity | Assumption | Result |
+|---|---|---|
+| Daily active users | 100 million | |
+| Peak concurrent editors | 1% of DAU | 1 million |
+| Typing rate while editing | 5 characters per second | 5 operations per second per user |
+| Peak operations | 1M × 5 | **5 million ops/second** |
+| Size of one operation (compact JSON or binary) | about 50 bytes | |
+| Incoming bandwidth | 5M × 50 B | **about 250 MB/s** |
+| Documents | 2 per user × 100M users | 200 million docs |
+| Average document size | 100 KB | **20 TB** of current content |
+| Version history | about 5× the content | **about 100 TB** in total |
+
+Two conclusions shape the design:
+
+- The workload is **write-heavy and tiny-write-heavy**. Millions of 50-byte operations per second rule out "save the whole document on every keystroke".
+- Load is spread across **many documents**, each with only a few editors. No single document is huge, so we can give each active document a home on one server and scale by adding servers.
+
+In practice clients also batch: a burst of typing within, say, 50–100 ms is sent as one operation, which cuts the message rate several times.
+
+## Operations as the unit of change
+
+Instead of sending the document, clients send **operations**: small descriptions of one edit.
+
+```json
+{ "type": "insert", "pos": 0, "text": "A", "baseVersion": 0, "clientId": "c-17", "seq": 1 }
+{ "type": "insert", "pos": 1, "text": "B", "baseVersion": 1, "clientId": "c-17", "seq": 2 }
+{ "type": "delete", "pos": 1, "len": 1, "baseVersion": 2, "clientId": "c-17", "seq": 3 }
+```
+
+The fields that matter:
+
+- **type**: insert or delete (rich text adds "format" and others, but the ideas are the same).
+- **pos**: the character index the edit applies at.
+- **text** or **len**: what to insert, or how many characters to remove.
+- **baseVersion**: the document version the client was looking at when it made the edit. This is what makes conflict detection possible.
+- **clientId + seq**: lets the server deduplicate retries, so a resend after a dropped connection is not applied twice.
+
+The document at any version is simply "version 0, plus every operation in order". That gives us history and undo almost for free.
+
+## APIs
+
+Editing traffic flows over a **WebSocket**, because the server needs to push other people's edits to you continuously. Ordinary actions use plain HTTPS.
+
+```text
+REST
+POST /docs                       -> { docId }
+GET  /docs/{docId}               -> { snapshot, version }
+GET  /docs/{docId}/history       -> list of versions
+POST /docs/{docId}/share         { userId, role }
+
+WebSocket  wss://collab.example.com/docs/{docId}
+client -> server   { op, baseVersion, clientId, seq }
+server -> client   { ack, seq, version }                  // your op was accepted as version N
+server -> client   { op, version, author }                // someone else's op
+both directions    { presence: { userId, cursor, selection } }
+```
+
+## Why conflicts happen
+
+Start with `abcde` at version 0. Alice inserts `X` at position 2. At the same moment, Bob deletes the character at position 3 (the `d`). Both edits were made against version 0.
+
+If each side simply applies the other's operation as received:
+
+- Alice: `abXcde`, then "delete position 3" removes `c`, giving `abXde`.
+- Bob: `abce`, then "insert X at 2", giving `abXce`.
+
+The two screens now differ, and nothing will ever reconcile them. Worse, Alice's copy deleted the wrong letter. The positions in Bob's operation were computed for a document that no longer exists on Alice's side.
+
+The obvious fixes do not work well:
+
+| Approach | Problem |
+|---|---|
+| Lock the document (or paragraph) while someone types | Editors constantly wait for each other; not "real time" |
+| Last writer wins on the whole document | Silently throws away someone's work |
+| Send whole documents and diff them | Too much data at 5M ops/s; diffs are ambiguous |
+
+We need a way to **adjust an operation so it means the same thing on a document that has changed underneath it**. That is exactly what operational transformation does.
+
+## Operational transformation
+
+### Versions and the server log
+
+The server for a document keeps:
+
+- the current text and **current version** `n`;
+- the **operation log**: op 1, op 2, … op n, each the edit that produced that version.
+
+Every incoming operation says which version it was based on. If it is based on version `n`, nothing has happened since the client last synced, and it applies as-is. If it is based on an older version `k`, then ops `k+1 … n` happened concurrently, and the new operation must be **transformed** past each of them before it is applied.
+
+### The server algorithm
+
+```text
+handle(op):
+    if op.baseVersion > currentVersion:        # client claims a future the server never produced
+        reject and ask the client to resync
+    if seen(op.clientId, op.seq):               # a retry
+        re-send the ack, stop
+    for each logged op L with version in (op.baseVersion, currentVersion]:
+        op = transform(op, L)                   # shift it past L
+    apply op to the document
+    currentVersion += 1
+    append op to the log as currentVersion
+    ack the sender, broadcast op to every other client
+```
+
+The server sees operations in the order they arrive on the document's connection. That arrival order **is** the global order; the server does not need wall-clock timestamps, which cannot be trusted across machines anyway. Because each document has exactly one server applying its operations at a time, there is one authoritative sequence.
+
+### Transform rules
+
+`transform(op, against)` answers: "`against` has already been applied; how must `op` change so it still does what its author meant?" For plain text there are four pairs to handle. All examples start from `abcde` at v0, and the first operation to arrive is applied unchanged.
+
+**Insert vs insert.** Alice inserts `X` at 2, Bob inserts `Y` at 2. Alice's arrives first: `abXcde`. Bob's insert is at or after Alice's position, so it shifts right by the inserted length: insert `Y` at 3, giving `abXYcde`.
+
+**Delete, then a later insert.** Alice deletes position 1 (`b`), Bob inserts `X` at 3 (between `c` and `d`). After Alice: `acde`. Bob's position is after the deletion, so it shifts left by one: insert at 2, giving `acXde`. The `X` still lands between `c` and `d`.
+
+**Insert, then a later delete.** Alice inserts `X` at 2, Bob deletes position 3 (`d`). After Alice: `abXcde`. Bob's target moved right: delete position 4, giving `abXce`. The `d` is deleted, as Bob intended.
+
+**Delete vs delete.** Alice deletes position 1 (`b`), Bob deletes position 3 (`d`). After Alice: `acde`. Bob's target shifts left: delete position 2, giving `ace`. If both deleted the **same** character, the second delete becomes a no-op; the character is already gone.
+
+The general rule: **an edit before your position shifts you (right for inserts, left for deletes); an edit after your position does not.**
+
+**Range deletes** need two more cases. Start from `abcdefg`; Alice deletes 3 characters from position 2 (`cde`), giving `abfg`.
+
+- Bob inserted `X` at 6 (before `g`), **after** the deleted range: shift left by the range length, to 3. Result `abfXg`.
+- Bob inserted `X` at 3, **inside** the deleted range: there is no longer a "between `c` and `d`". The convention is to place it at the start of the deleted range, position 2. Result `abXfg`. Bob's character survives Alice's deletion rather than vanishing.
+
+### Tie-breaking
+
+Two inserts at the same position are ambiguous: should `X` or `Y` come first? It does not matter which rule you pick, but **every participant must pick the same way**. Common choices: the operation the server sequenced first wins, or the lower client ID wins. Without a deterministic tie-break, clients would order the two characters differently and diverge.
+
+<SdOtConflictLab />
+
+### The client side
+
+The server is half the story. Clients apply their own edits **optimistically**: your keystroke goes into your local document immediately, so typing never lags behind the network. That means the client also has to transform:
+
+1. Every local edit is applied at once and put in a **pending** queue.
+2. The client sends **one operation at a time** and waits for its ack. Keystrokes typed meanwhile are merged into a buffer and sent next.
+3. When an operation from someone else arrives, the client transforms it past its own pending (unacknowledged) edits before applying it, because those edits are in the local text but not yet in the server's sequence.
+4. When the ack arrives, the client moves to the next pending edit, now based on the version in the ack.
+
+Keeping just one operation in flight keeps the bookkeeping simple: the server only ever has to transform a client operation past other people's operations, and the client only past its own unacknowledged ones. This client-server style of OT (pioneered by the Jupiter system and used by Google Wave and Docs) is much simpler than fully peer-to-peer OT, which needs extra guarantees that are notoriously hard to get right.
+
+<Callout kind="remember">
+OT's guarantee is **convergence with intent preserved**: every copy ends up identical, and each edit still does what its author meant (inserted between the same characters, deleted the same letter). The central server's ordering is what makes that tractable.
+</Callout>
+
+## Cursors and presence
+
+If someone types above your cursor, your cursor must move with the text, or you would suddenly be typing in the middle of a different word. Cursors are just positions, so they get **the same transformation as operations**:
+
+| Remote edit | Effect on your cursor at position c |
+|---|---|
+| Insert of length L before c | c + L |
+| Delete of length L entirely before c | c − L |
+| Delete range that contains c | Move to the start of the deleted range |
+| Any edit after c | Unchanged |
+
+Other people's cursors and selections are **presence** data. They are sent over the same WebSocket but treated differently from edits:
+
+- They are **ephemeral**: kept in memory (or Redis with a short TTL), never written to the operation log.
+- They are **throttled**: sending a cursor update every 50–100 ms is plenty.
+- They are **lossy**: if one is dropped, the next one replaces it. No acks, no retries.
+- When a user disconnects, a heartbeat timeout removes their cursor.
+
+## CRDTs as an alternative
+
+**Conflict-free replicated data types** solve the same problem differently. Instead of transforming positions, a CRDT gives every character a **unique, permanent ID** (for example, a client ID plus a counter) and positions it relative to its neighbours' IDs. "Insert `X` after character `c17:42`" means the same thing no matter what else has been inserted or deleted, so operations can be applied in **any order** on any replica and still converge. Deleted characters are kept as hidden "tombstones" so later operations can still refer to them.
+
+| | OT | CRDT |
+|---|---|---|
+| Needs a central server to order ops | Practically yes | No; peer-to-peer and offline-first work naturally |
+| Metadata per character | None | An ID per character, plus tombstones |
+| Complexity lives in | Transform functions | The data structure |
+| Used by | Google Docs, many classic editors | Figma-style multiplayer, Yjs, Automerge, local-first apps |
+
+For a centrally hosted editor with an always-on server per document, OT is a natural fit and is what Google Docs uses. If offline editing for long periods or peer-to-peer sync is a core requirement, CRDTs are attractive.
+
+## Snapshots and version history
+
+The operation log is the source of truth, but replaying it from version 0 to open a document with 10,000 edits would be slow. So the system writes a **snapshot**, the full document text at some version, every N operations (say every 100 or 1,000).
+
+To load a document, or rebuild it after a crash:
+
+1. Load the latest snapshot, say the text at v1000.
+2. Fetch the operations after v1000 from the log.
+3. Replay only those, maybe a few dozen.
+
+### Data model
+
+```sql
+documents   (doc_id PK, owner_id, title, created_at, latest_version)
+permissions (doc_id, user_id, role)                      -- owner, editor, commenter, viewer
+snapshots   (doc_id, version, content, created_at)       -- PK (doc_id, version)
+operations  (doc_id, version, client_id, seq, op, author_id, created_at)  -- PK (doc_id, version)
+```
+
+Everything is keyed by `doc_id`, so it partitions cleanly by document. The operations table is append-only and huge; a wide-column store (Bigtable, Cassandra) or a sharded SQL database partitioned by `doc_id` both fit.
+
+**Version history** in the UI is built from the same data: named versions point at a snapshot or a version number, and "restore" creates a new operation that changes the text back; it never rewrites history.
+
+**Undo** in a shared document should undo **your** last change, not whoever typed most recently. The client keeps your own operations, computes the inverse (an insert's inverse is a delete of the same range), transforms that inverse past everything that happened since, and sends it as a new operation.
+
+## High-level architecture
+
+```text
+Browser (editor + client OT + pending queue)
+   │  WebSocket (ops, acks, presence)
+   ▼
+WebSocket gateway  ──►  Router: hash(docId) → collaboration server
+                                │
+                                ▼
+                     Collaboration server (one owner per active doc)
+                       • sequencer: arrival order = version order
+                       • OT engine: transform, apply, bump version
+                       • broadcast manager: fan-out to all editors
+                       │                 │                  │
+                       ▼                 ▼                  ▼
+                 Redis (hot ops,     Kafka (op log      Presence store
+                 active doc state)    stream)           (in memory, TTL)
+                                         │
+                         ┌───────────────┼──────────────┐
+                         ▼               ▼              ▼
+                  Persistence writer  Standby replica  Search / history
+                  (ops + snapshots     (follows the     indexers
+                   to the database)    stream)
+```
+
+### Component by component
+
+- **Client.** Applies edits locally, keeps the pending queue, transforms incoming operations, renders other people's cursors.
+- **WebSocket gateway.** Terminates TLS and holds millions of long-lived connections. It authenticates the user once at connect time and checks their permission on the document.
+- **Router.** Every editor of a document must reach **the same** collaboration server, because that server is the single sequencer for the document. The router maps `docId` to a server, typically with consistent hashing or a lookup in a coordination service.
+- **Collaboration server.** The heart of the system. For each active document it holds the current text, version and recent log in memory, runs the server algorithm above, acks the sender and fans the operation out to the other editors.
+- **Redis.** Holds hot state for active documents (recent operations since the last snapshot, the current version) so a replacement server can load quickly.
+- **Kafka.** Every accepted operation is written to a log partitioned by `docId`, which preserves per-document order. Consumers persist it, feed a standby, and drive indexing.
+- **Database.** Durable snapshots and the operation log, plus metadata and permissions.
+
+### Durability before the ack
+
+The server should **not ack an operation until it is durable**: written to Kafka (with replication) or the database. Otherwise a crash right after the ack would lose an edit the user believes is saved. The broadcast to other editors can happen in parallel.
+
+## Failover
+
+Collaboration servers fail. When one dies:
+
+1. Clients' WebSockets drop. They reconnect, and the router sends them to a new owner for the document.
+2. The new owner loads the latest snapshot plus recent operations (from Redis for speed, or the database), then replays any remaining operations from the Kafka partition to reach the last durable version.
+3. Each client resends its pending operations with their original `clientId` and `seq`. Operations the old server had already logged are recognised as duplicates and simply re-acked; the rest are transformed and applied normally.
+
+A **warm standby** that already consumes the document's stream can take over in seconds. Two servers must never sequence the same document at once (that would create two conflicting version histories), so ownership is granted with a lease and fencing, typically via a coordination service such as ZooKeeper or etcd.
+
+## Bottlenecks and trade-offs
+
+| Concern | Approach |
+|---|---|
+| One very popular document (thousands of viewers) | Separate viewers from editors; viewers get a read-only broadcast stream that can be fanned out by many servers |
+| Message rate | Batch keystrokes on the client; throttle presence |
+| Long offline sessions | OT with a large backlog of transforms gets slow; CRDTs handle this better |
+| Huge operation logs | Snapshots plus compaction; archive old operations to cheap storage |
+| Rich text (bold, tables, comments anchored to text) | More operation types and more transform pairs; the principle is unchanged |
+| Server ownership | Single sequencer per document is simple and consistent, at the cost of failover complexity |
+
+## Cheat sheet
+
+- Send operations (insert/delete, position, base version), never whole documents.
+- Estimates: 1M concurrent editors × 5 ops/s ≈ 5M ops/s, about 250 MB/s; 200M docs ≈ 20 TB, about 100 TB with history.
+- Concurrent edits made against the same version break positions; naive application diverges.
+- OT: transform a late operation past every op applied since its base version, then apply and bump the version.
+- An edit before your position shifts you; an edit after does not; inserts inside a deleted range snap to its start.
+- Ties need a deterministic rule that everyone applies identically.
+- Clients apply edits optimistically, keep one op in flight, and transform incoming ops past their pending ones.
+- Cursors are transformed exactly like operations; presence is ephemeral, throttled and lossy.
+- CRDTs give characters stable IDs so ops commute; no central server, more metadata.
+- Snapshot every N ops; recover by loading a snapshot and replaying the tail of the log.
+- Route every editor of a document to one collaboration server; ack only after the op is durable.

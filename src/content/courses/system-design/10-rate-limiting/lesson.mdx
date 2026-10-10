@@ -1,0 +1,145 @@
+import { SdRateLimiterCompare } from "@/components/widgets/SdRateLimiterCompare";
+
+## Why rate limit
+
+A **rate limiter** caps how many requests a client may make in a period of time, and turns away the excess. It protects a service in three ways:
+
+- **Against overload.** Every service has a capacity. Past it, latency climbs, queues fill, and soon *nobody* gets served. Rejecting the excess keeps the service healthy for the traffic it can handle.
+- **Against abuse.** Credential stuffing, scraping, and runaway scripts look like floods of requests from a few sources.
+- **For fairness and cost.** One heavy customer shouldn't starve the rest, and an expensive downstream (an SMS provider, a paid AI API) shouldn't receive more calls than your budget allows.
+
+Imagine a new link-shortening service sized for a few hundred requests a second. A popular post links to it and traffic jumps a hundredfold. Without a limiter, the servers fall over and the service is down for everyone. With one, the requests beyond capacity get a quick error while the rest succeed. Rejecting some requests is a far better outcome than failing all of them.
+
+## Where the limiter lives
+
+A limiter sits **between the client and the work it protects**. Common places:
+
+| Place | Good for |
+|---|---|
+| API gateway or reverse proxy (NGINX, Envoy, a cloud gateway) | Uniform per-IP or per-API-key limits before traffic reaches your code |
+| Middleware in the service | Limits that need app knowledge: per user, per plan, per endpoint |
+| In front of a costly dependency | Staying under a third party's quota |
+| The client itself | Polite backoff so you don't hit the server's limit at all |
+
+Each limit needs a **key** (what is counted: IP address, user id, API key, or a combination with the endpoint) and a **rule** (how many per what period).
+
+When a request is rejected, say so clearly so well-behaved clients can back off:
+
+```http
+HTTP/1.1 429 Too Many Requests
+Retry-After: 7
+RateLimit-Limit: 100
+RateLimit-Remaining: 0
+RateLimit-Reset: 7
+```
+
+## The algorithms
+
+Each algorithm below enforces "about 5 requests per 10 seconds" in a different way, and the differences show up in how they treat **bursts** and **boundaries**.
+
+### Leaky bucket
+
+Picture a bucket with a small hole in the bottom. Water (requests) can pour in at any speed, but it drips out at a **fixed rate**. If the bucket is full, new water spills over.
+
+In code, the bucket is a **FIFO queue** with a maximum size, and a worker takes one request off it at a constant rate:
+
+1. A request arrives. If the queue has room, it joins the end; otherwise it's rejected.
+2. Requests leave the queue, and get processed, at exactly the leak rate (say one per second).
+
+Example with capacity 3 and a leak of 1 per second: at t=0 four requests arrive. Three fill the bucket, the fourth is rejected. At t=1 one has drained, so one new request fits. At t=3, after two quiet seconds, two more have drained and one is still waiting, so of four new requests two fit and two are rejected.
+
+**Strength:** the output is perfectly smooth, which is ideal for protecting something that can only handle a steady pace (a legacy system, a payment processor). **Weakness:** bursts are never served faster; they wait in the queue, adding latency, and a short spike from a real user feels sluggish.
+
+### Token bucket
+
+A bucket holds **tokens**, up to a fixed capacity, and tokens are added at a fixed **refill rate**. Each request must take one token; if the bucket is empty, the request is rejected.
+
+Example with capacity 5 and a refill of 1 token per second:
+
+| Time | Event | Tokens after |
+|---|---|---|
+| 0–5 s | Idle; bucket fills to its cap | 5 |
+| 6 s | 5 requests: all allowed | 0 |
+| 6 s | 6 more requests: all rejected | 0 |
+| 7 s | 1 token refilled; 2 requests: 1 allowed, 1 rejected | 0 |
+| 10 s | 3 seconds of refill (capped at 5), so 3 tokens; 1 request allowed | 2 |
+
+The implementation is tiny: store two numbers per key, the token count and the last refill time, and compute the refill lazily when a request arrives.
+
+```python
+def allow(bucket, now, capacity=5, rate=1.0):
+    bucket.tokens = min(capacity, bucket.tokens + (now - bucket.last) * rate)
+    bucket.last = now
+    if bucket.tokens >= 1:
+        bucket.tokens -= 1
+        return True
+    return False
+```
+
+**Strength:** it allows **bursts up to the capacity** after quiet periods, which matches how real users behave (open an app, fire ten requests, then go quiet), while enforcing the refill rate over time. **Weakness:** two parameters to tune, and a full bucket lets a burst through all at once, so the protected service must tolerate bursts of that size. Token bucket is the most widely used algorithm in API gateways and cloud APIs.
+
+### Fixed window counter
+
+Split time into fixed windows (12:00:00–12:00:09, 12:00:10–12:00:19, ...) and keep one counter per key per window. Allow while the counter is under the limit; a new window starts at zero.
+
+It's cheap (one counter with an expiry, for example Redis `INCR` plus `EXPIRE`) and easy to explain. Its flaw is the **boundary burst**: 5 requests at 12:00:09 and 5 more at 12:00:10 are in different windows, so all 10 pass within about a second, double the intended rate.
+
+### Sliding window log
+
+Keep a **log of timestamps** of accepted requests for each key. When a request arrives:
+
+1. Remove timestamps older than `now − window`.
+2. Count what's left.
+3. If the count is under the limit, allow and append the timestamp; otherwise reject.
+
+Walk through it with a limit of 5 per 10 seconds and requests at 1, 2, 3, 4, 9, 10, 11 and 12 seconds. The first five are allowed (the window always holds fewer than five). At t=10 the window covers (0, 10] and still holds 1, 2, 3, 4 and 9, so it's rejected. At t=11 the window (1, 11] no longer includes the request at 1, leaving 2, 3, 4 and 9: four, so it's allowed. At t=12 the window (2, 12] holds 3, 4, 9 and 11, four again, so it's allowed too. (Whether the window's old edge is inclusive is a detail each implementation must pick and apply consistently.)
+
+**Strength:** exact; no boundary bursts. **Weakness:** memory grows with the limit and the traffic, since every accepted request is stored (in Redis, a sorted set per key), and every check trims and counts it.
+
+### Sliding window counter
+
+A practical middle ground. Keep only **two counters**: the previous fixed window and the current one. Estimate the rolling count by weighting the previous window by how much of it still overlaps the sliding window:
+
+```text
+estimate = previous_count × (1 − elapsed_in_current / window) + current_count
+```
+
+If the window is 10 s, we're 3 s into the current window, the previous window had 5 and the current has 1, the estimate is 5 × 0.7 + 1 = 4.5, so one more request fits under a limit of 5. It assumes requests in the previous window were spread evenly, so it's approximate, but the error is small in practice, memory is constant, and it kills the boundary burst. Large CDNs and gateways use this approach.
+
+<SdRateLimiterCompare />
+
+### Comparing them
+
+| Algorithm | Bursts | Boundary problem | Memory per key | Typical use |
+|---|---|---|---|---|
+| Leaky bucket | Queued and smoothed, never faster | No | Queue up to capacity | Shaping traffic to a fixed-pace backend |
+| Token bucket | Allowed up to capacity | No | Two numbers | General API limits; the common default |
+| Fixed window | Up to 2× limit at boundaries | Yes | One counter | Simple quotas (per day, per month) |
+| Sliding log | No | No | One timestamp per request | Low-volume, strict limits (logins, OTPs) |
+| Sliding counter | Approximately limited | No | Two counters | High-volume APIs needing smooth limits |
+
+## Rate limiting across many servers
+
+With one server, the counters live in memory. With twenty servers behind a load balancer, each would see only a slice of a user's traffic, and a limit of 100 per minute becomes 2,000. The counts must be **shared**, usually in Redis:
+
+- Do the read-check-update **atomically** (a Lua script, or `INCR` whose return value you check), otherwise two servers can both read 99 and both allow request 100.
+- Every request now costs a round trip to Redis, so keep the logic to one call, and decide what happens if Redis is unreachable: **fail open** (allow traffic, risk overload) or **fail closed** (reject, risk an outage). Most public APIs fail open.
+- Some systems keep approximate local counters and sync them periodically, trading a little accuracy for speed.
+
+This shared state is where the sliding log hurts most: storing and trimming a timestamp set per user in a shared store is far heavier than updating two counters.
+
+<Callout kind="tip">
+Rate limits are for protection and fairness, not exact billing. Being off by a request or two at the edges is fine; being down because the limiter added 20 ms to every request is not.
+</Callout>
+
+## Cheat sheet
+
+- A rate limiter rejects excess requests so the service stays up for the traffic it can handle.
+- Each limit has a key (IP, user, API key, endpoint) and a rule (N per period).
+- Reject with 429 Too Many Requests and a Retry-After header.
+- Leaky bucket: FIFO queue drained at a fixed rate; smooth output, bursts wait.
+- Token bucket: tokens refill at a rate up to a cap; allows bursts, two numbers per key, the common default.
+- Fixed window: one counter per window; cheap, but lets 2× the limit through across a boundary.
+- Sliding log: timestamps of every accepted request; exact, memory-hungry.
+- Sliding counter: weighted previous window plus current; near-exact with constant memory.
+- Across many servers, share counters in Redis and update them atomically; choose fail-open or fail-closed.

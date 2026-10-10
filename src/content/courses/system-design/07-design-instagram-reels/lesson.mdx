@@ -1,0 +1,325 @@
+import { SdReelPipeline } from "@/components/widgets/SdReelPipeline";
+import { SdLikeBatcher } from "@/components/widgets/SdLikeBatcher";
+
+## What we are building
+
+A short-video product like Instagram Reels or YouTube Shorts looks simple from the outside: a creator records a vertical clip, and viewers swipe through an endless, personalised stream where each video starts playing the instant it appears. Behind that swipe sit two almost independent systems:
+
+- an **upload path** that takes a raw phone video and turns it into something every device on every network can play, and
+- a **viewing path** that decides *which* reels you see, delivers them with no visible buffering, and records how you reacted.
+
+Engagement signals (watch time, likes, comments, shares) connect the two: they feed the ranking models that choose the next reels.
+
+### Functional requirements
+
+1. Creators upload short videos (say, up to 90 seconds).
+2. Uploaded videos are processed: transcoded into several qualities and segmented for streaming.
+3. Content is moderated before it can be shown.
+4. Each viewer gets a personalised feed.
+5. Playback starts instantly, including when swiping to the next reel.
+6. Engagement (views, watch time, likes, comments) is captured.
+7. Trending content is detected per region.
+
+### Non-functional requirements
+
+| Property | Target | Why |
+|---|---|---|
+| Playback start | Well under a second, ideally instant on swipe | A blank frame on swipe is the moment users leave |
+| Availability of viewing | Very high | Feeds can degrade (less personal, slightly stale) but must not go blank |
+| Durability of uploads | Never lose an acknowledged upload | Losing a creator's video is far worse than a slow upload |
+| Consistency of counts | Eventual is fine | A like count a few seconds behind harms nobody |
+| Consistency of ownership and status | Strong | A blocked or private reel must never leak into feeds |
+
+<Callout kind="remember">
+Different parts of one product need different guarantees. Reel status and ownership need strong consistency; like counts and trending lists can be seconds stale. Naming this early lets you pick the right store for each piece.
+</Callout>
+
+## Scale estimates
+
+Back-of-the-envelope numbers decide the architecture, so do them first. Assume:
+
+- 250 million daily active users
+- 30 reels watched per user per day (low for real users, fine for a sketch)
+- 7 MB delivered per view on average
+- 25 million uploads per day
+- about 40 MB stored per processed reel, counting every quality level
+
+| Quantity | Calculation | Result |
+|---|---|---|
+| Views per day | 250M × 30 | 7.5 billion |
+| Average view starts per second | 7.5B ÷ 86,400 | about 87,000/s |
+| Peak view starts per second | about 4–5× average | about 400,000/s |
+| Bytes served per day | 7.5B × 7 MB | about 52 PB |
+| Uploads per second | 25M ÷ 86,400 | about 290/s |
+| New processed storage per day | 25M × 40 MB | about 1 PB (before replication) |
+
+Two conclusions fall straight out of the table.
+
+First, **reads dwarf writes** by roughly 300 to 1. Every design decision should make reads cheap, even at the cost of extra work on upload.
+
+Second, **52 PB a day cannot come from your own servers**. Each view is not one request either: a reel is split into many small segments, so one "start" turns into a manifest fetch plus several segment fetches. That is millions of HTTP requests per second. This is a **CDN-dominated system**: the application servers decide *what* to play, and edge caches near the viewer deliver the bytes.
+
+## API sketch
+
+```http
+POST /v1/reels/uploads            -> { reel_id, part_urls: [...], part_size: 8388608 }
+POST /v1/reels/{reel_id}/complete -> 202 Accepted
+GET  /v1/feed/reels?cursor=abc    -> { items: [{ reel_id, manifest_url, caption, creator, stats }], next_cursor }
+PUT  /v1/reels/{reel_id}/like     -> 204   (idempotent: liking twice is still one like)
+DELETE /v1/reels/{reel_id}/like   -> 204
+POST /v1/reels/{reel_id}/comments -> 201 { comment_id }
+POST /v1/events                   -> 202   (batched watch events from the client)
+GET  https://cdn.example.com/v/{reel_id}/master.m3u8   (served by the CDN, not the API)
+```
+
+Notice that the video bytes never flow through the API in either direction. Uploads go straight to object storage through pre-signed URLs, and playback goes through the CDN.
+
+## Data model
+
+| Data | Store | Key or partitioning | Why this store |
+|---|---|---|---|
+| Reel metadata (creator, status, duration, visibility, caption, manifest path) | Distributed SQL (for example Spanner, CockroachDB, YugabyteDB) | Sharded by `reel_id`, secondary index on `creator_id` | Strongly consistent status and ownership, transactions, single-digit to low-tens of ms reads |
+| Raw and processed video | Object storage (S3-style) | Path by `reel_id` | Cheap, durable, effectively unlimited |
+| Likes (who liked what) | Wide-column or sharded SQL | Primary key `(reel_id, user_id)` | One small insert per like, duplicate-proof by key |
+| Comments | Wide-column or sharded SQL | Partition by `reel_id`, cluster by time | Each comment is its own row, read newest-first |
+| Reel stats (likes, views, comments, shares, watch time) | Distributed NoSQL | `reel_id` | Updated in batches, read via cache |
+| Follow graph | Graph store or adjacency tables | `user_id` | "Who does this user follow?" |
+| User and reel features, embeddings | Feature store (low-latency key-value) plus a vector index | `user_id`, `reel_id` | Ranking needs hundreds of features in milliseconds |
+| Trending lists, hot counters | Redis sorted sets and keys | Per region | Sub-millisecond reads |
+
+A reel's metadata row moves through a small **state machine**:
+
+```text
+INIT ──upload done──> UPLOADED ──worker picks it up──> PROCESSING ──┬──> READY
+                                                                    ├──> BLOCKED  (moderation)
+                                                                    └──> FAILED   (retries exhausted)
+```
+
+Only `READY` reels are playable or eligible for any feed. Every reader (feed service, playback authorisation, search) filters on that, which is why status lives in a strongly consistent store.
+
+### Generating reel ids
+
+Reels are created in many regions at once, so ids can't come from one auto-increment counter (a single point of failure and a bottleneck). A random UUID would be unique, but it isn't **sortable by time**, and time order is useful everywhere: newest reels first, range scans by creation time, rough age from the id alone.
+
+A **Snowflake-style id** solves both. It packs into 64 bits:
+
+| Bits | Field | Purpose |
+|---|---|---|
+| 1 | Sign bit, always 0 | Keeps the id a positive integer |
+| 41 | Milliseconds since a custom epoch | Time ordering; lasts about 69 years |
+| 10 | Region or worker id | Two generators can never collide |
+| 12 | Per-millisecond sequence | Up to 4,096 ids per worker per millisecond |
+
+Each generator works alone with no coordination, and sorting ids sorts reels by creation time. The one thing to watch is **clock drift**: if a machine's clock jumps backwards, it must wait or refuse to issue ids, or it could repeat one.
+
+## The upload path
+
+Uploading is split into four phases, each with a clear owner.
+
+### Phase A, start a session
+
+The app opens a TLS connection to the nearest region (anycast DNS or IP routes it there). The upload service validates the auth token, mints a reel id, inserts the metadata row with status `INIT`, and returns **pre-signed URLs**, one per part of the file.
+
+### Phase B, upload to object storage
+
+The client uploads the file **directly to object storage** as a multipart upload, for example in 8 MB parts. That has three benefits:
+
+- **No app server touches the bytes.** Your API fleet handles tiny JSON requests while storage handles the heavy traffic.
+- **Resumable.** On a flaky mobile connection only the failed part is retried, not the whole file.
+- **Durable by default.** The storage system replicates each part across racks or zones before it acknowledges.
+
+When the last part is in, the storage service (or the client calling `complete`) tells the backend. The backend sets status `UPLOADED` and publishes a `reel.uploaded` event to Kafka.
+
+The Kafka topic is partitioned by `hash(reel_id) mod N`. All events for one reel land on the same partition, so they're read **in order** by a single consumer at a time. "Uploaded" can never be processed after "deleted" for the same reel.
+
+### Phase C, transcode and segment
+
+A pool of transcoding workers consumes the topic. For each event a worker:
+
+1. sets status `PROCESSING`,
+2. downloads the raw file from object storage,
+3. runs an FFmpeg-style pipeline to produce a **bitrate ladder**: the same video at several resolutions and bitrates (240p, 360p, 480p, 720p, 1080p),
+4. cuts every rendition into short **segments** of about 2 seconds and writes a manifest (HLS `.m3u8` or DASH `.mpd`) listing them,
+5. runs moderation (vision and audio classifiers, plus hash matching against known bad content), and
+6. sets status `READY`, `BLOCKED` or `FAILED`, then publishes the result.
+
+Why a ladder of segments instead of one MP4? Because of **adaptive bitrate streaming (ABR)**. The player measures its throughput as it downloads. If a 720p segment took too long, it asks for the next segment at 360p; when the network recovers, it climbs back up. Switching only happens at segment boundaries, which is why every rendition is cut at exactly the same timestamps.
+
+Segment length is a trade-off:
+
+| Segment length | Start-up | Requests | Adaptation |
+|---|---|---|---|
+| Very short (under 1s) | Fastest first frame | Many requests, more overhead per byte | Reacts quickly |
+| 1–2 seconds | Fast | Moderate | Good, the usual sweet spot for short video |
+| 6–10 seconds | Slow first frame | Few requests | Sluggish to react to network changes |
+
+A 30-second reel at 2-second segments is 15 segments per rendition.
+
+<Callout kind="tip">
+Transcoding must be **idempotent**: the same input always writes the same output paths. Then a worker that crashes halfway can simply be retried, because Kafka redelivers unacknowledged events. After a few failed attempts the event goes to a dead-letter queue and the reel is marked `FAILED`.
+</Callout>
+
+### Phase D, replicate across regions
+
+Processed segments are copied **synchronously within a region** (several zones acknowledge before the write counts) and **asynchronously across regions**. The upload path prefers **durability over availability**: it's better to make a creator wait a few more seconds than to tell them "posted" and lose the video in a disaster.
+
+When the reel is `READY`, consumers of the `reel.ready` event react independently: the notification service tells followers, the recommendation pipeline computes the reel's embedding, and search indexes the caption.
+
+<SdReelPipeline />
+
+## The viewing path
+
+When someone opens the Reels tab, the feed service must return about 20 reels in a few hundred milliseconds, chosen from billions. Scanning a table is out of the question. Instead it works like a funnel: cheap steps narrow billions down to about a thousand **candidates**, then an expensive model ranks only those.
+
+### Candidate generation
+
+Three sources contribute candidates in parallel:
+
+| Source | How it works | Typical size |
+|---|---|---|
+| **Following** | Read the user's follow list from the graph store, then each followed creator's recent `READY` reels, newest first | Tens to hundreds |
+| **You may like** | Look up the user's embedding (a vector describing their taste) in the feature store, then ask a vector index for reels with nearby embeddings | 300–500 |
+| **Trending** | Per-region lists kept in Redis sorted sets, scored by engagement velocity and completion rate | Tens to hundreds |
+
+All candidates pass through **filters**: already watched, blocked or not `READY`, from a muted or blocked creator, not visible to this user. The result is a pool of roughly 1,000–1,500 reels.
+
+**Trending** is computed by a stream job, not on request. Engagement **velocity** compares views in the last few minutes with the reel's own baseline, so a small creator's sudden spike can trend even if a celebrity's older reel has more total views. The job writes results to Redis:
+
+```text
+ZADD trending:IN 9821.4 reel:7123 4410.0 reel:6650 ...
+ZREVRANGE trending:IN 0 99    -- top 100 for India
+```
+
+### Ranking
+
+For each candidate the ranking service gathers three groups of features from the feature store:
+
+- **User features**: average watch time, like rate, typical completion rate. A user who usually watches to the end can be shown longer, story-driven reels; one who swipes after two seconds does better with fast hooks.
+- **Reel features**: engagement velocity, global average watch time, category (dance, food, coding, memes), creator quality.
+- **Context features**: time of day, network speed, device class, country.
+
+A model then predicts several outcomes per candidate, for example the probability of watching at least 3 seconds, of watching to the end, of liking, of sharing. A weighted combination becomes the final score:
+
+```text
+score = w1·P(3s watch) + w2·P(complete) + w3·P(like) + w4·P(share) − w5·P(skip within 1s)
+```
+
+The top 20 are returned, usually after a **diversity** pass so you don't get five reels from the same creator in a row. Ranking is per user and per request, so your top 20 and mine are different.
+
+Network and device also matter at playback: the player picks its starting rung of the ladder from them. A low-end phone on a slow network starts at 240p or 360p rather than waiting for 1080p.
+
+### Instant playback on swipe
+
+The feeling of "it was already playing" is engineered, not luck:
+
+1. The feed response contains manifest URLs, not video.
+2. While reel 1 plays, the client **prefetches the first one or two segments of reels 2 and 3**, often at a modest bitrate. When you swipe, playback starts from local memory.
+3. The client batches watch events (reel id, seconds watched, completed, liked) and sends them to `POST /v1/events`, which publishes to Kafka for analytics, ranking features and counters.
+4. While you're still on the early reels, the feed service prepares the **next page** asynchronously, so the next 20 are ready before you need them.
+
+<Callout kind="tip">
+Prefetching has a cost: bytes downloaded for reels the user never watches. Clients limit it to the first few seconds of the next one or two reels, and back off on metered or slow connections.
+</Callout>
+
+## Likes, views and comments
+
+A viral reel might get 100,000 likes, 500,000 views and 5,000 comments **per minute**. The obvious implementation breaks:
+
+```sql
+UPDATE reel_stats SET like_count = like_count + 1 WHERE reel_id = 7123;  -- once per like
+```
+
+The problem isn't that the statement is slow. It's that **every like targets the same row**. Each update must take that row's lock, so they run one at a time, and replication then has to ship every one of them. One row can absorb a few hundred to a few thousand updates a second; 100,000 a minute on one celebrity reel causes lock queues, timeouts and replica lag that hurt everyone sharing that shard. This is the **hot row** (or hot key) problem.
+
+The fix separates two things the naive version mixes up: *recording who liked what* and *counting*.
+
+### Step 1, record the relationship
+
+Each like inserts one row into a likes table keyed by `(reel_id, user_id)`:
+
+```sql
+INSERT INTO likes (reel_id, user_id, created_at) VALUES (7123, 42, now())
+ON CONFLICT DO NOTHING;
+```
+
+This write is unavoidable: it's how you prevent double likes, support unlike, and show the red heart when you come back. But it's a **fresh insert** to a distinct key, with no read-modify-write and no shared row, so millions of them spread evenly across shards.
+
+### Step 2, publish an event
+
+The like service publishes `reel.liked {reel_id, user_id}` to an engagement topic in Kafka and returns immediately.
+
+### Step 3, aggregate in memory and flush
+
+A **stats aggregator** consumes engagement events, keeps per-reel counters in memory, and every 1–5 seconds flushes them:
+
+```sql
+UPDATE reel_stats SET like_count = like_count + 8341 WHERE reel_id = 7123;  -- one write per flush
+```
+
+Fifty thousand likes become one database write. After the flush, the aggregator also updates Redis, and **every read of a count comes from Redis**, around a millisecond, never from the stats database.
+
+<SdLikeBatcher />
+
+Two caveats keep this honest:
+
+- Kafka delivers **at least once**, so an aggregator that crashes after flushing but before committing its offset will re-count a batch. Either make the flush idempotent (store the last applied offset with the counter, in the same transaction) or accept small drift and run a periodic job that recounts from the likes table.
+- Counts are **eventually consistent**. That's the trade you chose in the requirements, and it's the right one for engagement numbers.
+
+### Views and comments
+
+**Views** are far more numerous than likes, so they're counted at **milestones** rather than continuously: a view event at 3 seconds, another on completion. The same aggregator batches them and refreshes Redis periodically. Watch time per reel is summed the same way, and it's one of the most valuable ranking features.
+
+**Comments** are rarer (views are much more common than likes, and likes much more common than comments) but each one has content, so each is its own row: `comment_id, reel_id, user_id, text, created_at`. The **comment count** still goes through the aggregator, exactly like likes.
+
+## End-to-end architecture
+
+```text
+UPLOAD
+  App ─▶ edge / LB ─▶ Upload service ─▶ Metadata DB (status=INIT)
+   │                        └─ pre-signed URLs
+   └──── multipart upload ───────────────▶ Object storage (raw)
+                    Upload service ─▶ Kafka: reel.uploaded
+  Transcode workers ◀─ Kafka ─▶ fetch raw ─▶ ladder + 2s segments + manifest ─▶ Object storage (processed)
+                    └─▶ Metadata DB (READY / BLOCKED / FAILED) ─▶ Kafka: reel.ready
+  Consumers of reel.ready: push notifications, embeddings, search index, cross-region replication
+
+VIEW
+  App ─▶ Feed service ─▶ candidates (follow graph, vector index, Redis trending)
+                     ─▶ filters ─▶ ranking model (feature store) ─▶ top 20
+                     ─▶ hydrate (Metadata DB: caption, creator, duration; Redis: counts)
+  App ─▶ CDN ─▶ (miss) origin shield ─▶ object storage       (manifests and segments)
+
+ENGAGEMENT
+  App ─▶ Engagement service ─▶ likes/comments tables + Kafka: engagement events
+  Stats aggregator ◀─ Kafka ─▶ batch ─▶ reel_stats DB ─▶ Redis counts ─▶ feed + ranking
+```
+
+## Bottlenecks and trade-offs
+
+**Hot reels at the CDN.** A reel going viral means millions of requests for the same segments within minutes. Edges cache them, and an **origin shield** (a mid-tier cache in front of object storage) makes sure that thousands of edge misses become one origin fetch per segment, not thousands.
+
+**Transcoding cost.** Producing every rung of the ladder for 25 million uploads a day is expensive. A common optimisation is to transcode the lower rungs immediately (so the reel can go live) and produce higher rungs only once a reel shows traction.
+
+**Storage tiers.** Most reels are watched heavily for a few days and rarely after. Lifecycle rules move old renditions to cheaper, slower storage; the raw original may be kept for re-transcoding with better codecs later.
+
+**Sharding by reel id.** Spreading by `reel_id` gives even load for reads of individual reels. But "list this creator's reels" now touches many shards, so it needs a secondary index (or a separate creator-to-reels table).
+
+**Celebrity fan-out.** When a creator with 50 million followers posts, pushing a notification to every follower at once is a thundering herd. Notifications are sent in throttled batches, and feeds pull a celebrity's new reels at read time rather than writing them into 50 million feeds.
+
+**Cold start.** A brand-new reel has no engagement history, and a brand-new user has no embedding. Systems reserve a slice of every feed for exploration: new reels are shown to small test audiences and promoted if their early completion rate is good.
+
+**Degrading gracefully.** If the ranking service is slow, fall back to a cached, less personalised feed (trending plus following). An imperfect feed beats a spinner.
+
+## Cheat sheet
+
+- Reels is read-heavy (about 300:1) and byte-heavy (tens of PB a day), so it's CDN-dominated.
+- Upload goes client to object storage via pre-signed multipart URLs; app servers never handle video bytes.
+- A metadata row tracks INIT → UPLOADED → PROCESSING → READY / BLOCKED / FAILED; only READY is playable.
+- Snowflake ids are time-sortable and need no coordination: 41-bit time, 10-bit worker, 12-bit sequence.
+- Kafka partitioned by reel_id keeps each reel's events in order on one consumer.
+- Transcoding makes a bitrate ladder cut into about 2-second segments, which enables adaptive bitrate streaming.
+- Replicate synchronously within a region and asynchronously across regions; uploads favour durability.
+- Feed is a funnel: candidates (following, embeddings, trending) → filters → ML ranking → top 20.
+- Prefetch the first segments of the next reels, and prepare the next feed page in the background.
+- Never update a hot counter per event: insert the relationship row, publish to Kafka, batch-count, serve from Redis.
+- Counts are eventually consistent and at-least-once; reconcile or make flushes idempotent.

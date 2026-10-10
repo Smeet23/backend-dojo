@@ -1,0 +1,256 @@
+import { SdEventDelivery } from "@/components/widgets/SdEventDelivery";
+import { SdEventReplay } from "@/components/widgets/SdEventReplay";
+
+## The problem with call chains
+
+Picture a shop's checkout built the straightforward way. The client calls the order service, and the order service calls everything else **synchronously**, one after another, waiting for each answer:
+
+```text
+client ─▶ order-service ─▶ payment-service   (wait)
+                        ─▶ inventory-service (wait)
+                        ─▶ notification-service (wait)
+                        ◀─ 200 OK to the client
+```
+
+This works, and for small systems it's often the right call. As the system grows, three problems appear.
+
+**Tight coupling.** The order service must know every downstream service's address, its request and response formats, its error codes, and how to retry it. Change the notification API and you have to change, test and redeploy the order service.
+
+**Cascading failure.** If the notification service is down, the order call fails, even though nothing about the order itself went wrong. One sick dependency makes the whole checkout look dead. Latency compounds the same way: the user waits for the *sum* of every downstream call.
+
+**Hard to extend.** Product wants an analytics service and a loyalty-points service to react to every order. Each one means editing the order service, which is the most critical code you own, and making it slower still.
+
+Event-driven architecture (EDA) attacks all three by changing *how services talk*. Instead of the order service calling others, it **announces what happened**, and anyone interested reacts.
+
+## What an event is
+
+An **event** is a durable, immutable record of something that has **already happened**.
+
+- **Past tense.** `OrderCreated`, `PaymentCaptured`, `InventoryReserved`. A fact, not a request.
+- **Immutable.** History doesn't change. If an order is later cancelled, you don't edit `OrderCreated`; you append `OrderCancelled`.
+- **Durable.** It's stored, so it survives crashes of the producer and the consumers.
+- **Replayable.** Because it's stored, a consumer can read it again: to recover from a bug, to rebuild a database, or to bootstrap a brand-new service from history.
+
+Contrast this with a **command** such as `ChargeCard`, which asks one specific service to do something and can be refused. An event can't be refused; it already happened. Consumers can only decide how they react.
+
+```json
+{
+  "event_id": "evt_01J9Z6K4Q",
+  "type": "OrderCreated",
+  "occurred_at": "2026-10-10T09:00:00Z",
+  "order_id": "ord_123",
+  "user_id": "u_42",
+  "total": 1200,
+  "currency": "INR"
+}
+```
+
+The `event_id` matters later: it's how consumers recognise a duplicate.
+
+## The building blocks
+
+Every event-driven system has the same four parts.
+
+```text
+ producers                 broker                      consumers
+ order-service ──┐   ┌──────────────────┐   ┌──▶ payment-service
+                 ├──▶│ topic: orders    │───┼──▶ inventory-service
+ user-service ───┘   │ topic: users     │   └──▶ email-service
+                     └──────────────────┘
+```
+
+### Producers
+
+A **producer** is any service that notices a state change and emits an event describing it. The order service commits the order, then publishes `OrderCreated`.
+
+The key property: **the producer doesn't know who consumes the event**. It doesn't hold their URLs, doesn't know their formats, and doesn't wait for them to finish. Adding a fifth consumer requires zero changes to the producer.
+
+<Callout kind="warn">
+"Fire and forget" is about the *consumers*, not the broker. A producer should still wait for the **broker** to acknowledge that the event is safely stored (in Kafka, `acks=all`). Otherwise a broker hiccup silently drops events.
+</Callout>
+
+### The broker
+
+The **event broker** sits in the middle. It accepts events from producers, stores them durably, delivers them to consumers, and handles retries, ordering and fan-out. You can think of it as **a persistent log plus a delivery engine**. Common choices behave quite differently:
+
+| Broker | Model | Delivery | Keeps events after delivery? | Good for |
+|---|---|---|---|---|
+| Kafka (also Redpanda, Kinesis) | Partitioned append-only log | Consumers **pull** and track their own offset | Yes, for a retention period | High throughput, replay, ordering per key, stream processing |
+| RabbitMQ | Queues and exchanges | Broker **pushes** to consumers, removes on ack | No, by default | Task queues, flexible routing, per-message acks |
+| SNS (often with SQS) | Pub/sub topic fanning out to queues | Push to each subscription | SNS no; each SQS queue holds its copy until consumed | Simple fan-out on AWS |
+
+Brokers are not magic. They crash too, so production brokers replicate data across several nodes; when a partition's leader dies, another replica takes over. Your clients must tolerate brief unavailability during that switch.
+
+### Consumers
+
+A **consumer** is a long-running process subscribed to one or more topics. When an event arrives it reacts: payment captures money, inventory reserves stock, email sends a receipt.
+
+Consumers **don't know the producer and don't know each other**. Payment has no idea inventory exists. Each reads events independently, at its own pace, so a slow email service doesn't slow payment.
+
+To scale one kind of consumer, you run several instances in a **consumer group**. The broker splits the work among them (in Kafka, each partition is read by exactly one member of the group). Different groups each get **every** event: that's how one event fans out to payment, inventory and email.
+
+### Topics
+
+A **topic** is a named, append-only stream of related events: `orders`, `payments`, `users`. Append-only means you add to the end; you never edit or delete in place (old events age out by retention policy).
+
+One topic usually holds several event **types** about the same entity. The `orders` topic might contain `OrderCreated`, `OrderPaid`, `OrderCancelled` and `OrderShipped`. A consumer subscribed to `orders` receives all of them and ignores the types it doesn't care about.
+
+Topics are split into **partitions** for parallelism. Events with the same key (say `order_id`) always land in the same partition, and order is guaranteed **only within a partition**. So `OrderCreated` for order 123 is always read before `OrderCancelled` for order 123, but there is no global order across orders, and you shouldn't need one.
+
+## Event processing patterns
+
+How much should an event carry, and is it a message or the database itself? Three common patterns answer that differently.
+
+### Event notification
+
+The event says *that* something happened and little else:
+
+```json
+{ "type": "OrderCreated", "order_id": "ord_123" }
+```
+
+Events are tiny, and the producer exposes almost nothing. The cost is **extra calls**: every consumer that needs details must call back to the order service, which reintroduces a runtime dependency (and a load spike on the order service whenever events burst). There's also a subtle race: by the time the consumer calls back, the order may have changed again.
+
+### Event-carried state transfer
+
+The event carries everything consumers need:
+
+```json
+{ "type": "OrderCreated", "order_id": "ord_123", "user_id": "u_42",
+  "items": [{ "sku": "BK-7", "qty": 2 }], "total": 1200, "currency": "INR" }
+```
+
+Consumers are **fully decoupled**: payment can charge, inventory can reserve, without calling anyone. Some consumers keep their own local copy of the data they need. The costs are bigger events, data duplicated across services, and the need to evolve the event schema carefully (add fields, don't rename or remove them), because many consumers parse it.
+
+### Event sourcing
+
+The most radical pattern: **the events are the source of truth**, and current state is derived by replaying them.
+
+A normal table stores only the latest state: `order 123, status SHIPPED`. Ask "what was its status on Tuesday?" or "how did the total become 900?" and the table can't answer; earlier values were overwritten.
+
+An event-sourced system stores the sequence instead: `Created`, `Paid`, `ItemRemoved`, `RefundIssued`, `Packed`, `Shipped`. Current state is a fold over that list, and any past state is a fold over a prefix of it.
+
+<SdEventReplay />
+
+What you gain:
+
+- a **complete audit trail** of every change and when it happened,
+- **time travel**: rebuild state as of any moment,
+- the ability to build **new read models** later by replaying history into a new table shaped for a new query.
+
+What it costs:
+
+- **Complexity.** Replay must apply every event, in order, with logic that handles every historical event version. Skip or misapply one event and the derived state is wrong.
+- **Replay time.** Long histories are slow to fold, so systems store periodic **snapshots** and replay only events after the latest one.
+- **Querying.** "All orders shipped last week" is hard against a raw event log, so event sourcing is usually paired with separate read-optimised projections (the CQRS pattern).
+
+Event sourcing fits domains where history *is* the product: ledgers, payments, wallets, audit-heavy workflows. It's overkill for a user's profile picture.
+
+## When things fail
+
+Failures will happen; the design goal is that they stay **isolated** and that work **resumes safely**.
+
+| Where | Examples |
+|---|---|
+| Consumer | Process crashes mid-event, an exception in handler code, its database is down |
+| Broker | A node crashes, a partition leader changes, brief unavailability |
+| Network | Timeouts, packet loss, a dropped connection between any two parties |
+
+With synchronous calls, any of these fails the user's request. With events, the order is already accepted; a crashed email consumer just catches up when it restarts, because the events are waiting in the broker.
+
+The hard part is a crash **in the middle**: the consumer did some work but the broker doesn't know whether it finished. What happens next depends on the **delivery semantics**.
+
+### At most once
+
+The consumer acknowledges (commits its offset) **before** processing. If it crashes mid-way, the broker believes the event was handled, and it's **lost**. Nothing is ever processed twice, and nothing is retried.
+
+Fine for data where losing a little is acceptable: metrics samples, debug logs, live-location pings that are superseded a second later.
+
+### At least once
+
+The consumer acknowledges only **after** processing. If it crashes before acking, the broker redelivers. Events are **never lost**, but a crash after the work and before the ack means the same event is processed **twice**.
+
+This is the default for most event-driven systems, and it comes with one hard rule: **consumers must be idempotent**. Processing an event twice must leave the same final state as processing it once. Common techniques:
+
+- Record processed `event_id`s in the consumer's own database, **in the same transaction** as the side effect, and skip any id already seen.
+- Use natural keys and upserts: `INSERT ... ON CONFLICT (order_id) DO NOTHING`.
+- Pass an **idempotency key** (the event id) to external APIs such as payment providers, which then ignore repeats.
+
+```sql
+BEGIN;
+INSERT INTO processed_events (event_id) VALUES ('evt_01J9Z6K4Q');  -- fails if seen before
+INSERT INTO charges (order_id, amount) VALUES ('ord_123', 1200);
+COMMIT;
+```
+
+### Exactly once
+
+The ideal: each event **affects state exactly once**, despite failures. Strictly speaking, no network can guarantee a message is *delivered* exactly once; a lost ack is indistinguishable from a lost message. What real systems offer is **effectively-once processing**: at-least-once delivery plus deduplication or transactions, so duplicates have no effect. Kafka's transactions give this for read-from-Kafka, write-to-Kafka pipelines; once you touch an external database or API, it's your idempotency logic that makes it true.
+
+Use it (meaning: invest in the idempotency to get it) wherever duplicates cost money: settlements, wallet balances, ledger entries.
+
+<SdEventDelivery />
+
+### Retries and dead letters
+
+Some events will never succeed: malformed JSON, a reference to a deleted user, a bug in the handler. Retrying such a **poison message** forever blocks everything behind it on the same partition. The usual pattern is to retry a few times with backoff, then move the event to a **dead-letter queue** (DLQ), alert someone, and continue. After a fix, events in the DLQ are replayed.
+
+## Publishing reliably
+
+There's a trap on the producer side too. The order service must do two things: commit the order to its database **and** publish `OrderCreated`. These are two different systems, so there's no single transaction across them:
+
+- commit, then crash before publishing: the order exists, but nobody ever charges or ships it;
+- publish, then the commit fails: payment charges for an order that doesn't exist.
+
+The standard fix is the **transactional outbox**. In the same database transaction as the order, insert the event into an `outbox` table. A separate relay process (or change-data-capture on the database log) reads the outbox and publishes to the broker, retrying until acknowledged. The event can now be published twice, but never lost, and consumers are already idempotent.
+
+```sql
+BEGIN;
+INSERT INTO orders (id, user_id, total) VALUES ('ord_123', 'u_42', 1200);
+INSERT INTO outbox (event_id, topic, payload) VALUES ('evt_01J9Z6K4Q', 'orders', '...');
+COMMIT;  -- both or neither
+```
+
+## Choreography and its limits
+
+When services coordinate purely by reacting to each other's events, it's called **choreography**: no one is in charge, each service knows only its own step.
+
+That's elegant, but some steps really do depend on others. Shipping must not start until payment succeeds. So shipping should react to `PaymentCaptured`, not to `OrderCreated`. And if payment fails *after* inventory already reserved stock, inventory needs to hear `PaymentFailed` and release it. This chain of local steps with **compensating actions** instead of one big transaction is a **saga**. When the flow gets long, teams often add an **orchestrator** that tracks the saga's state explicitly, because a business process smeared across ten services' event handlers becomes hard to follow.
+
+<Callout kind="remember">
+EDA trades immediate consistency for decoupling. Right after checkout, payment may not have run yet. Design the user experience for that ("Order received, confirming payment...") instead of pretending it's synchronous.
+</Callout>
+
+## When to use it
+
+EDA fits when **one action must trigger several independent reactions**, reliably, at scale, and without the producer knowing about them. Real examples:
+
+- **Social feeds.** A new post event fans out to the feed builder, the notification service and the recommendation pipeline. Those consumers can themselves emit events (`RecommendationsUpdated`) that others consume.
+- **E-commerce.** An order's life cycle (created, paid, packed, shipped, delivered, returned) flows as events between independent services, so one service being down delays a step instead of failing checkout.
+- **Streaming platforms.** Playback events feed recommendations, monitoring and analytics at enormous volume.
+- **Ride-hailing.** A trip's life cycle (requested, matched, started, completed, paid) is a stream of events that pricing, payments, safety and analytics each consume.
+
+It's the wrong tool when the caller **needs the answer now** ("is this username taken?"), for simple CRUD apps with one database, or for small teams that don't yet need the operational weight of a broker, schemas, DLQs and distributed debugging.
+
+| | Synchronous calls | Event-driven |
+|---|---|---|
+| Coupling | Caller knows every callee | Producer knows only the broker |
+| A downstream outage | Fails the request | Delays that consumer's reaction |
+| Adding a reaction | Change the caller | Add a consumer |
+| Consistency | Immediate | Eventual |
+| Debugging | One stack trace | Tracing across services and a broker |
+| Best for | Queries, steps needing an immediate answer | Fan-out, workflows, integration, analytics |
+
+## Cheat sheet
+
+- Synchronous call chains cause tight coupling, cascading failures and painful extension.
+- An event is an immutable, durable, replayable fact in past tense; a command is a request that can be refused.
+- Producers don't know consumers, but they should wait for the broker's acknowledgement.
+- Kafka keeps a replayable log with pull-based consumers; RabbitMQ pushes and deletes on ack; SNS fans out to queues.
+- Consumer groups scale one consumer type; separate groups each get every event.
+- Order is guaranteed only within a partition, so key events by the entity id.
+- Notification events are small but force callbacks; event-carried state is bigger but decoupled.
+- Event sourcing stores events as truth and derives state; great for ledgers, needs snapshots and projections.
+- At-most-once can lose events; at-least-once can duplicate them; exactly-once is at-least-once plus idempotency.
+- Make consumers idempotent with processed event ids, upserts or idempotency keys.
+- Use a transactional outbox so a DB commit and its event can't diverge; send poison messages to a DLQ.

@@ -1,0 +1,210 @@
+import { SdFencingLock } from "@/components/widgets/SdFencingLock";
+
+## Why a mutex isn't enough
+
+Inside one process, a **mutex** stops two threads from touching shared state at the same time. It works because both threads share memory and the same operating-system kernel, which arbitrates who holds the lock.
+
+Run the same code on ten servers and that machinery disappears. There is no shared memory and no shared kernel; each server's mutex only protects that server. Ten servers can each "hold the lock" for order 42 at once.
+
+A **distributed lock** restores mutual exclusion across machines: at most one process anywhere in the system may work on a given resource at a time. Think of it as a mutex that lives in a separate service every machine can reach.
+
+Without one, a payment platform with ten workers that all pick up order 42 might charge the customer ten times. With one, worker A acquires `lock:order:42` and charges the card, while B and C are told "taken" and move on.
+
+## Requirements
+
+Designing a lock service is a small system design problem. Start with what it must do.
+
+**Functional**
+
+- `acquire(resource, ttl)` returns success plus a token, or "taken".
+- `release(resource, token)` frees the lock, but only for the holder.
+- `renew(resource, token, ttl)` extends the lease while work is still going.
+- Locks must **expire on their own** if the holder crashes, so a dead client can't block everyone forever.
+
+**Non-functional**
+
+- **Safety**: at most one holder per resource at a time, as far as the lock service can guarantee.
+- **Availability**: the lock service is on the critical path of every protected operation, so it can't be a single point of failure.
+- **Low latency**: acquiring should add single-digit milliseconds, not hundreds.
+
+## Capacity estimate
+
+Take a mid-sized payments platform doing **50,000 transactions per second**, each wrapped in one lock.
+
+- **Operations**: each transaction is one acquire and one release, so 100,000 ops/s. Add about 20% for retries on contention and renewals: about **120,000 ops/s**.
+- **Concurrent locks**: a lock is held for about 80 ms (0.08 s). By Little's law, locks held at once = arrival rate × hold time = 50,000 × 0.08 = **4,000**. Not 50,000: most locks are released long before the next second starts.
+- **Storage per lock**: a resource key (~64 B), an owner token (a 36-character UUID), an expiry timestamp (8 B), a fencing token (8 B) and a state flag, plus Redis's own per-key overhead: call it **about 200 B**.
+- **Total memory**: 4,000 × 200 B ≈ **800 KB**.
+
+<Callout kind="tip">
+Memory is a non-issue; any cache instance holds that easily. The constraint is **throughput**: 120,000 ops/s is close to what one Redis primary handles comfortably. If you need more headroom, shard locks across several primaries by hashing the resource key, which is a job for consistent hashing.
+</Callout>
+
+## Data model
+
+Each held lock is one entry in a **lock table**. In Redis that's simply a key with a TTL; in ZooKeeper it's a node in its tree; in Postgres it's a row.
+
+| Field | Example | Purpose |
+|---|---|---|
+| Resource key | `lock:order:42` | What is being protected: one order, one SKU's inventory, one cron job. |
+| Owner token | `9f1c…e2` (random UUID) | Proves who holds it. Generated fresh on every acquire attempt, not a reusable client ID, so a retry is never confused with an earlier attempt. |
+| Expires at | `now + 30 s` | The lease. After this the lock is free even if nobody released it. |
+| Fencing token | `34` | A number that **only goes up**, incremented on every successful acquire of that resource. Used to reject stale holders (explained below). |
+| State | held / queued / expired | Used by implementations that queue waiters or clean up lazily. |
+
+## Lock lifecycle
+
+A lock moves through five states:
+
+1. **Unlocked**: the key doesn't exist; anyone may try.
+2. **Acquiring**: a client's atomic "set if absent" command is in flight.
+3. **Locked**: one client owns the key and its TTL is counting down. The holder renews it periodically while working.
+4. **Releasing**: the holder runs an atomic "delete if it's still mine".
+5. **Expired**: the TTL ran out without a release, usually because the holder crashed or stalled, and the store removed the key.
+
+If an acquire fails, the client **retries with backoff and jitter** (or gives up, depending on the use case) rather than hammering the lock service.
+
+## Acquiring atomically
+
+The naive "check, then set" has a race: two clients both `GET` the key, both see nothing, both `SET` it, and both think they won.
+
+Redis solves this with one command that tests and sets in a single step:
+
+```bash
+SET lock:order:42 9f1c-e2 NX PX 30000
+# OK    → you hold the lock for 30 s
+# (nil) → someone else does
+```
+
+- `NX` means "only set if the key does **not** exist".
+- `PX 30000` attaches a 30-second expiry **in the same command**. Setting the key and then calling `EXPIRE` separately is a classic bug: crash between the two and the lock never expires.
+
+This is atomic because Redis executes commands **one at a time** on a single thread. If 10,000 clients send that command for the same key in the same millisecond, Redis still processes them in sequence: the first gets `OK`, the other 9,999 get `nil`.
+
+Plain Redis has no built-in fencing counter, so a lock service typically pairs the acquire with an `INCR fence:order:42` inside one Lua script, and returns that number with the lock.
+
+## Releasing safely
+
+Releasing with a plain `DEL` is dangerous:
+
+1. Client A acquires the lock with a 30 s TTL.
+2. A stalls for 40 s (a long GC pause, a slow disk, a VM being migrated).
+3. The lock expires and client B acquires it.
+4. A wakes up, finishes, and runs `DEL lock:order:42`, **deleting B's lock**.
+5. Client C acquires it while B is still working. Now B and C both "hold" the lock.
+
+The fix is to delete **only if the value is still your own token**. That check-then-delete must itself be atomic, so it runs as a Lua script, which Redis executes without interleaving any other command:
+
+```lua
+-- KEYS[1] = lock key, ARGV[1] = my owner token
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0  -- not mine any more; leave it alone
+end
+```
+
+Renewal uses the same pattern: "if the value is still mine, `PEXPIRE` it".
+
+## Leases and renewal
+
+Choosing the TTL is a trade-off:
+
+- **Too short**: a slightly slow task loses its lock mid-work.
+- **Too long**: when a holder crashes, everyone waits for the full TTL before anyone can proceed.
+
+The usual answer is a **moderate TTL plus a heartbeat**. For example, a 30 s TTL renewed every 10 s (about a third of the TTL) by a background thread or goroutine while the work runs. If the process crashes, renewals stop and the lock frees itself within 30 s. If the work finishes, the client releases immediately.
+
+<Callout kind="warn">
+Renewal can't save a client that is **frozen**. A stop-the-world GC pause freezes the renewal thread too. When the process resumes, its lease may have expired long ago, and nothing in the process knows that.
+</Callout>
+
+## Fencing tokens
+
+Even with atomic acquire, safe release and renewal, a lock **alone cannot guarantee** that only one client touches the resource. The paused client is the reason:
+
+1. A acquires the lock and gets fencing token **33**.
+2. A starts writing, then freezes in a long pause.
+3. The lease expires. B acquires the lock and gets token **34**, then writes.
+4. A wakes up, still believing it holds the lock, and writes again.
+
+Step 4 is invisible to the lock service: A never talks to it again. The only component that sees A's late write is the **resource itself**, so that's where the check must live.
+
+- Every write to the protected resource carries the holder's fencing token.
+- The resource remembers the **highest token it has accepted** for that key.
+- Any write with a **lower** token is rejected as stale.
+
+```sql
+-- Orders table keeps the highest fence seen per order
+UPDATE orders
+SET status = 'charged', fence = 34
+WHERE id = 42 AND fence < 34;   -- 0 rows updated means: you're stale
+```
+
+When A arrives with 33 after B has written 34, the update matches zero rows and A's write is refused.
+
+<Callout kind="remember">
+Fencing tokens are checked by the **protected resource** (database, storage service, downstream API), not by the lock service or the application. If the resource can't check them, the lock is a performance optimisation that prevents most duplicates, not a correctness guarantee.
+</Callout>
+
+<SdFencingLock />
+
+## Expiry and cleanup
+
+Redis removes expired keys by itself, so with Redis there's nothing extra to build.
+
+If you keep the lock table in a relational database instead, nothing deletes old rows for you. You add a **background sweeper**:
+
+- Index the `expires_at` column.
+- Every 1–5 seconds, find rows where `expires_at` is earlier than now, mark them expired or delete them, and notify the next waiter for that resource if you keep a queue.
+- Make the sweeper **idempotent**. If two sweeper instances run, or one crashes halfway and reruns, processing the same expired row twice must be harmless.
+
+Even with a sweeper, acquire logic should treat a row whose `expires_at` has passed as free; the sweeper is housekeeping, not the source of truth.
+
+## Making the lock service reliable
+
+The lock service must itself be distributed, or it becomes the single point of failure for everything it protects. But as soon as it has several nodes, those nodes must **agree on who holds each lock**, which is a consensus problem. There are three common levels:
+
+| Setup | How it works | Latency | Risk | Good for |
+|---|---|---|---|---|
+| **Single Redis primary** with async replicas | All locks on one node; replicas copy it a few ms later | Under 1–2 ms | If the primary dies before replicating, a promoted replica has never heard of the lock and grants it again | Locks that prevent wasted work, where a rare duplicate is tolerable |
+| **Redis with Sentinel** | Sentinels monitor the primary and, by a quorum vote, promote a replica within seconds | Same | Higher availability, but replication is still async, so the same lost-lock window exists on failover | High availability with simple operations, when an occasional double grant is acceptable |
+| **Consensus store** (etcd, ZooKeeper, Consul) | Each acquire is written to a replicated log and committed by a **majority** before the client hears "yes" | A few ms more, one quorum round trip | No lock is lost on failover; still need fencing for paused clients | Payments, leader election, critical infrastructure (Kafka and HDFS rely on ZooKeeper-style coordination) |
+
+In the consensus case, the flow looks like this: the leader receives the acquire, appends it to its log, sends it to all followers in parallel, waits for a majority to acknowledge, commits, and only then replies. A failover can only promote a node that already has every committed entry.
+
+These stores also hand you fencing tokens for free: etcd's **revision** number and ZooKeeper's **zxid** increase monotonically with every write.
+
+<Callout kind="warn">
+Redis's **Redlock** algorithm acquires the lock on a majority of independent Redis nodes to survive one failing. It narrows the failover gap, but it relies on clocks and bounded pauses, and it provides no fencing token, so it still can't protect against the paused client. For correctness-critical locks, prefer a consensus store plus fencing.
+</Callout>
+
+## Putting it together
+
+A production lock service usually has four layers:
+
+1. **Client SDK** inside every service. It wraps acquire with retries and backoff, runs the renewal heartbeat, performs the safe Lua release, and attaches the fencing token to downstream writes. These details are subtle enough that you write them once, in a library, rather than in every team's code.
+2. **Lock service**: Redis with replicas and Sentinel when an occasional duplicate is tolerable, or an etcd or ZooKeeper cluster when it isn't. Writes go to the primary or leader; replicas are standbys.
+3. **Protected resource**: the database, job queue or external API. It stores the highest fencing token per resource and rejects anything lower.
+4. **Observability**: the signals that tell you the system is healthy.
+
+| Metric | Healthy | A spike means |
+|---|---|---|
+| Lock wait time (p99) | A few ms | Contention on hot resources, or the lock service is overloaded |
+| Renewal failure rate | ~0% | Clients can't reach the lock service and are about to lose leases |
+| Fencing rejections | ~0 | Zombie clients are waking up after their lease expired: investigate pauses and TTLs |
+| Expired-not-released locks | Low | Clients are crashing or stalling mid-work |
+
+## Cheat sheet
+
+- A mutex only protects one process; across machines you need a lock held in a shared service.
+- Acquire with one atomic command, `SET key token NX PX ttl`; never set and expire separately.
+- Each acquire gets a fresh random owner token; release with a Lua compare-and-delete, never a plain `DEL`.
+- The TTL is a lease: it frees locks from crashed holders. Renew at about a third of the TTL while working.
+- A paused client can outlive its lease and write anyway; only fencing tokens checked by the resource stop it.
+- Fencing tokens increase on every acquire; the resource rejects writes with a lower token than it has seen.
+- Concurrent locks = rate × hold time; memory is tiny, throughput is the real limit.
+- Async-replicated Redis (alone or with Sentinel) can lose a lock on failover; fine for efficiency locks.
+- Correctness-critical locks use a quorum store (etcd, ZooKeeper) plus fencing.
+- DB-backed lock tables need an idempotent expiry sweeper; Redis expires keys itself.
+- Monitor lock wait time, renewal failures and fencing rejections.

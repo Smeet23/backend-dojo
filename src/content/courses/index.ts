@@ -3,6 +3,8 @@ import type { ComponentType } from "react";
 import type { Course, Lecture, Question } from "@/lib/types";
 import { course as backendCourse, lectures as backendLectures } from "./backend/lectures";
 import { lessons as backendLessons } from "./backend/registry";
+import { course as system_designCourse, lectures as system_designLectures } from "./system-design/lectures";
+import { lessons as system_designLessons } from "./system-design/registry";
 
 export type CourseContent = {
   course: Course;
@@ -13,4 +15,5 @@ export type CourseContent = {
 /** Every course, in display order. */
 export const courses: CourseContent[] = [
   { course: backendCourse, lectures: backendLectures, lessons: backendLessons },
+  { course: system_designCourse, lectures: system_designLectures, lessons: system_designLessons },
 ];

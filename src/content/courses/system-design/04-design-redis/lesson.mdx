@@ -1,0 +1,324 @@
+import { SdRedisEncodingLab } from "@/components/widgets/SdRedisEncodingLab";
+import { SdRedisPersistenceLab } from "@/components/widgets/SdRedisPersistenceLab";
+import { SdHashSlotMapper } from "@/components/widgets/SdHashSlotMapper";
+
+## What we are designing
+
+Redis is an **in-memory key-value store**. Every key and value lives in RAM, and the server answers most commands in well under a millisecond. That one decision, RAM instead of disk, explains nearly everything else in this lesson: why Redis is fast, why its capacity is capped, why it needs eviction, and why persistence is an optional add-on rather than the default.
+
+The most common place you meet it is as a **cache in front of a database**:
+
+1. The app server receives a request and asks Redis for the key.
+2. **Cache hit**: Redis has it, and the answer comes back in about a millisecond.
+3. **Cache miss**: the app queries the database, writes the result into Redis (usually with a TTL), then responds. The next request for that key is a hit.
+
+But Redis is more than a cache. Because it has real data structures (lists, sets, sorted sets, hashes, streams) and atomic commands on them, it is also used for leaderboards, rate-limit counters, session stores, job queues, pub/sub and distributed locks. Some teams even run it as a primary store for data they can afford to lose a second of. Whether that is safe depends entirely on the persistence and replication settings we cover below.
+
+<Callout kind="remember">
+Redis is fast because the data is in memory **and** because a single thread executes commands without locks. Keep both reasons in mind; most of the design follows from them.
+</Callout>
+
+## Requirements
+
+Treat this like any design exercise and pin down what the system must do before drawing boxes.
+
+### Functional requirements
+
+- `GET`, `SET` and `DEL` on string keys, plus rich types: lists, hashes, sets, sorted sets.
+- Expiry per key (`EXPIRE`, `SET ... EX 60`).
+- Atomic operations: `INCR`, `SETNX`, and multi-step scripts that nothing can interleave with.
+- Optional durability so a restart does not mean an empty server.
+
+### Non-functional requirements
+
+- **Latency**: sub-millisecond for simple commands at the server.
+- **Throughput**: hundreds of thousands of operations per second per node.
+- **Memory efficiency**: RAM is expensive, so every byte of overhead matters.
+- **Availability**: a node failure should not take the cache down for long.
+
+## Scale estimates
+
+### Throughput
+
+A single Redis process typically handles **100,000 to 500,000 simple operations per second**, and more with pipelining. What moves that number:
+
+- **Command complexity.** `GET` and `INCR` are O(1). `ZRANGE` over thousands of members, `SMEMBERS` on a huge set or `KEYS *` are O(n) and hog the one execution thread. Redis has no joins; the expensive commands are the ones that touch many elements.
+- **Network.** At these rates, round trips usually dominate. A client that sends one command and waits for the reply before sending the next is bounded by RTT, not by Redis. Pipelining (sending many commands before reading replies) fixes that.
+- **Hardware.** Single-core speed matters more than core count, because one core executes commands.
+
+### Latency
+
+Server-side execution of a simple command is a few microseconds. End-to-end latency, including the network hop inside a data centre, is typically **under 1 ms**. That is why Redis backs real-time features such as game leaderboards (sorted sets), live counters and session lookups on every request.
+
+### Memory
+
+All data must fit in RAM, so **RAM is your capacity**. On a 64 GB machine you do not get 64 GB of data:
+
+| Consumer | Rough share |
+|---|---|
+| Operating system and other processes | a few GB |
+| Redis per-key overhead (object headers, hash table buckets, expiry entries) | tens of bytes per key |
+| Headroom for fork during snapshots (copy-on-write) | up to the size of pages rewritten during the snapshot |
+| Your actual data | what is left |
+
+A safe rule is to set `maxmemory` well below physical RAM, often 60–75%, when persistence is on. If your data set will grow to 70 GB and the node has 64 GB, you have two choices: **evict** or **shard** across more nodes.
+
+## Eviction policies
+
+When used memory reaches `maxmemory`, Redis applies the `maxmemory-policy` on each write that needs more space:
+
+| Policy | What it evicts | Good for |
+|---|---|---|
+| `noeviction` | Nothing; writes fail with an OOM error | Data you must not silently lose: counters, queues, locks |
+| `allkeys-lru` | Least recently used key, from all keys | General caches, sessions |
+| `allkeys-lfu` | Least frequently used key | Caches with a stable hot set |
+| `volatile-lru` / `volatile-lfu` | Same, but only among keys with a TTL | Mixed instance: cache keys have TTLs, permanent keys do not |
+| `volatile-ttl` | Key closest to expiring | Data whose TTL reflects its value |
+| `allkeys-random` / `volatile-random` | Any key at random | Uniform access patterns |
+
+Redis's LRU and LFU are **approximate**: rather than maintaining a global ordered list (which would cost memory and pointer updates on every read), it samples a handful of keys (`maxmemory-samples`, default 5) and evicts the best candidate among them. Each object carries a 24-bit field that stores either a coarse "last access" clock or a logarithmic access counter, depending on the policy.
+
+<Callout kind="tip">
+Match the policy to the data. A session cache wants `allkeys-lru`: an idle session is the one to drop. A leaderboard or a rate-limit counter should never be evicted; give it `noeviction` and provision enough memory (or a separate instance) instead.
+</Callout>
+
+## The wire protocol
+
+Clients talk to Redis over a TCP connection using **RESP**, the Redis Serialization Protocol. It is deliberately simple: text-based, length-prefixed, and cheap to parse in any language.
+
+Each value starts with a one-byte type marker and every line ends with CRLF (`\r\n`):
+
+| Prefix | Type | Example |
+|---|---|---|
+| `+` | Simple string | `+OK\r\n` |
+| `-` | Error | `-ERR unknown command\r\n` |
+| `:` | Integer | `:42\r\n` |
+| `$` | Bulk string (length, then bytes) | `$5\r\nAlice\r\n` |
+| `*` | Array (element count, then elements) | `*2\r\n...` |
+
+A command is just an array of bulk strings. `SET user:1 Alice` travels as:
+
+```text
+*3\r\n
+$3\r\nSET\r\n
+$6\r\nuser:1\r\n
+$5\r\nAlice\r\n
+```
+
+(It is one continuous byte stream; the line breaks above are only for reading.) The `*3` says "three elements follow", and each `$n` says exactly how many bytes to read next. Because lengths are explicit, the server never scans for delimiters inside values, so binary data and values containing `\r\n` are safe. The reply to a successful `SET` is `+OK\r\n`; a `GET` reply is a bulk string, or `$-1\r\n` (a null) when the key is missing.
+
+Why a text protocol for a performance-obsessed server? Parsing it is a few branches per byte, it is easy to implement correctly, and you can debug it with `telnet`. RESP3, available since Redis 6, adds richer types such as maps and push messages, but the idea is the same.
+
+## One thread and an event loop
+
+Redis executes commands on **a single thread**. That surprises people, because the obvious way to serve 100,000 clients is many threads.
+
+### Why not a thread per client
+
+Imagine one OS thread per connection with 100,000 clients connected:
+
+- **Memory.** Each thread reserves a stack. Even at 1 MB per thread (Linux defaults are often 8 MB of virtual space), that is around 100 GB just for stacks, on a server whose whole point is to keep RAM for data.
+- **Context switching.** The CPU spends its time saving and restoring thread state instead of running commands.
+- **Locking.** Shared data structures need locks. Locks add latency, contention and whole classes of bugs.
+
+And the work per command is tiny: a hash lookup and a memory copy. With no disk waits inside a command, there is nothing for extra threads to overlap. A single thread that never blocks can keep a core busy on useful work. As a bonus, **every command is atomic** for free: no other command can run in the middle of an `INCR` or a Lua script.
+
+### epoll and the reactor loop
+
+The single thread still has to watch thousands of sockets. Checking each one in turn ("any data yet?") would burn CPU on idle connections. Instead, Redis asks the kernel to do the watching, using **epoll** on Linux (kqueue on BSD and macOS):
+
+1. Redis registers every client socket with an epoll instance.
+2. It calls `epoll_wait`, which sleeps until at least one socket has data (or a timer is due).
+3. The kernel wakes it with **only the ready sockets**. If 5 of 100,000 clients sent something, the list has 5 entries.
+
+The **event loop** is the layer built on top of that. It is the reactor pattern, the same idea that powers Node.js:
+
+```text
+while (true):
+    ready = epoll_wait(sockets, timeout)
+    for socket in ready:
+        bytes   = read(socket)
+        command = parse_resp(bytes)
+        reply   = execute(command)        # touches the in-memory data
+        queue_reply(socket, reply)
+    write_pending_replies()
+    run_timers()                          # expire keys, persistence checks, ...
+```
+
+`epoll_wait` is one call inside the loop; the loop is the whole read, parse, execute, reply cycle.
+
+<Callout kind="warn">
+Single-threaded execution has one sharp edge: **one slow command stalls every client**. `KEYS *` on 10 million keys, deleting a giant set, or a long Lua script blocks the loop. Use `SCAN` instead of `KEYS`, keep values small, and watch `SLOWLOG`.
+</Callout>
+
+Since Redis 6 you can enable **I/O threads** that read from and write to sockets in parallel. Command execution still happens on the main thread, so atomicity is unchanged. Background threads also handle a few slow chores, such as closing files and freeing large values (see lazy freeing below).
+
+## How values are stored
+
+### The keyspace
+
+Each database is a hash table (the "dict") from key to value. Redis grows it with **incremental rehashing**: when the table needs to double, Redis allocates the new table and moves a few buckets on every subsequent operation, instead of pausing to move millions of entries at once. Lookups check both tables until the move is complete. That is how a key lookup stays O(1) without occasional multi-second freezes.
+
+### The redisObject header
+
+Every value, whatever its type, is wrapped in a small header:
+
+```c
+typedef struct redisObject {
+    unsigned type:4;      // string, list, set, zset, hash, stream
+    unsigned encoding:4;  // how it is laid out in memory: int, embstr, raw, listpack, hashtable, skiplist...
+    unsigned lru:24;      // LRU clock or LFU counter, used by eviction
+    int refcount;         // shared objects and memory management
+    void *ptr;            // the actual data (or the integer itself)
+} robj;
+```
+
+The key point is that **type and encoding are separate**. The type is what the client sees ("this is a hash"). The encoding is how Redis chooses to lay it out right now, and Redis switches encodings automatically as the value grows. Clients never notice, but compact encodings commonly cut memory several times compared with naive structures. You can see the current choice with `OBJECT ENCODING key`.
+
+### String encodings
+
+| Value | Encoding | Layout |
+|---|---|---|
+| `42` (fits in a 64-bit integer) | `int` | The number is stored directly in the `ptr` field. No extra allocation. |
+| `"Alice"` (44 bytes or fewer) | `embstr` | Header and string bytes in **one** allocation, next to each other in memory. |
+| A 200-byte JSON blob | `raw` | Header in one allocation, pointing to a separate **SDS** buffer. Two allocations. |
+
+SDS ("simple dynamic string") is Redis's string type: a length-prefixed buffer, so getting the length is O(1), it can hold binary data, and appends can grow it in place. The 44-byte cut-off exists because a header plus a short SDS fits in a 64-byte allocator bucket.
+
+### Hashes and sorted sets
+
+Small collections use a **listpack**: one contiguous block of memory holding entries back to back. `HSET user:1 name Mayank age 29` becomes roughly:
+
+```text
+[ "name" | "Mayank" | "age" | "29" ]   one allocation, no pointers
+```
+
+Finding a field means scanning the block, which is O(n). That sounds bad, but for a few dozen tiny entries a linear scan through one cache-friendly block is as fast as hashing, and it avoids per-entry pointers and allocations.
+
+Redis converts to a real **hash table** when either limit is crossed:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `hash-max-listpack-entries` | 128 | More than 128 fields converts |
+| `hash-max-listpack-value` | 64 | Any field name or value longer than 64 bytes converts |
+
+Either condition alone triggers it: a hash with 5 fields converts as soon as one value is a 200-byte string. The conversion is **one-way for that key**. Deleting fields back below the limit does not shrink it to a listpack again; only rewriting the key (or a restart that reloads it) would. The thresholds themselves are ordinary config you can raise or lower at any time; they just decide what happens to keys at their next conversion check.
+
+Sorted sets follow the same pattern. Small ones are listpacks (rank queries are O(n)). Large ones become a **skip list plus a hash table**: the hash table gives O(1) "what is this member's score?", and the skip list keeps members ordered so `ZRANK` and `ZRANGE` are O(log n). Lists use a quicklist (a linked list of listpacks), and small sets of integers use a sorted `intset`.
+
+<SdRedisEncodingLab />
+
+## Persistence
+
+RAM is volatile. Power loss, a crash or the OOM killer wipes everything. Persistence answers one question: **after a restart, how much data do you get back, and how long does recovery take?** By default (with no persistence configured) the answer is "nothing".
+
+### RDB snapshots
+
+An RDB file (`dump.rdb`) is a compact binary snapshot of the whole data set at one moment. You trigger it with `BGSAVE` or rules such as "save if 1,000 keys changed in 60 seconds".
+
+How Redis snapshots without stopping:
+
+1. The main process calls `fork()`. The child gets a copy of the parent's address space, but the OS shares the physical pages instead of copying them.
+2. The child walks the keyspace and serialises it to a temporary file, then renames it to `dump.rdb`.
+3. The parent keeps serving clients. When it modifies a page, the kernel **copies that one page** first (copy-on-write), so the child still sees the data exactly as it was at fork time. The child gets a consistent snapshot without any locks.
+
+The catches:
+
+- **Memory spike.** Under heavy writes, many pages get copied during the snapshot. In the worst case memory use approaches 2x. This is why you leave headroom below physical RAM.
+- **Fork latency.** Forking a process with a large page table takes time (milliseconds per GB), and the main thread is paused for it.
+- **Data loss window.** You recover only up to the last completed snapshot. Snapshot every 5 minutes, crash at minute 4 of the next interval, and those 4 minutes are gone.
+
+The upside: RDB files are small and load quickly, which makes them good for backups and fast restarts.
+
+### Append-only file
+
+The **AOF** logs every write command, in RESP format, to `appendonly.aof`. On restart Redis replays the log from start to finish. If the log says "set 2, set 3, set 4, delete 4, set 5, set 6", the replay ends with 2, 3, 5 and 6.
+
+Writing to a file does not make it durable; the bytes sit in the OS page cache until `fsync` forces them to disk. The `appendfsync` setting picks when that happens:
+
+| Setting | When Redis calls fsync | Worst-case loss | Cost |
+|---|---|---|---|
+| `always` | Before replying to every write | About nothing | Every write waits for the disk; far slower |
+| `everysec` | Once per second, in a background thread | About 1 second | Small; the usual default |
+| `no` | Never; the OS flushes when it likes | Often around 30 seconds | Fastest |
+
+An AOF grows forever (a counter incremented a million times is a million log lines), so Redis periodically **rewrites** it: it forks, writes the minimal set of commands that rebuild the current data, and switches over.
+
+### Hybrid persistence
+
+Most production setups combine the two. With `aof-use-rdb-preamble yes` (the default since Redis 5), an AOF rewrite produces an **RDB-format base** followed by only the commands written since. Redis 7 made this explicit with multi-part AOF: one base file plus incremental files, tracked by a manifest.
+
+Recovery then means: load the base snapshot quickly, replay a short tail of commands. You get AOF's one-second loss window with close to RDB's restart speed.
+
+<SdRedisPersistenceLab />
+
+<Callout kind="tip">
+Pure cache whose data can be rebuilt from the database: persistence off or RDB only. Sessions, queues, or anything users would notice losing: AOF `everysec` (hybrid), plus replicas. Persistence protects against restarts; replicas protect against losing the machine.
+</Callout>
+
+## The life of a write
+
+Putting the pieces together, here is `SET user:1 Alice` end to end:
+
+1. **Network.** The client writes the RESP bytes to its TCP socket.
+2. **Event loop.** `epoll_wait` returns that socket as ready. The main thread reads the bytes.
+3. **Parse.** The RESP parser builds an argument array: `["SET", "user:1", "Alice"]`.
+4. **Dispatch.** Redis looks up `SET` in its command table (itself a hash table from command name to handler) and calls the handler.
+5. **Store.** The handler hashes `user:1` into the keyspace dict and creates a value object. "Alice" is 5 bytes, so it is an `embstr`: one allocation.
+6. **Propagate.** The command is appended to the AOF buffer (if enabled) and to the replication stream for replicas.
+7. **Reply.** `+OK\r\n` is queued and written back on the next pass of the loop.
+8. **Background.** The AOF fsync (every second) and any RDB snapshot happen off the main path.
+
+## Lazy freeing
+
+Deleting is usually instant, but not always. `DEL` on a sorted set with 10 million members has to free 10 million allocations, and on the single thread that could take hundreds of milliseconds, stalling every client.
+
+**Lazy freeing** avoids that. `UNLINK` (instead of `DEL`) removes the key from the keyspace immediately, so it is gone for every client, replies `:1`, and hands the actual memory release to a background thread. Settings such as `lazyfree-lazy-user-del`, `lazyfree-lazy-eviction` and `lazyfree-lazy-expire` make deletes, evictions and expiries behave this way automatically. It is safe because once a value is unlinked, no command can reach it, so the background thread is not racing anyone.
+
+## Replication and clustering
+
+Everything so far describes one node. Two features take Redis past one machine.
+
+### Replicas and failover
+
+A **replica** connects to the primary, receives a full RDB snapshot, then streams every subsequent write command. Replication is **asynchronous**: the primary acknowledges the client before replicas confirm, so a primary crash can lose the last few writes that had not reached a replica yet. (`WAIT` can make a client block until N replicas have a write, which narrows but does not close that gap.)
+
+**Redis Sentinel** watches primaries, agrees among several sentinels that one is down, promotes a replica, and tells clients the new address. Replicas can also serve reads, with the usual replication-lag caveats.
+
+### Hash slots
+
+**Redis Cluster** shards data across several primaries. The key space is divided into **16,384 hash slots**:
+
+```text
+slot = CRC16(key) mod 16384
+```
+
+Each primary owns a range of slots, and each primary has its own replicas. Clients cache the slot map. If a client sends a key to the wrong node, the node answers `MOVED 3999 10.0.0.2:6379` and the client updates its map. Adding a node means moving some slots to it, key by key, while the cluster stays online.
+
+Multi-key commands (`MGET`, transactions, Lua scripts) only work when all keys are in **the same slot**. **Hash tags** make that possible: if a key contains `{...}`, only the part inside the braces is hashed, so `{user:1000}:cart` and `{user:1000}:profile` always land together.
+
+<SdHashSlotMapper />
+
+## Bottlenecks and trade-offs
+
+| Problem | Why it hurts | Fix |
+|---|---|---|
+| Big keys (huge sets, megabyte strings) | Slow commands block the loop; uneven memory across shards | Split into smaller keys; `UNLINK` instead of `DEL` |
+| Hot keys | One key's traffic lands on one shard's one thread | Client-side caching, read replicas, or split the key (`counter:{1..10}`) |
+| O(n) commands | `KEYS`, `SMEMBERS`, `HGETALL` on large values stall everyone | `SCAN`, `SSCAN`, `HSCAN`; paginate |
+| Fork under heavy writes | Copy-on-write memory spike, fork pause | Memory headroom; snapshot on a replica |
+| Async replication | Failover can lose acknowledged writes | Accept it, use `WAIT`, or keep must-not-lose data elsewhere |
+
+## Cheat sheet
+
+- Redis keeps all data in RAM: sub-millisecond latency, and capacity equals memory.
+- Set `maxmemory` with headroom; pick `allkeys-lru` for caches, `noeviction` for counters, queues and locks.
+- RESP: type prefix (`+ - : $ *`), explicit lengths, CRLF; commands are arrays of bulk strings.
+- One thread executes commands, so every command is atomic and one slow command blocks everyone.
+- epoll tells the event loop which sockets are ready; the loop reads, parses, executes and replies.
+- Type and encoding differ: `int`, `embstr` (44 bytes or less), `raw` for strings; listpack until 128 entries or 64-byte values, then a hash table, never back.
+- Sorted sets: listpack when small, skip list plus hash table when large.
+- RDB: forked, copy-on-write snapshot; fast restore, loses everything since the last snapshot.
+- AOF: logs writes; `everysec` loses about a second; rewrite compacts it; hybrid = RDB base plus AOF tail.
+- `UNLINK` and lazy-free settings free big values on a background thread.
+- Replication is asynchronous; Sentinel handles failover; Cluster maps keys to 16,384 slots, hash tags keep related keys together.

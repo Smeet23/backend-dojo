@@ -1,0 +1,131 @@
+import { SdElectionStepper } from "@/components/widgets/SdElectionStepper";
+
+## Why pick a leader
+
+Many distributed systems run several identical nodes for capacity and redundancy. That's great for reads, but some jobs must be done by **exactly one** node at a time:
+
+- accepting writes for a database shard, so every replica applies them in the same order
+- running the nightly billing cron job, so customers are charged once
+- assigning partitions to consumers, or tasks to workers
+- deciding who holds which lock
+
+**Leader election** is the coordination problem of getting all nodes to agree that one specific node is in charge. The leader does the critical work; the others are **followers**. They can still serve reads, and they stand ready to take over.
+
+### What goes wrong without one
+
+Picture three servers sharing a product price that's currently 50. An admin raises it to 100, then a minute later to 120. If server A applies "100" and server B applies "120" independently, and their writes reach storage in the wrong order, the final value is 100. Server C, serving reads, shows a stale or wrong price. Nobody did anything "wrong" locally; the system simply had no single authority on ordering.
+
+That's the general failure pattern:
+
+- **Inconsistent state**: replicas disagree about the truth.
+- **Data corruption**: concurrent writers clobber each other.
+- **Split brain**: two nodes both believe they're the leader and both act on it. This is the scariest one, because each half of the system looks healthy on its own.
+
+With one leader, there is one sequence of decisions, and everyone else follows it.
+
+## What a good election guarantees
+
+Any election scheme is judged by four properties:
+
+| Property | Meaning | What violating it looks like |
+|---|---|---|
+| **Safety** | At most one leader at any moment. Zero is allowed briefly, during an election. | Two leaders accept conflicting writes: split brain. |
+| **Liveness** | The system eventually elects a leader without a human stepping in. | The leader dies and the cluster waits forever. |
+| **Fault tolerance** | Elections still work when nodes crash, messages are delayed or lost. | One dropped packet stalls the election. |
+| **Fast failover** | The gap between losing a leader and having a new one is short. | Writes are unavailable for minutes after every crash. |
+
+Safety and liveness pull against each other. Being very cautious about declaring a leader dead protects safety but slows failover. Being eager speeds failover but risks electing a second leader while the first is merely slow.
+
+## Detecting a dead leader
+
+Followers can't see a crash directly; they can only notice **silence**. So the leader sends a **heartbeat** every X milliseconds, and each follower waits up to Y milliseconds (Y several times larger than X) before deciding the leader is gone and starting an election.
+
+Tuning Y is a real trade-off:
+
+- **Too short**: a GC pause, a busy CPU or a congested network delays one heartbeat, a follower wrongly declares the leader dead, and you get a needless election, or worse, two leaders.
+- **Too long**: a real crash goes unnoticed for a long time and failover is slow.
+
+A common rule of thumb is a heartbeat every 100–500 ms and a timeout of a few heartbeat intervals. Raft also **randomises** each follower's timeout so they don't all start elections at the same instant.
+
+<Callout kind="remember">
+A timeout can't tell "dead" from "slow" or "unreachable". Every election algorithm has to live with that uncertainty, and how it copes is what separates toy algorithms from production ones.
+</Callout>
+
+## The bully algorithm
+
+**Rule: the live node with the highest ID becomes leader.** Higher IDs "bully" lower ones out of the way.
+
+Each node knows every other node's ID. When node `p` suspects the leader is dead:
+
+1. `p` sends an **ELECTION** message to every node with a **higher** ID. It never bothers with lower IDs, because they can't win while `p` is alive.
+2. Any higher node that's alive replies **OK** ("I'm here, stand down"), and then starts its own election in turn.
+3. If `p` receives at least one OK, it backs off and waits to hear who won.
+4. If nobody higher answers before the timeout, `p` is the highest live node. It declares itself leader and sends **COORDINATOR** to everyone.
+
+### A worked example
+
+Nodes 1 to 6; 6 is the leader and crashes. Node 2 notices first.
+
+- 2 sends ELECTION to 3, 4, 5, 6. Nodes 3, 4 and 5 reply OK; 6 is silent. Node 2 backs off.
+- 3 sends ELECTION to 4, 5, 6. Gets OKs from 4 and 5, so it backs off.
+- 4 sends ELECTION to 5 and 6. Gets an OK from 5, so it backs off.
+- 5 sends ELECTION to 6. Silence until the timeout, so 5 is the highest live node.
+- 5 sends COORDINATOR to 1, 2, 3 and 4.
+
+### Bully message cost
+
+Bully is easy to understand and to implement, but it is **chatty**. In the worst case the lowest node notices first; it messages n − 1 nodes, each of which messages everyone above it, and so on. That's roughly (n − 1) + (n − 2) + … + 1 election messages plus replies, which is **O(n²)**. Ten nodes is about a hundred messages; a thousand nodes is about a million.
+
+It also has an awkward rejoin story: when a crashed high-ID node comes back, it immediately bullies its way back to leadership, forcing a second handover even though the cluster was healthy. A node that keeps flapping causes an election every time.
+
+<SdElectionStepper />
+
+## The ring algorithm
+
+Nodes are arranged in a **logical ring**: each node knows its successor. Nothing about the network is circular; it's just an agreed ordering, such as 1 → 3 → 6 → 4 → 2 → 5 → back to 1. Again, the highest live ID wins.
+
+1. A node that notices the leader is gone sends **ELECTION** to its successor, carrying its own ID.
+2. Each node that receives it compares the ID in the message with its own and forwards the **larger** one to its successor. (A classic variant forwards the full list of IDs seen.)
+3. When the message comes back to the node that started it, the ID it carries is the highest live ID in the ring.
+4. The starter then sends **COORDINATOR** with the winner's ID around the ring once, so everyone learns the result.
+
+### Skipping a dead neighbour
+
+If your successor is the dead leader, where does the message go? The node needs to know who comes after it. Two approaches:
+
+- **Full membership**: every node knows the whole ring order, so it can skip any number of dead nodes. Robust, but the membership list must be kept in sync everywhere as nodes join and leave.
+- **Successor list**: every node knows its next *k* successors. Cheap to maintain, but if *k* consecutive nodes fail, the ring breaks and the election can't complete. Raising *k* toward the ring size just turns it back into full membership.
+
+### Ring message cost
+
+Each node only ever talks to its neighbour, so one election costs about **2n messages**: one lap for ELECTION and one for COORDINATOR. That's **O(n)**, a big improvement over bully's O(n²).
+
+The price is **time**: messages travel one hop at a time, so a ring of hundreds of nodes takes hundreds of sequential hops to finish, which hurts fast failover. And if several nodes start elections simultaneously, extra messages circulate unless nodes drop messages carrying a lower ID than one they've already forwarded.
+
+## Why production systems use neither
+
+Bully and ring are excellent teaching tools, but both quietly assume a **well-behaved network**: messages arrive within a known time, and a node that doesn't answer is really dead. Real networks break those assumptions:
+
+- **Network partitions.** Split six nodes into {1, 2, 3} and {4, 5, 6}. Under bully, each side sees the other as dead and elects its own leader: 3 and 6. That's split brain, the very thing elections were meant to prevent.
+- **Slow, not dead.** A leader stuck in a long GC pause misses heartbeats, a new leader is elected, and then the old one wakes up still believing it's in charge.
+- **Rejoin and flapping.** Nodes that come and go trigger repeated elections and leadership churn.
+
+Production systems use **consensus algorithms** such as **Raft** (etcd, Consul, CockroachDB, Kafka's KRaft mode) or **ZAB** (ZooKeeper). Their key ideas:
+
+- **Majority quorum.** A candidate needs votes from a majority of the cluster. Two disjoint majorities can't exist, so a partition can produce at most one leader; the minority side simply can't elect anyone.
+- **Terms (epochs).** Each election increments a term number. A node that hears from a higher term immediately steps down, so a leader waking up from a pause discovers it is stale. The term also works as a fencing token for anything the leader writes.
+- **Randomised election timeouts** so candidates rarely collide.
+
+Many teams don't run elections themselves at all: they let etcd or ZooKeeper (or a cloud lock service) pick the leader through a lease, which is exactly the distributed lock you'll see in the next lessons.
+
+## Cheat sheet
+
+- Leader election makes exactly one node responsible for writes or coordination; the rest follow.
+- Without a leader you risk inconsistent state, corruption and split brain.
+- A good election gives safety (at most one leader), liveness, fault tolerance and fast failover.
+- Failure is detected by missed heartbeats; short timeouts cause false elections, long ones slow failover.
+- Bully: message every higher ID; the highest live node wins and broadcasts COORDINATOR. O(n²) messages.
+- Ring: pass the highest ID around a logical ring, then a COORDINATOR lap. O(n) messages but slow on big rings.
+- Rings skip dead nodes using full membership or a successor list of size k.
+- Both assume timeouts are accurate; partitions and pauses can give them two leaders.
+- Production uses quorum-based consensus (Raft, ZAB) with terms, or leases from etcd or ZooKeeper.

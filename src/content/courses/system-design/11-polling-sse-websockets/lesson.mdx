@@ -1,0 +1,195 @@
+import { SdPushCostCalc } from "@/components/widgets/SdPushCostCalc";
+
+## The problem with request and response
+
+Classic HTTP is a conversation the client always starts. The browser asks, the server answers, and the exchange is over. That model is perfect for a product page or a blog post, where the data barely changes while you read it.
+
+Modern apps are different. A chat window shows new messages and "typing…" indicators. An order page flips from "preparing" to "out for delivery". A trading screen ticks every second. A monitoring dashboard redraws as traffic spikes. Nobody expects to press refresh for any of this.
+
+The catch: the **server is the one that learns about new data**, but plain HTTP gives it no way to speak first. Every technique in this lesson is a different answer to one question: *how does fresh data get from server to client without the user asking?*
+
+There are four common answers:
+
+1. **Short polling**: ask again and again on a timer.
+2. **Long polling**: ask once, and let the server hold the question open until it has an answer.
+3. **Server-Sent Events (SSE)**: open one HTTP response that never finishes, and stream events down it.
+4. **WebSockets**: upgrade the connection into a two-way channel where either side can send at any time.
+
+## Short polling
+
+The client sends a request every few seconds: "anything new?" Most of the time the answer is "no".
+
+```http
+GET /orders/42/status   → 200 {"status":"preparing"}
+(5 s later)
+GET /orders/42/status   → 200 {"status":"preparing"}
+(5 s later)
+GET /orders/42/status   → 200 {"status":"out_for_delivery"}
+```
+
+It's trivially easy, works through every proxy and firewall, and the server stays stateless. But it trades **latency against load**: a 5 s interval means updates arrive up to 5 s late (2.5 s on average), and shrinking the interval multiplies the request rate. With 100,000 clients polling every 5 s you serve 20,000 requests per second, nearly all of them empty, each carrying several hundred bytes of headers and often a database read.
+
+Short polling is still a fine choice when updates are slow and a little staleness is harmless, like checking an export job every 10 seconds.
+
+## Long polling
+
+Long polling removes the wasted "no" answers. The client sends a request, and the server **doesn't reply until it has something new** (or a timeout passes).
+
+1. Client sends `GET /messages?after=1041`.
+2. The server has nothing newer, so it **parks the request**. The TCP connection stays open.
+3. A new message arrives. The server answers the parked request immediately.
+4. The client processes it and **immediately sends the next request**.
+5. If nothing happens for, say, 30 seconds, the server returns an empty response (often `204 No Content`) and the client simply asks again.
+
+The timeout exists because idle connections don't live forever: proxies, load balancers and mobile networks silently kill requests that hang too long, so it's better to end them on your own terms. The `after=1041` cursor matters too. Anything that arrives in the gap between one response and the next request must not be lost, so the client always says what it has already seen.
+
+**Pros:** updates arrive almost instantly, it's plain HTTP, and it works anywhere ordinary requests work.
+
+**Cons:**
+
+- **Held connections.** 50,000 waiting users means 50,000 open connections, each tying up a socket and, on thread-per-request servers, a whole thread. Event-loop servers (Node, Go, Netty) cope far better.
+- **Per-message overhead.** Every update costs a full HTTP request and response, headers included.
+- **Bursty updates are clumsy.** Between one response and the next request there's a small window, and each message in a burst needs its own round trip unless you batch.
+
+Today long polling survives mainly as a **fallback** for environments where streaming or WebSockets are blocked, and in older systems that predate them.
+
+## Server-Sent Events
+
+SSE lets the server **push a stream of events over one long-lived HTTP response**. The client makes a single request and the server simply never finishes the body. It writes an event whenever something happens.
+
+```http
+GET /prices/stream HTTP/1.1
+Accept: text/event-stream
+
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Cache-Control: no-cache
+Connection: keep-alive
+
+id: 981
+event: price
+data: {"symbol":"ACME","price":101.25}
+
+id: 982
+event: price
+data: {"symbol":"ACME","price":101.40}
+
+```
+
+The three response headers each have a job:
+
+| Header | Why it's there |
+|---|---|
+| `Content-Type: text/event-stream` | Tells the browser this body is an event stream, not a document to wait for. |
+| `Cache-Control: no-cache` | Stops browsers and proxies caching or buffering a live stream. |
+| `Connection: keep-alive` | Keeps the underlying connection open (HTTP/1.1; HTTP/2 manages this itself). |
+
+Key properties:
+
+- **One direction only: server to client.** If the client needs to send something (place an order, post a comment), it uses ordinary HTTP requests alongside the stream.
+- **Text only, UTF-8.** Each event is lines of `field: value` ending in a blank line. Binary data must be encoded (for example base64), which costs about a third more bytes. The upside is that streams are easy to read and debug.
+- **Automatic reconnect.** The browser's `EventSource` reconnects by itself if the connection drops, and sends the last `id` it saw in a `Last-Event-ID` header. A server that keeps a short history can then replay what the client missed. That's a real advantage over a raw WebSocket, where you build all of this yourself.
+- **It's just HTTP.** It passes through most proxies, works with existing auth cookies and headers, and needs no special server support beyond keeping responses open.
+
+```ts
+const es = new EventSource("/prices/stream");
+es.addEventListener("price", (e) => render(JSON.parse(e.data)));
+// Reconnection and Last-Event-ID are handled by the browser.
+```
+
+<Callout kind="warn">
+Over HTTP/1.1, browsers allow only about **6 connections per origin**, and each SSE stream permanently uses one. Open the app in seven tabs and the seventh hangs. HTTP/2 multiplexes many streams over one connection and removes the problem, so serve SSE over HTTP/2 where you can.
+</Callout>
+
+**Good fits:** notifications, live dashboards, stock tickers, build logs, news feeds, and streaming AI responses token by token. All of these are cases where the client mostly *watches*.
+
+## WebSockets
+
+A WebSocket is a **full-duplex** channel over a single long-lived TCP connection: client and server can each send messages whenever they like, at the same time.
+
+### The upgrade handshake
+
+A WebSocket starts life as an ordinary HTTP request that asks to switch protocols:
+
+```http
+GET /chat HTTP/1.1
+Host: example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+The server proves it understood by hashing the client's key into `Sec-WebSocket-Accept`, and answers **`101 Switching Protocols`**. From that moment the same TCP connection stops speaking HTTP. Starting from HTTP is deliberate: it reuses port 80/443, so WebSockets pass through firewalls that only allow web traffic.
+
+### After the upgrade
+
+Data then flows as **frames**. A frame has a tiny header of 2 to 14 bytes (length, type, a masking key for client-to-server frames), but **no HTTP headers**: no cookies, no user agent, no content type repeated on every message. That's why WebSockets are so cheap per message compared with polling.
+
+- Frames can be **text or binary**, so you can send JSON, Protocol Buffers or raw bytes.
+- **Either side can close** the connection with a close frame.
+- TCP underneath guarantees bytes arrive **in order and without gaps for as long as that connection lives**.
+
+<Callout kind="warn">
+TCP's guarantee ends when the connection does. If a phone switches from Wi-Fi to 4G, the socket dies, and anything sent in the meantime is gone. Real chat systems still give messages sequence numbers, acknowledge them, and on reconnect ask "send me everything after message 1041".
+</Callout>
+
+### The hard parts
+
+WebSockets give you a raw pipe. Everything above it is your job:
+
+- **Reconnection** with backoff, and **resuming** from the last message seen.
+- **Ordering and deduplication** when a message is retried after a reconnect.
+- **Heartbeats** (ping/pong) to detect dead connections that never sent a close frame, and to stop idle-timeout proxies dropping them.
+- **Authentication** at handshake time, plus re-checking when tokens expire on connections that live for hours.
+- **Scaling.** Connections are stateful and pinned to one server. If user A is connected to server 1 and user B to server 7, a message from A must find B's server, typically through a pub/sub backplane such as Redis Pub/Sub or Kafka. Deploys also drop every connection on a server at once, so clients must reconnect gracefully.
+
+**Good fits:** chat, multiplayer games, collaborative editors like Google Docs, live trading terminals: anything genuinely interactive in both directions.
+
+## Side by side
+
+| | Short polling | Long polling | SSE | WebSocket |
+|---|---|---|---|---|
+| Direction | Client asks | Client asks, server answers late | Server to client | Both ways |
+| Protocol | HTTP | HTTP | HTTP (one endless response) | Starts as HTTP, upgrades to WebSocket |
+| Connection | New request per poll | One held request per update | One long-lived response | One persistent TCP connection |
+| Who starts an update | Client | Client (server completes it) | Server | Either side |
+| Latency | Up to one interval | Near real time | Near real time | Lowest |
+| Per-message overhead | Full HTTP headers | Full HTTP headers | A few bytes of framing | 2–14 bytes of framing |
+| Data | Anything | Anything | UTF-8 text | Text or binary |
+| Reconnect | Not needed | Not needed | Built into the browser | You build it |
+| Complexity | Lowest | Low | Moderate | Highest |
+| Best for | Slow, tolerant updates | Fallback, legacy | Feeds, notifications, dashboards | Chat, games, collaboration |
+
+<SdPushCostCalc />
+
+## Choosing in practice
+
+Ask two questions:
+
+1. **Does the client need to send frequent, low-latency messages back?** If yes (chat, games, collaborative cursors), use **WebSockets**.
+2. **If not, how fresh must the data be?** If seconds matter, use **SSE**. If a delay of tens of seconds is fine and updates are rare, **short polling** is the simplest thing that works.
+
+Keep **long polling** in your back pocket as a fallback. Libraries such as Socket.IO try WebSockets first and quietly fall back to long polling when a network blocks them.
+
+<Callout kind="remember">
+The common mistake is reaching for WebSockets by default. A notification bell or a live dashboard is one-way traffic: SSE gives you push, auto-reconnect and resume over plain HTTP, with far less code to maintain.
+</Callout>
+
+## Cheat sheet
+
+- Plain HTTP can't push, because the client always speaks first; every technique here works around that.
+- Short polling: request on a timer, simple but wasteful; latency is up to one interval.
+- Long polling: the server holds the request until data arrives or a timeout passes, then the client re-asks at once.
+- Long polling and push both hold one open connection per client, so event-loop servers scale them best.
+- SSE: one endless HTTP response, `Content-Type: text/event-stream`, server-to-client only, UTF-8 text.
+- SSE reconnects automatically and resumes with `Last-Event-ID`; serve it over HTTP/2 to avoid the 6-connection limit.
+- WebSocket: HTTP `Upgrade` request, `101 Switching Protocols`, then full-duplex frames with no HTTP headers.
+- WebSockets carry text or binary; either side can close.
+- With WebSockets you own reconnection, resume, ordering, heartbeats, auth refresh and cross-server routing.
+- One-way feeds pick SSE; truly interactive two-way apps pick WebSockets; slow, tolerant updates pick polling.

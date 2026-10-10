@@ -1,0 +1,364 @@
+import { SdScalingComparator } from "@/components/widgets/SdScalingComparator";
+import { SdShardRouter } from "@/components/widgets/SdShardRouter";
+
+## Why system design matters
+
+**System design** is the process of deciding a system's architecture, its components and how data flows between them, so that it keeps meeting its users' needs as those needs grow.
+
+A login service that works perfectly for 10 users can fall over at 1 million: the one server runs out of CPU, the one database runs out of connections, and every request queues behind the others. Even at low traffic, distance hurts. A user in the US talking to a server in India waits for every packet to cross the planet; the same request to a server in their own region might take a fraction of the time.
+
+Both failures have the same root: a design that was fine in a demo but wasn't built for the real world. The rest of this lesson is the toolkit for building systems that survive it, one building block at a time.
+
+## Client-server architecture
+
+Almost everything on the web follows the **client-server** model: a **client** (browser, mobile app, another service) sends a **request**, and a **server** processes it and sends back a **response**. The client always starts the conversation.
+
+They talk over HTTP. Locally, while developing, plain HTTP is fine. In production, always use **HTTPS** so traffic is encrypted and can't be read or tampered with on the way.
+
+<Callout kind="remember">
+**Clients never talk to the database directly.** The server sits in the middle: it authenticates the caller, checks what they're allowed to do, validates input, and only then runs queries. Exposing a database to the internet would hand those decisions to whoever holds the connection string.
+</Callout>
+
+### Two-tier and three-tier
+
+Architectures are often described by how many **tiers** (separately running layers) they have.
+
+**Two-tier**: the client application talks directly to a database server. The client holds the user interface **and** the business logic; the server side is just the database. This was common for desktop apps on an office network, where every client was trusted. It's simple, but every client needs database credentials, logic changes mean updating every installed copy, and it can't safely face the internet.
+
+**Three-tier** splits responsibilities into three layers:
+
+| Tier | Responsibility | Examples |
+|---|---|---|
+| Presentation (client) | User interface | Browser app, mobile app |
+| Application | Business logic, auth, validation, APIs | Web servers, app servers, REST APIs |
+| Data | Storing, retrieving and protecting data | PostgreSQL, MySQL, MongoDB |
+
+The client talks only to the application tier, and only the application tier talks to the database. This is the standard model for web systems because each tier can be **scaled and maintained independently**: add app servers without touching the database, redesign the UI without touching the logic.
+
+## Monoliths and microservices
+
+A **monolith** builds the whole application as **one deployable unit**. Login, payments, dashboard and admin panel live in one codebase, run in one process, and usually share one database.
+
+**Microservices** split the system into small services that each own **one business capability**: a users service, a payments service, a notifications service. Each runs and deploys on its own, has **its own database**, and talks to others over the network, typically REST APIs or messages.
+
+| | Monolith | Microservices |
+|---|---|---|
+| Build and test | Simple, one codebase | Many repos, contracts between services |
+| Calls between features | In-process function calls, fast | Network calls: slower, can fail |
+| Deploys | Everything ships together | Each service ships independently |
+| Failure | A crash or memory leak can take everything down | A failing service can be isolated (notifications down, checkout still works) |
+| Scaling | Scale the whole app together | Scale only the busy service |
+| Teams | Everyone in one codebase | Teams own services end to end |
+| Operations and debugging | Easy, one log, one stack trace | Hard: distributed tracing, many moving parts |
+
+Neither is "better". A monolith is the right starting point for most products: easy to build, test and run, with no network between features. Microservices pay off when the system and the organisation are large enough that independent deploys and independent scaling outweigh the cost of running a distributed system.
+
+<Callout kind="warn">
+Splitting into services doesn't automatically isolate failures. If checkout calls notifications synchronously and waits, a dead notifications service still breaks checkout. Isolation needs timeouts, circuit breakers or asynchronous messaging.
+</Callout>
+
+## Synchronous and asynchronous communication
+
+When one component asks another to do something, it can wait or not.
+
+**Synchronous** communication is **blocking**: the caller sends a request (usually HTTPS) and waits for the response before continuing. It's simple to reason about and right when the caller **needs the answer to proceed**, for example checking a password or reading a price. The downside: the caller is only as fast and as available as the slowest thing it waits on. If the server is down or slow, the caller hangs until a timeout and then fails.
+
+**Asynchronous** communication is **non-blocking**: the sender puts a message onto a **queue** and moves on immediately. A consumer picks it up when it's ready, does the work, and may later emit a "done" event. The queue holds messages while consumers are busy or down, so a burst of requests or a crashed consumer doesn't lose work.
+
+| | Synchronous | Asynchronous |
+|---|---|---|
+| Caller | Waits for the result | Continues immediately |
+| Coupling | Caller needs the callee up right now | Queue buffers between them |
+| Good for | Logins, reads, anything needing an answer now | Emails, video processing, reports, notifications |
+| Cost | Latency adds up along the chain | More moving parts; results arrive later |
+
+Real systems use both: sync for the part the user is waiting for, async for everything that can happen afterwards.
+
+## Load balancers
+
+A **load balancer** distributes incoming traffic across multiple servers so no single server is overwhelmed and no single server's failure takes the service down. It sits between clients and servers; clients only ever see the balancer's address.
+
+Without one, traffic tends to pile onto one machine while others idle, and when that machine dies, its users see an outage even though other servers are healthy. With one:
+
+- **Higher availability.** Health checks detect dead servers and stop sending them traffic, so their requests go to the survivors.
+- **Even load.** Requests are spread out instead of piling up.
+- **Easy horizontal scaling.** Add a fourth server, register it, and it starts taking traffic.
+
+<Callout kind="tip">
+A load balancer spreads a traffic spike out, but it doesn't create capacity. For a 10× sale-day spike you still need enough servers behind it, usually added ahead of time or by **autoscaling**.
+</Callout>
+
+### Static and dynamic algorithms
+
+**Static** algorithms follow a fixed rule and ignore what the servers are doing right now: round robin, weighted round robin, IP hash. They're simple and predictable.
+
+**Dynamic** algorithms use live information such as active connections or response times: least connections, least response time. They adapt to uneven load but need the balancer to track server state, which is more work to tune and operate.
+
+### Round robin, least connections and sticky sessions
+
+**Round robin** hands requests out in turn: R1 to server A, R2 to B, R3 to C, R4 back to A. Fair when requests cost the same.
+
+**Least connections** sends each new request to the server with the fewest requests in progress. If A and C are busy with slow requests and B just finished a quick one, R4 goes to B. Better when request durations vary.
+
+**Sticky sessions** (session affinity) aren't really a distribution algorithm but a rule layered on top: once a user lands on a server, keep sending them there, usually via a cookie the balancer sets or a hash of the client IP. This helps when a server holds per-user state in memory, such as a shopping cart. The catch: if that server dies, the user's state dies with it, and load can become uneven. The more robust design keeps servers **stateless** and puts carts and sessions in a shared store like Redis or the database, so any server can handle any request.
+
+### Layer 4 and layer 7
+
+- **Layer 4** balancers work at the **transport layer**. They route using IP addresses and ports, never reading the request contents. That makes them very fast and protocol-agnostic.
+- **Layer 7** balancers work at the **application layer**. They parse HTTP, so they can route on URL path, headers or cookies, terminate TLS and retry failed requests. Parsing costs a little extra processing, which is usually negligible next to what the backend does.
+
+Use layer 4 when the content doesn't affect where the request should go; use layer 7 when it does.
+
+### Routing users to a nearby region
+
+A single load balancer lives in one data centre; it spreads load across servers **in that location**. Sending a US user to US servers and an Indian user to Indian servers is done one level up, by **global traffic management**: DNS that answers with a region close to the user (GeoDNS), or anycast addresses that the network routes to the nearest site. Each region then has its own load balancers.
+
+## Caching
+
+**Caching** stores copies of frequently used data in a faster place, so later requests skip the slow work: the database query, the computation, the long network trip. "Faster" usually means RAM instead of disk, or nearby instead of far away.
+
+### Where caches live
+
+| Layer | What it stores | Example |
+|---|---|---|
+| Client (browser) | Images, CSS, JS, API responses the server marked cacheable | `Cache-Control: max-age=3600` lets the browser reuse a file for an hour |
+| CDN | Static files on edge servers near users | Product images served from a nearby PoP |
+| Application | Computed results in an in-memory store | Redis or Memcached holding popular products or a leaderboard |
+| Database | Results of frequent queries, hot pages in memory | The database's own buffer pool keeping hot rows in RAM |
+
+Browser caching makes repeat visits load faster and cuts server load. Application caching is where backend engineers spend most of their effort: for example, during a phone launch sale, the product's details are requested millions of times and change rarely, so they're cached in Redis instead of being rebuilt from the database each time.
+
+Database-level query result caches exist but are less useful than they sound: any write to a table invalidates its cached results, which is why MySQL removed its query cache in version 8. Caching at the application layer, where you control keys and expiry, is usually better.
+
+### Hits and misses
+
+A **cache hit** means the data was in the cache and is returned immediately. A **cache miss** means it wasn't, so the system does the slow work, returns the result and usually stores it for next time. The **hit rate** (hits divided by lookups) tells you whether a cache is earning its place.
+
+### Eviction algorithms
+
+Caches are small, so when one is full, something must be removed. Take a cache with room for **3 items** and this access sequence:
+
+```
+A  B  C  A  B  D  E
+```
+
+**LRU (least recently used)** evicts the item untouched for the longest time.
+
+| Access | Result | Cache after (oldest use first) |
+|---|---|---|
+| A, B, C | 3 misses | A, B, C |
+| A | hit | B, C, A |
+| B | hit | C, A, B |
+| D | miss, evict **C** (least recently used) | A, B, D |
+| E | miss, evict **A** | B, D, E |
+
+**FIFO (first in, first out)** evicts whatever was inserted earliest, no matter how often it's used.
+
+| Access | Result | Cache after (insertion order) |
+|---|---|---|
+| A, B, C | 3 misses | A, B, C |
+| A, B | hits, order unchanged | A, B, C |
+| D | miss, evict **A** (first in) | B, C, D |
+| E | miss, evict **B** | C, D, E |
+
+FIFO threw out A and B even though they were just used. That's its weakness: it ignores popularity.
+
+**LFU (least frequently used)** evicts the item with the fewest accesses. If A has been read 5 times, B 3 times and C once, a new item E replaces **C**. LFU protects long-term favourites, but an item that was popular last week can linger long after interest fades, so real implementations decay counts over time.
+
+| Policy | Evicts | Good for |
+|---|---|---|
+| LRU | Least recently used | General-purpose default |
+| LFU | Least often used | Stable popularity (top products, popular pages) |
+| FIFO | Oldest inserted | Simple; rarely the best choice |
+
+### When not to cache
+
+Caching shines when the **same data is read often**, **changes rarely**, and must be served **fast**. It's a poor fit when data changes constantly and every reader must see the latest value.
+
+- **Bank balances** must come from the source of truth, not a copy that might be seconds old. A slower but correct read beats a fast wrong one.
+- **Live stock prices** change many times a second. Caching them for minutes would show wrong prices. Market data systems instead push updates to clients, or cache for well under a second where a tiny delay is acceptable.
+
+The rule: cache when a slightly stale answer is acceptable, and choose the TTL to match how stale is acceptable.
+
+## Content delivery networks
+
+A **CDN** is a network of servers spread around the world that cache static content and serve it from the location **closest to each user**.
+
+Picture an online store that ships everything from one warehouse in Mumbai. Orders from Mumbai arrive the same day; orders from Delhi take days. Open warehouses in several cities, each stocked with copies of popular items, and everyone gets fast delivery. A CDN does this for files.
+
+### Origin, edge and DNS
+
+| Part | Role |
+|---|---|
+| **Origin server** | Holds the original, authoritative content. Changes are made here first. |
+| **Edge servers (PoPs)** | Located in many cities; hold cached copies of origin content and serve nearby users. |
+| **DNS / request routing** | When a user looks up your domain, the CDN's DNS answers with the address of a nearby edge (or uses anycast), so the request never travels to the origin. |
+
+Most CDNs work on a **pull** model: an edge fetches a file from the origin the first time someone nearby requests it, then serves its copy until it expires or is purged. Some setups **push** content to edges in advance, useful for a big launch or a large video file you know will be popular.
+
+### What to put on a CDN
+
+Static assets that are the same for every user and change rarely:
+
+- HTML for static pages, CSS, JavaScript
+- Images and video
+- PDFs and downloadable files, such as a product's spec sheet
+- Fonts and icons
+
+Personalised pages and API responses that differ per user generally stay off the CDN, or are cached only with great care.
+
+## SQL and NoSQL
+
+Every real application has a database, and picking the wrong kind affects how efficiently you can store, query and scale data for the life of the product.
+
+### Relational databases
+
+**Relational (SQL) databases** store data in **tables** of rows and columns with a **predefined schema**. Relationships between tables are expressed with **foreign keys**, and you query with SQL, including joins across tables.
+
+```sql
+CREATE TABLE users  (id BIGINT PRIMARY KEY, email TEXT UNIQUE NOT NULL);
+CREATE TABLE orders (id BIGINT PRIMARY KEY,
+                     user_id BIGINT NOT NULL REFERENCES users(id),
+                     total_cents INT NOT NULL CHECK (total_cents >= 0));
+
+SELECT u.email, SUM(o.total_cents)
+FROM users u JOIN orders o ON o.user_id = u.id
+GROUP BY u.email;
+```
+
+Every row must match the schema, which catches bad data early. Changing the schema is possible (migrations) but deliberate. Examples: PostgreSQL, MySQL, Microsoft SQL Server, Oracle.
+
+### NoSQL families
+
+**NoSQL** ("not only SQL") databases are non-relational and usually have **flexible schemas**. Most are designed to scale **horizontally** across many machines. They come in four main families:
+
+| Model | Shape | Example | Typical use |
+|---|---|---|---|
+| Key-value | Key maps to an opaque value | Redis, DynamoDB | Caching, sessions, counters |
+| Document | JSON-like documents with nested fields | MongoDB | Product catalogues, user profiles, varied records |
+| Wide-column | Rows with huge, sparse sets of columns, partitioned by key | Cassandra | Time series, event logs, very high write rates |
+| Graph | Nodes and edges | Neo4j | Social graphs, recommendations, fraud rings |
+
+### Choosing
+
+| Need | Lean towards |
+|---|---|
+| Transactions that must be ACID (payments, orders, inventory) | SQL |
+| Complex queries, joins, reporting | SQL |
+| Data with many relationships and integrity rules | SQL |
+| Schema still changing fast, records with varied shapes | NoSQL (document) |
+| Massive scale with simple access patterns and low latency | NoSQL (key-value, wide-column) |
+| High-speed caching, sessions | NoSQL (key-value) |
+| Traversing relationships many hops deep | Graph |
+
+These are tendencies, not laws. PostgreSQL stores and indexes JSON well; MongoDB and DynamoDB now support multi-record transactions; and large social networks have been built on sharded MySQL. Choose based on your access patterns and correctness needs, not on fashion.
+
+### ACID transactions
+
+A **transaction** groups several operations into one unit. Relational databases guarantee **ACID** properties for transactions:
+
+- **Atomicity**: all operations succeed or none do. A transfer that debits one account must also credit the other, or roll back entirely. No half-finished transfers.
+- **Consistency**: a transaction moves the database from one valid state to another. Constraints (foreign keys, `CHECK`, `UNIQUE`) are never left violated.
+- **Isolation**: concurrent transactions don't interfere. Depending on the isolation level, this prevents dirty reads (seeing uncommitted data), lost updates and other race conditions.
+- **Durability**: once a transaction commits, it survives crashes. The database writes it to a log on disk before confirming.
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+UPDATE accounts SET balance = balance + 500 WHERE id = 2;
+COMMIT;  -- both happen, or (on error / ROLLBACK) neither does
+```
+
+This is why money, orders and inventory default to relational databases: they need these guarantees, and SQL databases have provided them reliably for decades.
+
+## Vertical and horizontal scaling
+
+**Scaling** means increasing a system's capacity to handle more traffic, more users, more data or sudden spikes. There are two directions.
+
+**Vertical scaling (scale up)** makes one machine more powerful: more CPU, more RAM, bigger disks, faster network. A server with 8 GB of RAM and a 1 TB disk becomes one with 32 GB and 2 TB.
+
+- **Pros:** no architecture changes, simple to manage, and everything stays on one machine, so there's no network hop between components and no data to keep in sync.
+- **Cons:** there's a hard ceiling on how big one machine gets; high-end hardware costs disproportionately more; resizing often means downtime; and it's still a **single point of failure**.
+
+**Horizontal scaling (scale out)** adds more machines, each handling a share of the traffic or data, usually behind a load balancer.
+
+- **Pros:** practically unlimited growth, commodity machines are cheaper per unit of capacity, and losing one machine just reduces capacity instead of causing an outage.
+- **Cons:** the architecture must change. Servers must be stateless, data spread over machines must be kept **consistent**, and machines must coordinate over a network that can be slow or fail. Moving from one big server to many usually means real redesign.
+
+<SdScalingComparator />
+
+A common path: scale vertically while it's cheap and easy, design the app servers to be stateless from day one, and scale out when one machine's ceiling or its single point of failure becomes the real risk.
+
+## Database sharding
+
+Stateless app servers scale out easily. Databases are harder, because they hold the state. **Sharding** is how a database scales out: one large database is split into smaller, independent databases called **shards**, each holding a **subset** of the rows. Together they hold the full dataset.
+
+### Why shard
+
+- **Data size.** A table with billions of rows won't fit on, or be fast on, one machine.
+- **Write throughput.** One server can only commit so many writes per second, and read replicas don't help with writes.
+- **Blast radius.** If one shard has an outage, only the users on that shard are affected.
+
+Sharding comes **after** cheaper options: vertical scaling, indexing, caching and read replicas. It's powerful, but it makes cross-shard queries, joins and transactions much harder.
+
+### Choosing a shard key
+
+Sharding needs two decisions: a **shard key**, and an **algorithm** that maps key values to shards.
+
+The **shard key** is the column used to decide where each row lives. A good shard key:
+
+- **Never changes.** On a social network, a user's name, photo and city can change, but their `user_id` can't. Changing the key would mean moving the row to a different shard.
+- **Has high cardinality** (many distinct values), so data can spread evenly. Sharding by `country` puts all of India on one shard.
+- **Matches the main access pattern.** If almost every query is "data for this user", sharding by `user_id` keeps each user's data on one shard and most queries touch only one shard.
+
+### Hash-based sharding
+
+Hash the key and take it modulo the number of shards: `shard = hash(user_id) mod 4` gives a shard number from 0 to 3.
+
+- **Pros:** spreads data and load evenly, even with sequential IDs.
+- **Cons:** adding or removing a shard changes the modulus, so most keys map to a different shard and must move: an expensive **rebalancing**. Range queries ("users who joined last week") must ask every shard. **Consistent hashing** reduces the movement when shards change to roughly 1/N of the keys.
+
+### Range-based sharding
+
+Assign contiguous ranges of the key to shards: user IDs 1 to 100,000 on shard 1, 100,001 to 200,000 on shard 2, and so on.
+
+- **Pros:** simple to understand, range queries hit few shards, and adding a new shard for a new range moves no existing data.
+- **Cons:** **hotspots**. With sequential IDs, every new signup lands on the newest shard, and new users are often the most active. One shard does most of the work while older shards sit idle.
+
+### Directory-based sharding
+
+Keep a **lookup table** (the directory) that maps each key, or group of keys, to its shard.
+
+| user_id | shard |
+|---|---|
+| 101 | shard 1 |
+| 102 | shard 2 |
+| 103 | shard 1 |
+
+To serve `GET /users/102`, the system first looks up 102 in the directory, finds shard 2, then queries shard 2.
+
+- **Pros:** total flexibility. You can move one heavy customer to its own shard, or rebalance by updating entries rather than rehashing everything.
+- **Cons:** every query needs an **extra lookup** (usually cached); the directory is a **single point of failure** and must be highly available; and it must stay **in sync** with data as it moves, or queries go to the wrong shard.
+
+<SdShardRouter />
+
+| Strategy | Even spread | Adding a shard | Range queries | Extra moving part |
+|---|---|---|---|---|
+| Hash | Yes | Moves most data (unless consistent hashing) | Hit every shard | None |
+| Range | Risk of hotspots | Easy | Efficient | None |
+| Directory | Controllable | Flexible | Depends | The directory itself |
+
+## Cheat sheet
+
+- System design keeps software working under real-world scale and distance.
+- Clients talk to servers; only servers talk to databases.
+- Three-tier (presentation, application, data) lets each layer scale and change independently.
+- Start with a monolith; move to microservices when independent deploys and scaling outweigh distributed-system costs.
+- Sync for answers the caller needs now; async with a queue for work that can happen later.
+- Load balancers spread traffic and skip dead servers; round robin for uniform work, least connections for uneven work.
+- Prefer stateless servers with a shared session store over sticky sessions.
+- LRU is the default eviction policy; FIFO ignores popularity; LFU keeps long-term favourites.
+- Don't cache data where staleness is unacceptable (balances); match TTL to tolerable staleness.
+- CDNs: origin is the truth, edges hold cached copies, DNS steers users to a nearby edge.
+- SQL for ACID transactions, joins and integrity; NoSQL for flexible schemas and massive simple-access scale.
+- Shard by a stable, high-cardinality key; hash spreads evenly, range risks hotspots, directory needs a highly available lookup.

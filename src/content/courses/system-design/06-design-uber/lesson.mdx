@@ -1,0 +1,311 @@
+import { SdHexDispatchMap } from "@/components/widgets/SdHexDispatchMap";
+import { SdTripStateMachine } from "@/components/widgets/SdTripStateMachine";
+
+## What we are designing
+
+A ride-hailing service connects riders who need a trip with nearby drivers who are free. The core loop looks simple:
+
+1. The rider opens the app and requests a ride from a pickup point.
+2. The backend finds free drivers near that point.
+3. A matching step picks the best driver.
+4. That driver gets an offer and accepts it.
+5. Both apps track the trip live until drop-off, then the rider is charged.
+
+Underneath that loop sit three hard problems: **ingesting a firehose of GPS updates**, **answering "who is near here?" in milliseconds**, and **never giving one driver to two riders**. This lesson builds the design around those three.
+
+## Requirements
+
+### Functional requirements
+
+- Riders request a ride, see an ETA and price, and watch the driver approach on a map.
+- Drivers go online and offline, stream their location, and accept or decline offers.
+- The system matches each request with a suitable nearby driver.
+- A trip moves through clear states from request to completion, and the rider is charged at the end.
+- Pricing adjusts to supply and demand (surge).
+
+### Non-functional requirements
+
+- **Low matching latency**: a match within a few seconds.
+- **Fresh locations**: positions no more than a few seconds old.
+- **Correctness where money and assignment are involved**: a driver is never double-booked; a rider is never double-charged.
+- **High availability**: an outage strands people on the street.
+- **Locality**: almost all traffic is local to a city, which we will exploit for sharding.
+
+## Scale estimates
+
+### Trips
+
+Assume about 200 million monthly users and about **40 million trips per day**.
+
+```text
+40,000,000 trips / 86,400 s ≈ 460 ride requests per second on average
+peak (rush hour, events) ≈ 3-5x average ≈ 1,500-2,500 per second
+```
+
+Ride requests are not the heavy part of the load. Location updates are.
+
+### Location updates
+
+Assume **2 million drivers online** at peak, each sending a GPS ping **every 4 seconds**:
+
+```text
+2,000,000 / 4 s = 500,000 location updates per second
+```
+
+A ping is small:
+
+| Field | Bytes |
+|---|---|
+| driver ID | 8 |
+| latitude (double) | 8 |
+| longitude (double) | 8 |
+| timestamp | 8 |
+| heading, speed, status | about 8 |
+| **Total** | **about 40** |
+
+The **latest position of every online driver** is then 2M × 40 B = **80 MB**. That is small enough to fit in the memory of a single Redis node. We still shard it, for throughput (500k writes per second) and availability, not because it does not fit.
+
+### Bandwidth
+
+```text
+ingress: 500,000 pings/s × 40 B = 20 MB/s ≈ 160 Mbit/s   (before protocol overhead)
+egress:  if ~5 riders watch each moving driver, ≈ 5x ingress ≈ 100 MB/s ≈ 800 Mbit/s
+```
+
+Real numbers are higher once TLS, framing and headers are added, which is one reason to use a compact binary format and long-lived connections rather than a fresh HTTPS request per ping.
+
+### Storage estimate
+
+| Data | Per unit | Per day | Per year |
+|---|---|---|---|
+| Trip records (rider, driver, route summary, fare, timestamps) | about 1 KB × 40M trips | about 40 GB | about 14.6 TB |
+| Location trail during trips (a ping every 4 s, 20-minute trips = 300 pings) | 40M × 300 × 40 B | 12 billion pings, about 480 GB | about 175 TB |
+
+Location trails dominate. They are needed for fare calculation, safety investigations, disputes and machine learning, but only the recent ones need fast access. Old trails can move to cheap, compressed storage.
+
+## APIs
+
+```text
+Rider
+POST /rides                       { pickup, dropoff, product }   -> { rideId, eta, price }
+GET  /rides/{rideId}                                             -> trip state, driver, ETA
+POST /rides/{rideId}/cancel
+
+Driver
+POST /drivers/me/status           { online: true }
+POST /offers/{offerId}/accept     (or /decline)
+POST /rides/{rideId}/start        POST /rides/{rideId}/complete
+
+Streaming (one long-lived connection per app)
+driver -> server   location pings every 4 s
+server -> driver   ride offers
+server -> rider    driver location, ETA updates, trip state changes
+```
+
+## The edge layer
+
+Every phone holds a **persistent connection** to the backend. Polling would not work at this scale: 2 million drivers and millions of riders asking "anything new?" every second would be mostly wasted requests, and offers to drivers must arrive in under a second.
+
+Uber built its own push platform for this, called **RAMEN** (Realtime Asynchronous MEssaging Network). It keeps a long-lived stream open to each app (originally over server-sent events, later bidirectional gRPC streams), with message acknowledgements and replay after reconnects. In an interview, "WebSockets, or a similar persistent bidirectional stream" is the right level of detail.
+
+In front of the services sits the usual edge:
+
+- **Load balancers and a web application firewall** for traffic distribution and attack filtering.
+- An **API gateway** for authentication, rate limiting and routing requests to internal services.
+
+## Location ingestion
+
+Location pings take this path:
+
+1. The driver app sends a ping over its persistent connection.
+2. The gateway publishes it to **Kafka**, partitioned by driver ID (or by city).
+3. The **location service** consumes the stream, converts each position into a geo cell (next section), and updates the **real-time index in Redis**.
+4. Other consumers read the same stream independently: trip recording, surge pricing, fraud detection, ETA model training.
+
+Why Kafka in the middle? It **decouples** the 500k-per-second producers from the consumers. If the location service slows down or restarts, pings queue up durably instead of being dropped, and each consumer can read at its own pace. It also lets several independent systems consume the same data without the gateway calling each of them.
+
+Why Redis for the index? Matching needs "current position and status of drivers near X" in milliseconds, and the data is small, constantly overwritten and only valuable while fresh. That is the ideal profile for an in-memory store. Each driver record gets a **short TTL** (say 30 seconds), so a driver whose app crashes or loses signal quietly disappears from search rather than receiving offers they will never see.
+
+## Geospatial indexing
+
+### Why not just query by distance
+
+The naive approach is a SQL query:
+
+```sql
+SELECT driver_id FROM drivers
+WHERE status = 'available'
+  AND distance(lat, lng, :rider_lat, :rider_lng) < 2000
+ORDER BY distance(...) LIMIT 10;
+```
+
+Without a spatial index this computes the distance to every driver in the table, for every request, while the table is rewritten 500,000 times a second. We need an index that turns "near this point" into a cheap lookup.
+
+### Divide the map into cells
+
+The standard trick is to divide the map into **cells**, each with an ID. Every driver is filed under the cell they are in. "Drivers near the rider" becomes "drivers in the rider's cell and the cells around it": a handful of key lookups instead of a scan.
+
+| Scheme | Cell shape | Notes |
+|---|---|---|
+| **Geohash** | Rectangles, encoded as base-32 strings | Shared prefix means "probably close", so prefix queries work. But two points either side of a cell boundary can have totally different hashes, so you must always check neighbours. Neighbour cells sit at different distances (edge vs corner). |
+| **Google S2** | Quadrilaterals on a sphere, numbered along a Hilbert curve, 64-bit IDs | Nearby cells have nearby IDs, which makes it great for **sharding** data by ranges of cell IDs. |
+| **Uber H3** | Hexagons, in 16 resolutions, 64-bit IDs | Every hexagon has exactly **six neighbours, all the same distance away**. That makes "expand the search ring by ring" uniform in every direction. |
+
+Hexagons win for the search itself. With squares, a "one ring" search covers corner cells farther away than edge cells, so the search area is lumpy. With hexagons, each ring is a good approximation of a circle. Uber open-sourced H3 for exactly this kind of neighbourhood analysis. At resolution 9 a hexagon is roughly 0.1 square kilometres, a few city blocks, which is a sensible granularity for pickup matching.
+
+### Indexing drivers by cell
+
+On each ping, the location service computes the driver's cell and updates two structures:
+
+```text
+driver:{driverId}   HASH  { lat, lng, cell, status, updatedAt }   EXPIRE 30
+cell:{h3Index}      SET   { driverIds currently in this cell }
+```
+
+If the driver crossed into a new cell, it is removed from the old cell's set and added to the new one. We keep the **exact coordinates** in the driver record too, not just the cell: the cell finds candidates quickly, and the exact position is needed to rank them and draw the car on the map. (Redis also has built-in `GEOADD` and `GEOSEARCH`, which store geohash-encoded positions in a sorted set; that is a fine alternative for the same job.)
+
+The driver's **status** (available, offered, on trip) lives in the same record. Only available drivers are candidates.
+
+### k-ring search
+
+To find drivers for a rider:
+
+1. Convert the pickup point to its cell.
+2. Look up drivers in that cell. That is **k = 0**.
+3. If there are not enough candidates, widen to every cell within distance 1 of it (**k = 1**, 7 cells), then 2 (19 cells), and so on. The number of cells within distance k is 3k(k+1) + 1.
+4. Stop when there are enough candidates or a maximum radius is reached.
+
+Note that k is a **radius in rings**, not a count of extra cells: k = 3 means every hexagon within three steps, 37 cells in total.
+
+<SdHexDispatchMap />
+
+### Sharding the index
+
+Riders are almost always matched with drivers in the same city, so the index is **sharded geographically**: by city or region, or by ranges of S2 or H3 cell IDs. A request for a pickup in one city hits only that city's shard. Dense downtown areas get smaller shards than suburbs, so load stays even.
+
+## Matching and dispatch
+
+Uber's dispatch system is called **DISCO** (dispatch optimisation). Three ideas matter.
+
+### Batch matching
+
+Matching each request the instant it arrives with "the closest free driver" is greedy, and greedy is often wrong. Suppose rider A is matched with the driver 2 minutes away, and a second later rider B appears for whom that same driver was the only one within 10 minutes. A better plan would have given A a 3-minute driver and B the 2-minute one.
+
+So the dispatcher collects requests in a **short window, a few seconds**, then solves an **assignment problem** over the batch: riders on one side, nearby free drivers on the other, each possible pairing weighted by pickup ETA (and other factors). Algorithms for weighted bipartite matching minimise the total wait across everyone, not just for whoever asked first. The small delay buys noticeably better matches overall.
+
+### ETA, not distance
+
+Straight-line distance is a poor proxy for pickup time: a driver 300 metres away across a river or on the wrong side of a motorway may be 10 minutes out. The edge weights come from an **ETA service** that routes over the road network and corrects the result with a learned model (Uber's DeepETA) using live traffic, time of day, weather and historical data. The same service produces the ETA shown to the rider.
+
+### Reserving a driver
+
+Dispatch runs on many machines in parallel. Two matching workers could each pick driver 101 for different riders in the same instant. To prevent that, a driver is **reserved atomically** before the offer goes out:
+
+```text
+SET driver:101:lock  trip:77  NX  EX 15
+```
+
+`NX` means "only if nobody holds it", so exactly one worker succeeds; the others pick someone else. `EX 15` means the reservation **expires by itself** after 15 seconds, so if the driver ignores the offer, or the worker that made it crashes, the driver becomes available again without anyone cleaning up.
+
+<Callout kind="warn">
+A lock with a timeout is a lease, not a guarantee: a worker that pauses longer than the TTL may still believe it holds the driver. Make the final state change conditional too (for example, "set status to on trip only if it is still offered to trip 77"), so a stale worker's write is rejected.
+</Callout>
+
+## The trip state machine
+
+Once matched, a trip is managed by the **trip service** as an explicit state machine:
+
+```text
+REQUESTED → MATCHING → OFFERED → ACCEPTED → ARRIVED → IN_PROGRESS → COMPLETED
+                ↑          │
+                └──────────┘  offer declined or timed out
+Any state before IN_PROGRESS → CANCELLED
+MATCHING → NO_DRIVERS (search radius exhausted)
+```
+
+Why be this formal?
+
+- **Illegal transitions are rejected.** "Complete trip" on a trip that never started, or a second "accept" from a different driver, are bugs or races. The service refuses them instead of corrupting state.
+- **Every transition is a conditional write**: update the trip only if it is still in the expected state (or version). Two concurrent events cannot both succeed.
+- **Retries are safe.** A duplicate "end trip" arriving after a network retry finds the trip already completed and changes nothing, so the rider is charged once. The payment call itself also carries an idempotency key.
+- **Each transition emits an event** (to Kafka) that drives side effects: push notifications, driver status changes, receipts, analytics.
+
+<SdTripStateMachine />
+
+## Storage
+
+Different data has different needs, so it goes to different stores:
+
+| Data | Store | Why |
+|---|---|---|
+| Live driver positions and status | Redis (sharded by region) | Tiny, overwritten constantly, needed in milliseconds; losing it is fine because the next ping rebuilds it |
+| Location stream | Kafka | Durable buffer, many independent consumers |
+| Users, payment methods (tokenised), driver payout details | Relational database (MySQL or Postgres) | Transactions and strong consistency around money and identity |
+| Trips and recent location trails | Wide-column store such as Cassandra | Massive write volume, multi-region availability, simple access by trip or driver |
+| Old trails and trip history | Object storage or a data lake (S3, HDFS), compressed | Cheap long-term retention for analytics, ML, audits |
+
+A typical **retention** policy keeps trips and trails in the fast store for the window when disputes and safety reports are common (say a week), then moves them to cold storage. They are not deleted; they are just slower to reach.
+
+The rule of thumb behind the money row is about **guarantees, not technology names**: payments need atomic, consistent updates. Relational databases provide that by default, which is why they are the usual choice, but the requirement is the transaction, not "SQL" itself. (Uber's own storage layer for many years, Schemaless, was a sharded key-value design built on top of MySQL.)
+
+## Supporting services
+
+The location stream and trip events feed several more consumers:
+
+- **Surge pricing** compares open requests with free drivers per cell over the last few minutes. Where demand outstrips supply, prices rise, which both rations scarce drivers and pulls drivers toward that area.
+- **Fraud detection** looks for impossible jumps in GPS position (spoofing), unusual payment patterns and collusion between rider and driver accounts.
+- **Notifications** send pushes when the app is in the background: "your driver has arrived", "trip receipt".
+
+## Putting it together
+
+```text
+Driver app ──pings every 4s──►┐
+                              │   Edge: LB + WAF + API gateway
+Rider app ──requests──────────┤   Persistent push connections (RAMEN)
+                              ▼
+                        Kafka (location + trip events)
+                 ┌──────────┼────────────────┬───────────────┐
+                 ▼          ▼                ▼               ▼
+         Location service  Trip recorder   Surge pricing   Fraud detection
+         (lat/lng → H3)     (trails to
+                 │           Cassandra)
+                 ▼
+         Redis geo index (by region)
+                 ▲
+                 │ k-ring lookup
+         DISCO matching (batches, ETA, driver lock)
+                 │
+                 ▼
+         Trip service (state machine) ──► MySQL (users, payments)
+                 │                        Cassandra (trips)
+                 ▼
+         Push to driver and rider apps
+```
+
+Following one ride: the rider's request reaches DISCO through the gateway. DISCO looks up the pickup cell, gathers free drivers from the surrounding rings in Redis, batches the request with others for a couple of seconds, scores pairings by ETA, locks the chosen driver and sends the offer over the driver's push connection. On acceptance, the trip service moves the trip to ACCEPTED, marks the driver on trip, and pushes the driver's position and ETA to the rider. Every ping from then on flows through Kafka to update the map, the trail and the next surge calculation.
+
+## Bottlenecks and trade-offs
+
+| Concern | Approach |
+|---|---|
+| 500k location writes per second | Kafka buffer; geo-sharded Redis; only update the cell sets when the cell actually changes |
+| Dense downtown, empty suburbs | Shard by cell density, not by equal-size areas; smaller cells or lower k in dense areas |
+| Stale drivers (app crashed, tunnel) | TTL on driver records; a missing heartbeat means unavailable |
+| Double-booking | Atomic reservation with expiry, plus conditional state transitions |
+| Match quality vs speed | A batch window of a few seconds; larger windows match better but feel slower |
+| Regional outage | Riders and drivers are local, so regions fail independently; replicate trip data across regions |
+| Cost of storing every ping | Keep only recent trails hot; compress and archive the rest |
+
+## Cheat sheet
+
+- 2M drivers pinging every 4 s = 500k updates/s; 40 B each, 80 MB for every driver's latest position.
+- 40M trips/day ≈ 460 requests/s on average; location trails (about 480 GB/day) dominate storage.
+- Persistent push connections (RAMEN, or WebSockets) instead of polling, for pings, offers and live updates.
+- Kafka buffers and fans out the location stream; Redis holds the live index with TTLs.
+- Index drivers by geo cell; H3 hexagons give six equidistant neighbours and even ring searches.
+- k-ring search widens one ring at a time: 1, 7, 19, 37 cells for k = 0 to 3.
+- Shard the index geographically, by city or cell-ID ranges.
+- Batch requests for a few seconds and solve an assignment problem weighted by ETA, not distance.
+- Reserve a driver with SET NX plus an expiry, and make state changes conditional.
+- The trip is a state machine: illegal transitions are rejected, duplicates are no-ops, each change emits an event.
+- Money in a transactional store, trips and trails in a wide-column store, old data in cold storage.

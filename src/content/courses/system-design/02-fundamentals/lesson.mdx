@@ -1,0 +1,317 @@
+import { SdScaleStory } from "@/components/widgets/SdScaleStory";
+import { SdCapPartition } from "@/components/widgets/SdCapPartition";
+
+## Grow it until it breaks
+
+The best way to understand why large systems look the way they do is to build one in steps. Start with the simplest thing that works, add users until something breaks, add exactly the component that fixes it, and repeat.
+
+By the end you'll have the standard architecture behind most large web products, and, more importantly, you'll know **which problem each box solves**. That's what lets you design systems you've never seen before.
+
+## The starting point
+
+One client, one server.
+
+1. The user types `example.com`. The browser doesn't know where that is, so it asks a **DNS resolver**, which answers with an IP address such as `203.0.113.28`.
+2. The browser opens a **TCP connection** to that IP, negotiates **TLS**, and sends an HTTPS request.
+3. The server handles it, queries its database, and returns a response.
+
+On the public internet, use HTTPS, not plain HTTP: anyone on the path (café Wi-Fi, an ISP) could read or modify unencrypted traffic. Inside a private network, traffic behind the load balancer is sometimes plain HTTP, but the public edge is always encrypted.
+
+This setup is perfect for a side project. Now the product gets popular.
+
+## Vertical scaling
+
+At 10,000 daily users the server starts struggling. The easiest fix is a **bigger machine**: more CPU cores, more RAM, faster disks. This is **vertical scaling**, or scaling up.
+
+It's attractive because **nothing in the code changes**. But two problems remain:
+
+- **There's a ceiling.** The largest machine you can buy is finite, and the price climbs much faster than the capacity near the top end. At a million users, no single box is big enough.
+- **It's a single point of failure.** If that one server crashes, or you reboot it to resize it, the whole product is down.
+
+## Horizontal scaling
+
+The alternative is **more machines** of ordinary size, all running the same code. This is **horizontal scaling**, or scaling out. Capacity grows by adding servers, and if one of three dies, the other two keep serving.
+
+There's a precondition: servers must be **stateless**. If server 1 keeps a user's session in its own memory, that user breaks the moment a request lands on server 2. So session data, uploads and anything else that must survive between requests moves to shared stores (a database, a cache, object storage).
+
+And there's a new problem: the client only knows one IP address. **Which server should it talk to?**
+
+## Load balancers
+
+A **load balancer** sits in front of the servers. DNS points at the load balancer, clients talk only to it, and it forwards each request to one of the servers behind it.
+
+### Routing algorithms
+
+| Algorithm | How it picks | Good when |
+|---|---|---|
+| Round robin | Next server in turn: 1, 2, 3, 1, 2, 3... | Requests cost roughly the same |
+| Least connections | The server with the fewest requests in flight | Request durations vary a lot |
+| IP hash | Hash of the client IP decides the server | The same client should keep hitting the same server |
+
+Round robin assumes every request is equal. In reality, a report export might take five seconds while a profile fetch takes five milliseconds; round robin keeps handing work to a server stuck on slow requests. **Least connections** adapts automatically, because slow servers have more requests open.
+
+**IP hash** gives **sticky sessions**: the same client lands on the same server, useful when the server holds some per-user state. It's a weak tool, though. Many users can share one IP behind a corporate NAT or mobile carrier, so load skews, and mobile users change IPs often. Cookie-based stickiness is more precise, and the cleaner fix is to make servers stateless so stickiness isn't needed at all.
+
+### Layer 4 and layer 7
+
+Load balancers differ in **how much of the request they read**.
+
+- **Layer 4** (transport layer) routes on IP addresses and TCP/UDP ports only. It never looks inside the request, so it's very fast and can carry any protocol, but it can't tell an image request from an API call.
+- **Layer 7** (application layer) parses HTTP. It can route `/api/*` to app servers and `/static/*` to a file server, route by header or cookie, terminate TLS, and retry a failed request on another server.
+
+Most web traffic goes through layer 7 balancers (AWS ALB, Nginx, Envoy) because content-aware routing is so useful. Layer 4 balancers (AWS NLB, for example) are still common for raw TCP or UDP services and extreme throughput, often in front of a layer 7 tier.
+
+### Health checks
+
+The balancer regularly probes each server, for example `GET /health` every few seconds. A server that fails several probes in a row is **taken out of rotation**, and traffic goes only to healthy servers. When it recovers and passes again, it's added back. Users never notice a server died.
+
+### Who balances the balancer
+
+The load balancer is now a single point of failure itself. In practice balancers run as a **pair or a fleet**: active-passive (a standby takes over the shared IP if the active one dies) or active-active (both serve, and DNS or anycast spreads traffic). Managed cloud balancers do this for you.
+
+## CDNs
+
+The servers live in Virginia. A user in Singapore sends every request halfway around the planet and back: 200 ms or more of pure travel time, before any work is done. No amount of server power fixes physics.
+
+A **content delivery network (CDN)** is a fleet of **edge servers** (also called **points of presence**, or PoPs) spread around the world. Users are routed to the nearest one, which serves files from its local copy.
+
+### Cache hits and misses at the edge
+
+1. A user in Mumbai requests `/img/logo.png`. The Asia edge doesn't have it: a **cache miss**.
+2. The edge fetches it from your **origin** server, stores a copy, and returns it.
+3. The next user in Singapore or Mumbai asking for it gets a **cache hit**, served from the edge in a few milliseconds.
+
+Each edge fills independently: the Europe PoP has its own misses and its own copy.
+
+### What belongs on a CDN
+
+Static content that's the same for everyone: images, video, audio, JavaScript bundles, CSS, fonts, and HTML for static sites. **Not** personalised API responses, or anything generated per user or per request.
+
+### Invalidation
+
+When you deploy a new version of `main.js`, edges must stop serving the old one. Two standard approaches:
+
+- **Time to live (TTL).** Each cached file carries an expiry (`Cache-Control: max-age=86400`). After it, the edge re-checks with the origin. Simple, but users may see the old file until it expires.
+- **Versioned file names.** Build tools put a content hash in the name: `main.a1b2c3.js`, then `main.d4e5f6.js` after a change. The HTML references the new name, so it's a brand-new URL that no edge has cached. Old and new can coexist safely, and hashed files can be cached for a year.
+
+Production sites combine both: hashed assets with very long TTLs, and HTML with short TTLs so it picks up new asset names quickly. CDNs also offer an explicit **purge** API for emergencies.
+
+## An in-memory cache
+
+Static files are fast now, but every dynamic request still queries the database. A typical query costs 5 to 50 ms, and many of them are repeats: the same product page, the same profile, the same leaderboard, thousands of times per second, for data that changes rarely.
+
+Put an **in-memory cache** such as **Redis** between the app servers and the database. Redis keeps data in RAM, so a lookup over the network takes well under a millisecond, an order of magnitude or two faster than most database queries. It also stores rich structures (strings, hashes, lists, sets, sorted sets), so a leaderboard can live directly in a sorted set.
+
+The most common pattern is **cache-aside**: the app checks the cache, on a miss reads the database, then stores the result in the cache with a TTL.
+
+```ts
+async function getProduct(id: string) {
+  const cached = await redis.get(`product:${id}`);
+  if (cached) return JSON.parse(cached);                 // hit
+  const row = await db.query("SELECT * FROM products WHERE id = $1", [id]);
+  await redis.set(`product:${id}`, JSON.stringify(row), { EX: 300 }); // miss: fill
+  return row;
+}
+```
+
+### Write strategies
+
+How writes interact with the cache matters as much as reads.
+
+| Strategy | On write | Upside | Downside |
+|---|---|---|---|
+| Write-through | Write to cache and database together | Cache always in sync | Every write pays double; you cache data that may never be read |
+| Write-back (write-behind) | Write to cache now, flush to database later in the background | Very fast writes, batched DB load | Data lost if the cache dies before flushing |
+| Cache-aside + invalidate | Write to database, then delete the cache key | Simple, cache holds only what's read | Next read is a miss; short race windows |
+
+Write-back suits data you can afford to lose a little of (view counters, metrics). Anything that must survive, like orders, goes to the database first.
+
+### Eviction
+
+RAM is limited. When the cache is full, something must go:
+
+- **LRU (least recently used)**: drop the key untouched for the longest. The usual default.
+- **LFU (least frequently used)**: drop the key with the fewest accesses, keeping long-term favourites.
+- **TTL expiry**: keys disappear after a fixed lifetime regardless of space. Essential for data that goes stale, like prices.
+
+### Cache stampede
+
+A viral post's cache key expires. In the next instant, thousands of requests all miss together and **all hit the database** for the same row. The database buckles under a load the cache was supposed to absorb. This is a **cache stampede** (or thundering herd).
+
+Fixes:
+
+- **A lock (single flight).** The first request to miss takes a short lock (in Redis, `SET lock:post:42 1 NX EX 5`), queries the database and refills the cache. Everyone else waits briefly and then reads the refilled cache.
+- **Jittered TTLs.** Add randomness to expiry times so many hot keys don't expire in the same second.
+- **Refresh early or serve stale.** Refresh hot keys in the background before they expire, or serve the slightly old value while one request refreshes it.
+
+### Cold starts
+
+A brand-new or restarted cache is empty, so the first wave of traffic all misses and lands on the database. Fix it by **pre-warming**: load the most popular keys (top products, home-page data) into the cache before sending it real traffic.
+
+## Read replicas
+
+Growth continues. Even with a cache, one database is handling every write and every cache miss. Most products read far more than they write (think 1,000 reads per write), which suggests splitting those jobs.
+
+With **replication**, one **primary** accepts all writes. It streams its changes to several **read replicas**, which serve read queries. Adding replicas scales reads almost linearly. Writes still go to one place, which gives a single source of truth and avoids conflicting updates.
+
+### Replication lag
+
+Replication is usually **asynchronous**: the primary confirms a write before the replicas have applied it. Replicas trail the primary by milliseconds normally, and by seconds or more under heavy load. A read from a replica can therefore return **stale** data.
+
+For most readers that's fine. It's not fine for the person who just made the change: they edit their bio, the page reloads from a replica, and the old bio appears. The fix is **read-your-writes** routing: for a short window after a user writes (say, a few seconds), send that user's reads to the primary, then go back to replicas once they've caught up.
+
+### Failover
+
+If the primary dies, a replica is **promoted** to become the new primary (chosen by an election or by an orchestrator), and the others start following it. With asynchronous replication, any writes the old primary accepted but hadn't yet shipped can be lost, which is why some systems wait for at least one replica to confirm before acknowledging a write.
+
+## Sharding
+
+Eventually the **data itself** outgrows one machine, and since every replica holds a full copy, replicas don't help. The fix is **sharding**: split the data so each **shard** is an independent database holding a subset of rows.
+
+In production, sharding and replication work together: **each shard has its own primary and its own replicas**. If a shard's primary fails, one of that shard's replicas is promoted.
+
+### Range and hash sharding
+
+How do you decide which shard a row lives on?
+
+- **Range-based**: users A to M on shard 1, N to Z on shard 2 (or ID ranges). Range queries are easy, but popular ranges become **hot shards**.
+- **Hash-based**: compute `hash(user_id) mod N`. With 5 shards, user 51 goes to shard 1 and user 57 to shard 2. Data spreads evenly, but range queries must ask every shard.
+
+With MySQL or PostgreSQL you typically build sharding into the application or use a layer like Vitess or Citus. Databases such as Cassandra and DynamoDB are **designed to partition and replicate automatically**, which is a big reason to choose them when you don't need rich relational queries and transactions.
+
+### Consistent hashing
+
+`hash mod N` has a nasty flaw: change N and almost every key maps somewhere new. Going from 4 to 5 shards moves about 80% of the data. Adding capacity, or losing a node, triggers a massive reshuffle.
+
+**Consistent hashing** fixes this. Picture a ring of hash values. Each server is hashed to positions on the ring, and each key is hashed onto the ring too; a key belongs to the **first server clockwise** from it. Adding a server only takes keys from its neighbour, so roughly **1/N** of keys move instead of nearly all of them.
+
+With one position per server, gaps on the ring are uneven and one server gets a huge slice. So each server is placed at many points, called **virtual nodes**. More virtual nodes means a more even spread, and when a server leaves, its load is shared among many others instead of dumped on one neighbour.
+
+## Message queues
+
+A user uploads a photo. The server must resize it (800 ms), compress it (600 ms), make a thumbnail (400 ms), update the database (50 ms) and send a confirmation email. Doing it all inside the request means the user stares at a spinner for two seconds or more, and if the email provider is down, the upload fails.
+
+The fix is to **decouple** the slow work. The app server saves the essentials, drops a message such as `photo.uploaded {id: 42}` onto a **message queue**, and responds in 30 ms. **Workers** consume messages and do the rest in the background.
+
+What this buys you:
+
+- **Fast responses**: the user waits only for the essential part.
+- **Absorbing spikes**: a surge piles up in the queue, and workers drain it at their own pace instead of the servers falling over.
+- **Retries**: if a worker crashes mid-job, the message wasn't acknowledged, so it's redelivered and retried. The user never knows.
+- **Easy extension**: adding an analytics consumer means subscribing a new worker, with no change to the upload code.
+
+One subtlety: if image, thumbnail and email workers each need to see **every** upload, that's **publish/subscribe** (each subscriber group gets its own copy), not a single shared work queue where each message goes to only one worker. And because delivery is usually **at-least-once**, workers must tolerate seeing the same message twice.
+
+### Kafka and RabbitMQ
+
+| | Kafka | RabbitMQ |
+|---|---|---|
+| Model | Distributed, persistent **log** | Traditional message **broker** with queues |
+| After consumption | Messages stay for a retention period (days, weeks) | Message is removed once acknowledged |
+| Consumers | Each tracks its own offset and can **replay** history | Broker pushes messages; routing via exchanges |
+| Strong at | Event streams, analytics pipelines, audit logs, very high throughput | Task queues, flexible routing, per-message acknowledgement |
+
+## Object storage
+
+Images, video, PDFs and audio don't belong in the database. Databases are optimised for small, structured, queryable rows; stuffing large binary blobs into them bloats backups, slows replication and wastes expensive storage.
+
+Store files in **object storage** (Amazon S3, Google Cloud Storage, Azure Blob Storage) instead. It's cheap, effectively unlimited, and highly durable. The database keeps only metadata and the file's key or URL. Files are served to users **through the CDN**, with object storage as the CDN's origin.
+
+### Pre-signed URLs
+
+Funnelling uploads through your app servers wastes their bandwidth. Instead:
+
+1. The client asks your API for permission to upload.
+2. The server checks auth and returns a **pre-signed URL**: a link to a specific object, with an expiry time and a cryptographic signature.
+3. The client uploads the file **directly to object storage** with that URL.
+4. Storage emits an event (or the client confirms), and a message lands on the queue so workers can process the file.
+
+The signature means nobody can change the target or reuse the link after it expires. Downloads of private files work the same way. File-sharing products rely heavily on this pattern.
+
+## Real-time updates
+
+Plain HTTP is request-response: the client asks, the server answers, done. Chat, live notifications and collaborative editors need the server to **push** data as it happens.
+
+| Technique | How it works | Trade-off |
+|---|---|---|
+| Short polling | Client asks "anything new?" every few seconds | Simple, but most responses are empty: wasted requests |
+| Long polling | Server holds the request open until there's news (or a timeout), then the client asks again | Fewer empty responses, but constant reconnects |
+| Server-sent events (SSE) | One long-lived HTTP response the server keeps writing events to | **Server to client only**; great for feeds, notifications, live prices |
+| WebSockets | One persistent, **bidirectional** connection after an upgrade handshake | Low overhead both ways; chat, games, collaborative editing |
+
+Choose SSE when only the server talks, WebSockets when both sides do.
+
+## Idempotency
+
+A user pays $100. The server charges the card, but the network drops before the response reaches the phone. The app sees a timeout and retries. Without protection, the server charges **another** $100: it has no way to know this is the same payment.
+
+An operation is **idempotent** if doing it many times has the same effect as doing it once. `GET`, `PUT` and `DELETE` are idempotent by design; `POST` is not. To make a `POST` safe to retry, use an **idempotency key**:
+
+```http
+POST /payments
+Idempotency-Key: 7f3c9a2e-4b1d-4e8a-9c55-2d1f0b6a8e13
+Content-Type: application/json
+
+{"amount": 10000, "currency": "USD"}
+```
+
+1. The client generates a unique ID (a UUID) **once per logical operation** and reuses it on every retry.
+2. The server atomically checks a store (Redis or the database) for that key.
+3. Unseen key: process the payment, then save the key with its result.
+4. Seen key: skip the work and return the saved result.
+
+The check must be atomic (for example `SET key NX`), or two simultaneous retries could both slip through. Payment APIs like Stripe and PayPal use this exact pattern, and it applies equally to order submission, emails and any write a client might retry.
+
+## The CAP theorem
+
+Once data lives on several machines, the network between them can fail. The **CAP theorem** describes the choice you're forced into:
+
+- **Consistency (C)**: every read sees the latest write. No stale answers.
+- **Availability (A)**: every request gets a non-error response, even if it might be stale.
+- **Partition tolerance (P)**: the system keeps operating when the network splits nodes into groups that can't talk to each other.
+
+A partition is a **network split**, not merely a crashed node: both sides are alive but can't reach each other. In any real distributed system partitions will happen, so P isn't optional. The real choice is what to do **during** a partition:
+
+- **CP**: refuse requests that can't be confirmed as current. Correct or nothing. Right for **bank balances, payments, inventory counts** you sell against.
+- **AP**: keep answering from whatever data each side has, and reconcile later. Right for **view counts, likes, feeds**: one viewer seeing 100k views while another sees 200k is fine, because both converge.
+
+"CA" only exists for a system on a single machine, where there's no network to partition.
+
+In practice, CP systems usually rely on a **majority (quorum)**: with three replicas, the side holding two can keep serving, while the lone replica refuses requests until the network heals. An AP system lets both sides accept writes, which is exactly how two withdrawals can each be approved against the same money.
+
+<SdCapPartition />
+
+<Callout kind="tip">
+When there's no partition, the trade-off becomes **latency vs consistency**: waiting for replicas to agree makes every request slower. This extension is called PACELC, and it's why many systems choose eventual consistency even when the network is healthy.
+</Callout>
+
+## The full picture
+
+Put together, the design looks like this:
+
+1. **DNS** resolves the domain to the **load balancer** (a redundant pair).
+2. Static files come from the **CDN**, backed by **object storage**.
+3. The layer 7 balancer spreads API requests over **stateless app servers**, skipping unhealthy ones.
+4. App servers read from **Redis** first, then the database.
+5. The database is **sharded** (consistent hashing), and each shard has a **primary for writes** and **replicas for reads**, with failover.
+6. Slow work goes onto a **queue** and is processed by **workers**.
+7. Uploads go **directly to object storage** via pre-signed URLs.
+
+Every box exists because something broke without it:
+
+<SdScaleStory />
+
+## Cheat sheet
+
+- Vertical scaling is simple but has a ceiling and a single point of failure; horizontal scaling needs stateless servers.
+- Load balancers: round robin for uniform requests, least connections for uneven ones, stickiness only if you must.
+- Layer 4 routes on IP and port; layer 7 reads HTTP and can route by path, header or cookie.
+- CDNs serve static content from the nearest edge; use hashed file names plus TTLs for invalidation.
+- Cache-aside with Redis is the default; write-back is fast but can lose data.
+- Prevent stampedes with a lock (single flight), jittered TTLs or early refresh; pre-warm cold caches.
+- Replicas scale reads, not writes; route a user's reads to the primary briefly after they write.
+- Sharding splits data; `hash mod N` reshuffles on resize, consistent hashing moves about 1/N of keys.
+- Queues make slow work asynchronous, absorb spikes and enable retries; consumers must be idempotent.
+- Files go in object storage via pre-signed URLs; the database stores only metadata.
+- SSE for server-to-client pushes, WebSockets for two-way real-time.
+- Idempotency keys make retried POSTs safe; during a partition choose CP for money, AP for counters.
