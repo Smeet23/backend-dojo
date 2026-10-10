@@ -1,0 +1,273 @@
+import { HldQuorumLab } from "@/components/widgets/HldQuorumLab";
+
+## What we are designing
+
+A key-value store is the simplest database there is: you `put(key, value)` and later `get(key)`. No schema, no joins, no query language. Amazon's Dynamo, Apache Cassandra, Riak and DynamoDB all grew from this idea, and they power shopping carts, session stores, user profiles, feature flags and countless other "look it up by id" workloads.
+
+On one machine it is a hash map with a file behind it. The interesting problem is building one that spans **hundreds of machines**, survives machines dying every day, keeps serving through network partitions, and still answers in a few milliseconds. Almost every hard idea in distributed systems shows up along the way: partitioning, replication, quorums, conflict resolution, failure detection and repair.
+
+## Requirements
+
+### Functional requirements
+
+- `put(key, value)` stores a value; `get(key)` returns it.
+- Keys are small (up to a few hundred bytes); values are small to medium (up to, say, 1 MB).
+- Optional per-key TTL and delete.
+
+### Non-functional requirements
+
+- **Scalability**: add machines to grow storage and throughput, with no downtime.
+- **High availability**: reads and writes keep working when nodes fail, even during network partitions (we will see this means choosing availability over strict consistency).
+- **Low latency**: single-digit milliseconds at p99 for get and put.
+- **Tunable consistency**: callers choose, per request, between faster/more available and more consistent.
+- **Durability**: an acknowledged write must survive node crashes.
+- **Heterogeneity**: newer, bigger machines should take proportionally more data.
+
+## Single server first
+
+A single-node store keeps a **hash table in memory** for speed and persists to disk so it survives restarts. Two tricks stretch it further: compress values, and keep only hot keys in memory with the rest on disk.
+
+But one machine has hard limits: its RAM and disk cap the data size, its CPU and network cap throughput, and when it dies, everything is unavailable. To go further we must **spread data across many nodes** and **keep copies** of each key on several of them. The rest of this lesson is about doing those two things well.
+
+## The CAP choice
+
+The **CAP theorem** says that when a **network partition** splits your nodes into groups that cannot talk to each other, each node that receives a request must choose:
+
+- **Consistency (CP)**: refuse the request (or block) because it cannot confirm it has the latest data, or cannot make the write visible everywhere.
+- **Availability (AP)**: answer anyway with what it has, accepting that replicas may diverge for a while.
+
+Partitions are not optional in a distributed system, so the real choice is CP or AP during a partition. A bank ledger chooses CP. A shopping cart, a social feed or a session store usually chooses AP: a briefly stale or temporarily divergent value is far cheaper than an error page.
+
+The classic Dynamo-style design, which we follow here, is **AP with tunable consistency**: it stays available and resolves divergence afterwards, while letting callers ask for stronger guarantees per request.
+
+## Partitioning with consistent hashing
+
+With a lot of data, each node should own only a slice of the keys. The naive scheme, `node = hash(key) % N`, falls apart when N changes: going from 4 to 5 nodes changes the result for about 80% of keys, so nearly all data moves.
+
+**Consistent hashing** fixes that:
+
+1. Hash both **nodes** and **keys** onto the same circular space, for example 0 to 2^128 − 1, called the **ring**.
+2. A key belongs to the **first node found walking clockwise** from the key's position.
+3. When a node joins, it takes over only the keys between its position and its predecessor's. When a node leaves, only its keys move, to the next node clockwise.
+
+On average only **1/N of keys move** when one node is added or removed, which is what lets the cluster grow or shrink without a mass reshuffle.
+
+### Virtual nodes
+
+With one position per node, the ring is lumpy: some nodes get huge arcs and others tiny ones, and when a node dies its whole load lands on a single neighbour. The fix is **virtual nodes (vnodes)**: each physical node is placed at many points on the ring (say 100 to 256), each owning a small arc.
+
+- Load evens out statistically, because each node's share is the sum of many small random arcs.
+- When a node fails, its many small arcs are spread across many different neighbours instead of one.
+- **Heterogeneous hardware** is easy: a machine with twice the capacity gets twice as many vnodes.
+
+## Replication
+
+To survive node failures, each key is stored on **N** nodes, where N is the **replication factor** (commonly 3). After finding the key's position on the ring, walk clockwise and pick the first N **distinct physical nodes** (skipping vnodes that belong to a node already chosen). That ordered list is the key's **preference list**; the first node is usually the **coordinator** for that key.
+
+Placement should also cross failure domains. If all three replicas sit in one rack or one availability zone, a single power or network event loses them all. Production systems make the walk **rack- and zone-aware** so the N replicas land in different zones.
+
+Replicas are updated **asynchronously** relative to each other: the coordinator sends the write to all N, but how many it waits for is what the next section is about.
+
+## Quorum reads and writes
+
+Three numbers control the trade-off between consistency, latency and availability:
+
+- **N**: the number of replicas for each key.
+- **W**: how many replicas must **acknowledge a write** before the coordinator tells the client "success".
+- **R**: how many replicas must **answer a read** before the coordinator returns a value (it returns the newest version among them).
+
+The coordinator always sends to all N healthy replicas; W and R only decide how many responses it waits for. The rule to remember:
+
+**If R + W is greater than N, every read set overlaps every write set**, so at least one replica in any read has the latest acknowledged write. With N = 3, W = 2 and R = 2, any two replicas you read share at least one with any two that acknowledged the write.
+
+| Setting (N = 3) | Behaviour | Good for |
+|---|---|---|
+| W = 3, R = 1 | Reads fast and fresh; any one replica down blocks writes | Read-heavy, rarely written data |
+| W = 1, R = 3 | Writes fast; any one replica down blocks reads | Write-heavy, rarely read data |
+| W = 2, R = 2 | Balanced; tolerates one failure for both | The common default |
+| W = 1, R = 1 | Fastest and most available; stale reads possible | Caches, metrics, anything that tolerates staleness |
+
+A few subtleties keep this honest:
+
+- **Latency follows the slowest replica you wait for.** W = 3 means every write waits on the slowest of three nodes.
+- **Availability follows how many you can lose.** Writes survive N − W failures; reads survive N − R.
+- **R + W greater than N is not full linearizability.** Concurrent writes, failed writes that partially landed, and sloppy quorums (below) can still produce surprises. It gives "reads see the latest acknowledged write" under normal conditions, which is what most applications need.
+
+<HldQuorumLab />
+
+## Consistency models
+
+It helps to name what a store promises:
+
+| Model | Promise | Example |
+|---|---|---|
+| **Strong (linearizable)** | Every read sees the most recent completed write, as if there were one copy | A single-leader database with synchronous replication; consensus-based stores (etcd, Spanner) |
+| **Eventual** | If writes stop, all replicas eventually converge; until then reads may be stale | Dynamo-style stores with W = 1, R = 1; DNS |
+| **Read-your-writes** | A client always sees its own earlier writes | Profile edits that must show up immediately for the editor |
+| **Monotonic reads** | A client never sees time go backwards (newer, then older) | Pin a user's reads to one replica |
+| **Causal** | Writes that depend on each other are seen in order by everyone | A reply is never visible before the message it answers |
+
+Strong consistency requires coordination on every write, which costs latency and availability during partitions. Dynamo-style stores default to **eventual consistency** and let you buy more (quorums, session guarantees) where you need it. Session guarantees such as read-your-writes are often implemented on the client side, for example by sticking a user to one coordinator or passing the version they last wrote.
+
+## Versioning and conflicts
+
+Because writes can land on different replicas during failures or partitions, two replicas can end up with **different values for the same key**, both accepted. Something has to decide which wins, or whether both must be kept.
+
+### Last write wins
+
+The simplest policy: attach a timestamp to every write and keep the one with the highest timestamp. Cassandra does this per column.
+
+It is simple and needs no extra metadata, but it **silently loses data**. If two users add different items to the same cart concurrently, one addition disappears. Clock skew between machines makes it worse: a write from a node whose clock runs fast can beat a genuinely later write. LWW is fine when values are immutable or when overwrites are naturally whole-value replacements; it is dangerous for read-modify-write data.
+
+### Vector clocks
+
+A **vector clock** records, per key, a list of `(node, counter)` pairs: how many updates each coordinator has applied to this lineage of the value. It lets the system tell whether one version **descends from** another or whether they are **concurrent**.
+
+Walk through a shopping cart with replicas Sx, Sy and Sz:
+
+```text
+1. Client writes cart=[book], handled by Sx        → D1 [(Sx,1)]
+2. Client adds pen, read D1, handled by Sx         → D2 [(Sx,2)]           D2 descends from D1
+3. Network splits. Client A adds mug via Sy        → D3 [(Sx,2),(Sy,1)]
+4. Client B adds lamp via Sz                       → D4 [(Sx,2),(Sz,1)]
+5. A read sees D3 and D4.
+   Neither has every counter ≥ the other's: they are CONCURRENT (siblings).
+6. The client merges: cart=[book, pen, mug, lamp],
+   writes it via Sx                                → D5 [(Sx,3),(Sy,1),(Sz,1)]
+```
+
+The comparison rule: version X **descends from** Y if every counter in X is greater than or equal to the matching counter in Y. If neither descends from the other, they conflict, and the store returns **both siblings** to the client, whose application logic merges them (for a cart, take the union).
+
+Costs: the clock grows with the number of coordinators that ever touched the key (systems truncate old entries, which can occasionally misclassify), and pushing merge logic to clients adds complexity. An alternative is **CRDTs** (conflict-free replicated data types: counters, sets, maps) that merge automatically by construction.
+
+## Handling failures
+
+At scale, something is always broken. The store needs to notice failures, keep serving through them, and repair the damage afterwards.
+
+### Failure detection with gossip
+
+A central monitor is itself a single point of failure, and having every node ping every other node is O(N²) messages. Instead, nodes use a **gossip protocol**:
+
+1. Each node keeps a **membership list** with a **heartbeat counter** per node.
+2. Each node periodically increments its own heartbeat.
+3. Every second or so, it sends its list to a few **random** peers, which merge it with their own (keeping the higher counter for each node).
+4. If a node's heartbeat has not increased for a while (as seen by several peers), it is marked **suspected down**.
+
+Information spreads through the cluster like a rumour, reaching all nodes in O(log N) rounds, with no central coordinator. The same mechanism propagates ring membership and token ownership.
+
+### Sloppy quorum and hinted handoff
+
+Strict quorums say: if fewer than W of a key's N home replicas are reachable, the write fails. That hurts availability exactly when you need it. A **sloppy quorum** instead uses the **first W healthy nodes** on the ring walk, even if some of them are not in the key's usual preference list.
+
+A stand-in node stores the write together with a **hint**: "this belongs to node C". When gossip reports that C is back, the stand-in **hands the data off** to C and deletes its copy. This is **hinted handoff**, and it covers **temporary** failures, from seconds to hours.
+
+The price: during the failure, a read with R = 2 might hit the two home replicas that never saw the write. Sloppy quorums trade the R + W greater than N guarantee for availability. Most stores let you turn them off when you need the stronger guarantee.
+
+### Anti-entropy with Merkle trees
+
+Hints get lost (the stand-in itself crashes), and nodes can be down for days. For **permanent** divergence, replicas periodically compare their data and repair the differences. Comparing every key would mean shipping the whole dataset across the network, so they use **Merkle trees**:
+
+1. Split a node's key range into buckets.
+2. Hash each bucket's contents; these are the **leaves**.
+3. Build parent nodes by hashing pairs of children, up to a single **root hash**.
+4. Two replicas compare roots. Equal roots mean identical data, done. Different roots mean compare the children, and descend only into subtrees whose hashes differ.
+
+The amount of data exchanged is proportional to the **differences**, not to the dataset size. A billion keys with ten differing need only a handful of hash comparisons down ten paths.
+
+### Read repair
+
+A cheap, opportunistic fix happens on reads. When the coordinator collects R responses and notices some replicas returned an older version, it **writes the newest version back** to the stale ones. Hot keys therefore heal quickly through normal traffic; anti-entropy catches the cold ones.
+
+| Mechanism | Handles | When it runs |
+|---|---|---|
+| Gossip | Detecting failed nodes, sharing membership | Continuously |
+| Hinted handoff | Temporary node outages | When the node returns |
+| Read repair | Stale replicas of keys that get read | During reads |
+| Merkle-tree anti-entropy | Long outages, lost hints, silent divergence | Periodic background job |
+
+Data-centre outages are handled by replicating across **multiple data centres or regions**, with quorums that can be local (fast) or global (stronger).
+
+## Write path
+
+Inside each storage node, the write path follows the **LSM-tree** (log-structured merge tree) design used by Cassandra, RocksDB, LevelDB and others:
+
+1. **Commit log.** Append the write to a sequential log on disk. Sequential appends are fast, and if the node crashes, replaying the log restores what was in memory.
+2. **Memtable.** Insert the write into an in-memory sorted structure (a skip list or balanced tree).
+3. **Acknowledge** to the coordinator.
+4. **Flush.** When the memtable reaches a size threshold, write it to disk as an immutable, sorted file called an **SSTable** (sorted string table), then start a new memtable and trim the commit log.
+
+Every write is a sequential append plus a memory insert. There are **no random disk writes and no in-place updates**, which is why LSM stores sustain very high write throughput. Updates and deletes are just newer entries; a delete writes a marker called a **tombstone**.
+
+## Read path
+
+1. Check the **memtable**. If the key is there, return it (it is the newest).
+2. Otherwise check the SSTables **from newest to oldest**, since a newer file shadows older ones.
+3. For each SSTable, consult its **Bloom filter** first. Only if the filter says "maybe present" do you use the SSTable's **sparse index** to find the right block and read it.
+4. Return the first (newest) version found. A tombstone means "deleted".
+
+Hot data also sits in a row or block cache, so many reads never touch disk at all.
+
+### Bloom filters
+
+A **Bloom filter** is a compact bit array plus k hash functions that answers "is this key in the set?" with either **"definitely not"** or **"maybe"**:
+
+- **Add**: hash the key k ways and set those k bits.
+- **Query**: if any of the k bits is 0, the key was never added, so skip this SSTable. If all are 1, it might be there (or it is a false positive from other keys' bits).
+
+There are **no false negatives**, and the false-positive rate is tunable: about 10 bits per key gives roughly a 1% false-positive rate. Without Bloom filters, a read for a missing key would touch every SSTable on disk; with them, it touches almost none.
+
+### Compaction
+
+SSTables accumulate, and each read may have to check several. **Compaction** runs in the background, merging SSTables (a merge sort, since each is sorted), keeping only the newest version of each key and dropping tombstones once they are old enough. Strategies trade differently:
+
+- **Size-tiered**: merge files of similar size. Cheaper writes, more files per read, needs extra temporary disk.
+- **Leveled**: maintain levels with non-overlapping key ranges. More rewrite work, but most reads touch one file per level.
+
+Tombstones cannot be dropped immediately: if a replica that missed the delete still holds the old value, removing the tombstone early would let anti-entropy **resurrect** the deleted key. Stores keep tombstones for a grace period longer than the repair interval.
+
+## Putting it together
+
+```text
+client ──▶ any node (coordinator for this key, found via the ring)
+             │  sends to N replicas on the preference list (zone-aware)
+             │  waits for W acks (put) or R replies (get)
+             ▼
+   ┌──────── node ────────┐
+   │ commit log → memtable│  flush → SSTables (+ Bloom filters, index)
+   │ compaction in bg     │
+   └──────────────────────┘
+membership & failure detection: gossip
+temporary failures: sloppy quorum + hinted handoff
+permanent divergence: read repair + Merkle-tree anti-entropy
+conflicts: vector clocks (siblings) or last-write-wins
+```
+
+Every node runs the same code and plays the same roles. There is **no leader** and no special node to fail, which is the core of the Dynamo design's availability.
+
+| Goal or problem | Technique |
+|---|---|
+| Store big data | Consistent hashing across nodes |
+| Even load, mixed hardware | Virtual nodes |
+| High availability for reads and writes | Replication plus sloppy quorums |
+| Tunable consistency | N, R, W per request |
+| Concurrent conflicting writes | Vector clocks or LWW; CRDTs |
+| Temporary failures | Hinted handoff |
+| Permanent failures, drift | Merkle-tree anti-entropy, read repair |
+| Failure detection | Gossip |
+| Fast writes | Commit log, memtable, SSTables |
+| Fast reads of absent keys | Bloom filters |
+
+## Cheat sheet
+
+- Consistent hashing moves only about 1/N of keys when a node joins or leaves; vnodes even out load.
+- Each key lives on N distinct nodes from the ring walk, spread across zones.
+- R + W greater than N makes read and write sets overlap; W and R also set latency and failure tolerance.
+- Dynamo-style stores choose availability during partitions and repair divergence afterwards.
+- Last-write-wins is simple but drops concurrent updates and trusts clocks.
+- Vector clocks detect concurrent versions so the client (or a CRDT) can merge them.
+- Gossip spreads membership and detects failures with no central monitor.
+- Sloppy quorum plus hinted handoff keeps writes flowing through temporary failures.
+- Merkle trees let replicas find differences by exchanging hashes, not data; read repair heals hot keys.
+- Writes go to a commit log and memtable, then flush to immutable SSTables; compaction merges them.
+- Reads check memtable, then SSTables newest first, skipping files whose Bloom filter says "definitely not".
+- Keep tombstones longer than the repair interval, or deleted data can come back.

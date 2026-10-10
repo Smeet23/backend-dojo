@@ -1,0 +1,246 @@
+import { HldServiceRegistry } from "@/components/widgets/HldServiceRegistry";
+
+## Why discovery is needed
+
+In a monolith, calling the payments code is a function call. Split it into services and the order service now has to send a network request to the payment service. To do that, it needs an **address**: an IP and a port.
+
+In the old world you'd put that in a config file: `PAYMENTS_URL=http://10.0.4.17:8080`. That breaks quickly in a modern deployment, because instance addresses are **dynamic**:
+
+- **Autoscaling** adds and removes instances as load changes.
+- **Deploys** replace every instance with new ones, often on new IPs.
+- **Failures** kill instances, and schedulers restart them somewhere else.
+- **Containers** get IPs from a pool; a pod's IP changes every time it's recreated.
+- There are **many instances** per service, and callers should spread load across the healthy ones.
+
+**Service discovery** is the mechanism that answers one question at runtime: *"Where are the healthy instances of service X right now?"*
+
+It has three moving parts:
+
+1. A **service registry**: a database of service names mapped to live instance addresses.
+2. **Registration**: how instances get into the registry (and out of it).
+3. **Lookup**: how a caller uses the registry to choose an instance.
+
+## The service registry
+
+The registry is the source of truth for "what is running where". Each entry looks something like:
+
+```json
+{
+  "service": "payments",
+  "instances": [
+    { "id": "payments-7f9c", "address": "10.0.4.17", "port": 8080, "status": "UP", "zone": "us-east-1a", "version": "2.3.1" },
+    { "id": "payments-a21b", "address": "10.0.5.42", "port": 8080, "status": "UP", "zone": "us-east-1b", "version": "2.3.1" }
+  ]
+}
+```
+
+Metadata such as zone and version is useful: callers can prefer instances in their own zone (cheaper, faster) or route a fraction of traffic to a canary version.
+
+Because every call in the system depends on it, the registry must be **highly available**. Registries are run as clusters, and they make an explicit CAP choice:
+
+| Registry | Consistency model | Notes |
+|---|---|---|
+| **Consul** | CP for its catalog (Raft consensus) | Health checks, DNS and HTTP interfaces, key/value store, multi-datacenter |
+| **etcd** | CP (Raft) | Backing store for Kubernetes; used directly via leases and watches |
+| **ZooKeeper** | CP (ZAB) | Ephemeral nodes vanish when the session dies; older but still common |
+| **Eureka** (Netflix) | AP | Peers replicate asynchronously; prefers serving possibly-stale data over refusing |
+
+An **AP** registry keeps answering during a network partition, possibly with stale entries. A **CP** registry may refuse registrations or reads on the minority side. For discovery, stale-but-available is often the better trade: a slightly old instance list is usually still mostly right, and callers retry on failure anyway. Eureka's **self-preservation mode** reflects this: if it suddenly loses heartbeats from a large fraction of instances, it assumes the network is at fault, not the instances, and stops evicting entries.
+
+<Callout kind="tip">
+Callers should **cache** the last good registry response. If the registry is briefly unreachable, the system keeps working on the cached list instead of failing every request.
+</Callout>
+
+## Registration
+
+### Self-registration
+
+Each instance registers itself on startup, sends **heartbeats** while running, and deregisters on graceful shutdown.
+
+```text
+startup   → POST /register { service: payments, addr: 10.0.4.17:8080 }
+every 30s → PUT  /heartbeat/payments-7f9c
+shutdown  → DELETE /register/payments-7f9c
+```
+
+If the heartbeats stop (the process crashed, the VM died, the network broke), the registry expires the entry after a timeout. This is the classic **Eureka** model, where Spring Cloud apps include a client library that does all of this.
+
+- **Pros**: simple; the instance knows best when it's actually ready (after warming caches, running migrations).
+- **Cons**: every service in every language needs registry client code; the instance is coupled to the registry.
+
+### Third-party registration
+
+A separate component, the **registrar**, watches the deployment platform and registers or deregisters instances on their behalf. The service itself knows nothing about discovery.
+
+Examples: **Kubernetes** (the control plane tracks pods and updates EndpointSlices automatically), **Registrator** watching Docker events and writing to Consul, and **AWS** registering ECS tasks into Cloud Map or target groups.
+
+- **Pros**: services stay discovery-agnostic; works for any language; one consistent implementation.
+- **Cons**: the registrar is another critical component, and it needs a readiness signal from the instance (a health endpoint) to know when the instance can really take traffic.
+
+| | Self-registration | Third-party registration |
+|---|---|---|
+| Who writes to the registry | The service instance | A registrar or the platform |
+| Code in the service | Registry client library | Just a health endpoint |
+| Typical example | Eureka client | Kubernetes, Consul with Registrator |
+
+## Health checks and heartbeats
+
+Registering an instance is easy. Knowing when to **remove** one is the hard part. A crashed process can't deregister itself.
+
+### Heartbeats (push)
+
+The instance periodically tells the registry "I'm alive". The registry tracks a lease or TTL and expires the entry when it misses enough heartbeats. Eureka's defaults are a 30-second heartbeat and a 90-second lease, which means a dead instance can stay listed for well over a minute (more once client caches are counted).
+
+### Active health checks (pull)
+
+The registry or agent **probes** the instance: an HTTP `GET /health`, a TCP connect, a gRPC health check, or a script. Consul runs these from a local agent on each node; Kubernetes runs **liveness** and **readiness** probes from the kubelet.
+
+### Liveness vs readiness
+
+These answer different questions and should never be the same check:
+
+| Probe | Question | On failure |
+|---|---|---|
+| **Liveness** | Is the process stuck beyond repair? | Restart it |
+| **Readiness** | Should it receive traffic right now? | Remove it from discovery, but don't restart it |
+
+An instance that is starting up, draining for shutdown, or temporarily overloaded is alive but not ready. Making the readiness check depend on a shared downstream (say, the database) is risky: one database blip marks every instance unready at once and takes the whole service out of discovery.
+
+### Detection speed trade-off
+
+Short intervals detect failures fast but create more load and more **flapping** (healthy instances marked down by one slow response). Long intervals are calmer but route traffic to dead instances longer. Common practice: require several consecutive failures before marking down (e.g. 3), and several successes before marking up again.
+
+<Callout kind="remember">
+Discovery is always slightly behind reality. Callers must still use **timeouts and retries on another instance**, because the registry will sometimes hand out an address that died a second ago.
+</Callout>
+
+<HldServiceRegistry />
+
+## Client-side discovery
+
+In **client-side discovery** the caller queries the registry itself, gets the list of healthy instances, and picks one using its own **load-balancing** logic (round robin, random, least outstanding requests, zone-aware).
+
+```text
+order-service ──(1) lookup "payments"──▶ registry
+order-service ◀─(2) [10.0.4.17, 10.0.5.42]──
+order-service ──(3) direct call──────────▶ 10.0.5.42:8080
+```
+
+The client usually caches the list and refreshes it periodically or via a **watch** (a long-poll that returns when the list changes).
+
+Classic stack: **Netflix Eureka + Ribbon** (Ribbon has since been replaced by Spring Cloud LoadBalancer). gRPC's built-in name resolvers and load-balancing policies work the same way.
+
+- **Pros**: no extra network hop; the client can make smart choices (zone affinity, latency-aware picking, retries on a different instance).
+- **Cons**: discovery and load-balancing logic lives in every client, in every language, and must be kept up to date; clients are coupled to the registry.
+
+## Server-side discovery
+
+In **server-side discovery** the caller sends the request to a fixed address: a **load balancer** or router. The load balancer consults the registry and forwards the request to a healthy instance.
+
+```text
+order-service ──▶ payments-lb (stable address) ──▶ 10.0.5.42:8080
+                        │
+                        └── reads the registry / target group
+```
+
+Examples: **AWS ALB/NLB** with target groups, NGINX or HAProxy fed by Consul templates, and **Kubernetes Services**, where `kube-proxy` programs iptables or IPVS rules on every node.
+
+- **Pros**: clients are simple and language-agnostic; just call one stable name.
+- **Cons**: an extra hop (some latency); the load balancer must itself be highly available and scaled; less per-request intelligence in the client.
+
+| | Client-side | Server-side |
+|---|---|---|
+| Who picks the instance | The calling service | A load balancer or router |
+| Extra hop | No | Yes |
+| Logic per language | Yes | No |
+| Examples | Eureka + Spring Cloud LoadBalancer, gRPC client LB | AWS ALB, Kubernetes Services, NGINX + Consul |
+
+### Service mesh
+
+A **service mesh** (Istio, Linkerd, Consul Connect) is a hybrid. A **sidecar proxy** (Envoy, for example) runs next to each instance. Your code calls `localhost`, and the sidecar does client-side discovery, load balancing, retries, timeouts and mTLS on its behalf, fed by a control plane. You get client-side smarts without writing client libraries in every language, at the cost of running and understanding the mesh.
+
+## DNS-based discovery
+
+DNS is the oldest discovery system of all. Register instances as DNS records and let callers resolve a name:
+
+```text
+$ dig +short payments.service.consul
+10.0.4.17
+10.0.5.42
+
+$ dig +short SRV _payments._tcp.service.consul
+1 1 8080 payments-7f9c.node.dc1.consul.
+1 1 8080 payments-a21b.node.dc1.consul.
+```
+
+`A` records give IPs; `SRV` records also carry ports and weights. Consul exposes a DNS interface that only returns instances passing their health checks.
+
+**Why it's attractive**: every language and tool already speaks DNS. No client library needed.
+
+**Why it's limited**:
+
+- **Caching and TTLs.** Resolvers, operating systems and runtimes cache answers. Some runtimes historically cached DNS far longer than the TTL (older JVMs could cache forever), so clients keep calling dead instances.
+- **Coarse load balancing.** Clients often pick the first record and stick to it, especially with long-lived connections. Load spreads poorly.
+- **Little metadata.** No version, zone or health detail beyond what fits in records.
+
+Use short TTLs (a few seconds) and make sure your runtime honours them.
+
+## Kubernetes Services
+
+Kubernetes bundles third-party registration, a registry, server-side discovery and DNS:
+
+1. A **Deployment** creates pods with labels like `app: payments`.
+2. A **Service** selects pods by label and gets a stable virtual IP (the **ClusterIP**) and a DNS name, `payments.prod.svc.cluster.local`.
+3. The control plane keeps **EndpointSlices** updated with the IPs of pods that pass their **readiness probe**.
+4. **kube-proxy** on every node programs rules so traffic to the ClusterIP is spread across those pod IPs.
+5. **CoreDNS** answers the Service name with the ClusterIP.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments
+spec:
+  selector:
+    app: payments
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+Code simply calls `http://payments` (from the same namespace). Because the DNS answer is a stable virtual IP rather than pod IPs, DNS caching isn't a problem. A **headless Service** (`clusterIP: None`) instead returns the pod IPs directly, for client-side load balancing or stateful sets where you need to address a specific pod.
+
+One gotcha: kube-proxy balances **connections**, not requests. With HTTP/2 or gRPC, one long-lived connection pins a client to one pod. That's why gRPC services often use headless Services with client-side load balancing, or a mesh.
+
+## Graceful registration and deregistration
+
+Discovery problems show up most during deploys:
+
+- **Register late**: only become ready after warm-up (connections opened, caches loaded). Otherwise the first requests hit a cold instance and time out.
+- **Deregister early**: on shutdown, first fail readiness (or deregister), wait long enough for registries, load balancers and client caches to notice, *then* stop accepting connections and drain in-flight requests.
+- **Expect lag everywhere**: registry propagation, client cache refresh, DNS TTLs. A dead address may be handed out for seconds after an instance dies.
+
+## Choosing an approach
+
+| Situation | Reasonable choice |
+|---|---|
+| Everything runs on Kubernetes | Kubernetes Services and DNS; add a mesh for mTLS and smarter L7 balancing |
+| Mixed VMs and containers, several datacenters | Consul with health checks, DNS or HTTP API |
+| JVM / Spring Cloud on VMs | Eureka with client-side load balancing |
+| gRPC with long-lived connections | Client-side load balancing via headless Service, xDS or a mesh |
+| Public traffic into the system | A managed load balancer (server-side) at the edge |
+
+## Cheat sheet
+
+- Service discovery answers "where are the healthy instances of X right now?" because IPs are dynamic.
+- A registry maps service names to live instances; it must be highly available and is either CP (Consul, etcd, ZooKeeper) or AP (Eureka).
+- Self-registration: the instance registers and heartbeats itself. Third-party: a registrar or the platform does it.
+- Heartbeats with leases push liveness; active health checks pull it.
+- Liveness failure means restart; readiness failure means remove from discovery.
+- Client-side discovery: the caller looks up and load-balances itself; no extra hop, but logic in every client.
+- Server-side discovery: call a stable load balancer, which picks an instance; simple clients, extra hop.
+- A service mesh puts client-side discovery in a sidecar proxy.
+- DNS discovery is universal but suffers from caching and coarse load balancing; keep TTLs short.
+- Kubernetes Services combine label selectors, readiness-filtered EndpointSlices, kube-proxy and CoreDNS.
+- Registries always lag reality, so callers still need timeouts and retries on another instance.
+- On shutdown: become unready first, wait for propagation, then drain.

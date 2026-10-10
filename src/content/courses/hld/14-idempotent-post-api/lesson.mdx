@@ -1,0 +1,255 @@
+import { HldIdempotencyKeyLab } from "@/components/widgets/HldIdempotencyKeyLab";
+
+## The double charge problem
+
+A customer taps "Pay ₹2,000". The app sends `POST /payments`. The server charges the card, writes the payment row, and sends back `201 Created`. Then the response is lost: the phone switched from Wi-Fi to mobile data, a load balancer timed out, or the app was backgrounded.
+
+From the client's side, the request **timed out**. It has no idea whether the payment happened. It can either:
+
+- **Not retry**, and maybe the customer never paid, or
+- **Retry**, and maybe the customer pays twice.
+
+Neither is acceptable. The fix is to make the endpoint **idempotent**: sending the same request twice must have the same effect as sending it once. Then retrying is always safe, and the client can retry until it gets an answer.
+
+<Callout kind="remember">
+In a distributed system, a timeout tells you **nothing** about whether the work happened. The request may have failed before, during or after the server did the work. Idempotency is how you make "just retry" correct.
+</Callout>
+
+## Why POST is not idempotent
+
+HTTP defines which methods are idempotent by their meaning:
+
+| Method | Idempotent | Why |
+|---|---|---|
+| `GET` | Yes | Reading changes nothing |
+| `PUT /users/42` | Yes | "Make user 42 look like this." Doing it twice leaves the same state |
+| `DELETE /users/42` | Yes | Once deleted, it stays deleted (a repeat may return 404, but state is unchanged) |
+| `POST /payments` | **No** | "Create a new payment." Each call means another one |
+| `PATCH` | Not guaranteed | `{"balance": 500}` is idempotent; `{"increment": 100}` is not |
+
+POST means "process this", usually "create a new thing". The server can't tell a **retry** of payment A apart from a **second, intentional** payment of the same amount. Both look identical: same user, same amount, same card.
+
+So the fix can't come from HTTP itself. The client must give the server a way to recognise "this is the same request I sent before".
+
+### Sources of duplicates
+
+Duplicates are not rare edge cases. They come from:
+
+- **Client retries** after a timeout or a dropped connection.
+- **User double-clicks** on a submit button.
+- **Proxies and SDKs** that retry automatically on network errors.
+- **Message queues** with at-least-once delivery, which redeliver a message if the consumer crashed before acknowledging it.
+- **Webhooks** that providers resend until they get a `2xx`.
+
+## Idempotency keys
+
+The standard technique: the client generates a **unique key per logical operation** and sends it with the request, usually in a header.
+
+```http
+POST /v1/payments HTTP/1.1
+Idempotency-Key: 6f1c2b7e-8d4a-4e1f-9b2a-3c5d7e9f0a12
+Content-Type: application/json
+
+{ "amount": 200000, "currency": "INR", "source": "card_8x2" }
+```
+
+The server's contract:
+
+- The **first** time it sees a key, it processes the request and **stores the response** against the key.
+- Any **later** request with the same key gets the **stored response replayed**, without doing the work again.
+
+The key identifies the **intent** ("this one payment"), not the HTTP request. Every retry of that intent reuses the same key. A genuinely new payment gets a new key.
+
+### Who generates the key
+
+The **client** generates it, because only the client knows whether a request is a retry or a new action. Rules for clients:
+
+- Use a **UUID v4** (or another random 128-bit value) so keys never collide across clients.
+- Generate the key **once per user action**, when the user clicks Pay, and store it with the pending operation. Don't generate a new key on each retry, or every retry looks new.
+- Persist it if the operation can outlive the process (for example, a mobile app that may be killed and restarted mid-payment).
+
+Stripe's API uses exactly this pattern with the `Idempotency-Key` header, and an IETF draft standardises the header name.
+
+### Scoping keys
+
+A key should be scoped to the **caller**: store it as `(account_id, idempotency_key)`. Otherwise, one customer could (accidentally or maliciously) replay another customer's stored response just by guessing or reusing a key.
+
+## Storing keys and responses
+
+### What to store
+
+For each key, store a record like this:
+
+```sql
+CREATE TABLE idempotency_keys (
+  account_id      BIGINT       NOT NULL,
+  idem_key        TEXT         NOT NULL,
+  request_hash    TEXT         NOT NULL,   -- hash of method + path + body
+  status          TEXT         NOT NULL,   -- 'in_progress' | 'completed'
+  response_code   INT,
+  response_body   JSONB,
+  locked_until    TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_id, idem_key)
+);
+```
+
+- **Request hash.** If the same key arrives with a **different body** (say, a different amount), that's a client bug. Reject it with `422 Unprocessable Content` (or `409`) instead of replaying a response for a different request.
+- **Status.** Distinguishes "done, here's the answer" from "someone is working on it right now".
+- **Response.** The exact status code and body to replay, so retries get a byte-for-byte consistent answer, including the id of the created payment.
+
+### Where to store it
+
+| Store | Strengths | Weaknesses |
+|---|---|---|
+| **Same SQL database as the business data** | Key record and payment row commit in **one transaction**, so they can't disagree | Adds rows and writes to the main database |
+| **Redis** | Fast, built-in TTL, `SET NX` for locking | Not in the same transaction as the database write; data loss on failover can forget keys |
+
+The strongest design keeps the idempotency record in the **same database transaction** as the side effect. If the transaction commits, both the payment and the "completed" key exist; if it rolls back, neither does. Redis is a fine fast path or a lock, but for money, the source of truth should be transactional with the payment.
+
+## The request flow
+
+Here's the server-side algorithm:
+
+```text
+1. Read Idempotency-Key. Missing on a required endpoint → 400.
+2. INSERT (account, key, request_hash, status='in_progress')
+     ON CONFLICT DO NOTHING
+3. If the insert succeeded → we own this key. Go to step 5.
+4. If a row already existed:
+     a. request_hash differs        → 422 (key reused for a different request)
+     b. status = 'completed'        → replay stored response, stop
+     c. status = 'in_progress'      → 409 Conflict (retry later), stop
+5. Do the work (charge card, create payment row).
+6. In one transaction: save the payment AND set the key to 'completed'
+   with the response code and body.
+7. Return the response.
+```
+
+The most important line is step 2. Using the database's **unique constraint** (or Redis `SET key value NX`) as the gate means only one request can ever own a key, however many arrive at once.
+
+<HldIdempotencyKeyLab />
+
+## Concurrent duplicates
+
+The tricky case isn't a retry that arrives a minute later. It's two copies of the request arriving **at the same moment**, for example a double-click, or a client that retried after 2 seconds while the first attempt is still running.
+
+A naive implementation does "check if key exists, then insert":
+
+```text
+Request A: SELECT key → not found
+Request B: SELECT key → not found
+Request A: charge card, insert key
+Request B: charge card, insert key   ← double charge
+```
+
+That's the same check-then-act race you see with rate limiter counters. The fix is to **make the claim atomic**:
+
+- In SQL: `INSERT ... ON CONFLICT DO NOTHING` (or catch the unique-violation error). Exactly one insert wins.
+- In Redis: `SET idem:acct:key in_progress NX PX 30000`. Exactly one `SET NX` returns OK.
+
+The loser sees the `in_progress` record. It should **not** wait forever or do the work itself. Common choices:
+
+- Return **`409 Conflict`** with a message like "a request with this key is in progress", and let the client retry shortly. This is what Stripe does.
+- Or briefly **poll** the record for a few hundred milliseconds and replay the result if it finishes quickly.
+
+### Crashed in the middle
+
+What if the server that owns the key crashes after charging the card but before marking the key completed? The key is stuck `in_progress` forever, and every retry gets `409`.
+
+Two safeguards:
+
+1. **A lock timeout.** Store `locked_until`. If a retry finds an `in_progress` record whose lock has expired, it may take over.
+2. **Make the downstream step idempotent too.** Before charging, pass the same idempotency key (or a derived one) to the payment provider. If the takeover request charges again, the provider recognises the key and returns the original charge instead of a second one.
+
+The second point is the deep idea: **idempotency must hold end to end**. Your API being idempotent doesn't help if the call it makes to the bank isn't.
+
+### Recovery points for multi-step work
+
+For long operations (create order, reserve stock, charge, send email), store a **recovery point** in the key record after each step: `started`, `payment_charged`, `order_created`. A retry that takes over resumes from the last completed step instead of starting from scratch. Steps that can't be made idempotent (sending an email) are pushed to a **transactional outbox** that is processed once after commit.
+
+## Expiry and TTL
+
+Keys can't be kept forever. They need a **TTL**, typically **24 hours to a few days**. Stripe keeps keys for 24 hours.
+
+How to choose:
+
+- Long enough to cover **every realistic retry**: client retry policies, an app reopened the next morning, a queue redelivering after an outage.
+- Short enough that storage stays bounded.
+
+After the TTL, the same key is treated as new. That's why the TTL must be comfortably longer than the client's maximum retry window.
+
+Clean-up is easy: Redis expires keys itself; in SQL, a periodic job deletes rows with `created_at` older than the TTL (or you partition the table by day and drop old partitions).
+
+### What to store for errors
+
+Decide which outcomes are "final" and get cached:
+
+| Outcome | Cache it? | Why |
+|---|---|---|
+| `2xx` success | Yes | The work is done; retries must see the same result |
+| `4xx` validation error, card declined | Yes | Retrying the same request will fail the same way |
+| `5xx` or crash before any side effect | No; release the key | The client should be able to retry and succeed |
+| `429` rate limited | No | Nothing was done; let the retry go through |
+
+## Payment example end to end
+
+Putting it together for `POST /payments`:
+
+```text
+Client                    Payment API                         Postgres          Card network
+  │ Pay ₹2,000, key K        │                                     │                   │
+  │─────────────────────────►│ INSERT (acct, K, hash, in_progress) │                   │
+  │                          │────────────────────────────────────►│ ok (we own K)     │
+  │                          │ charge(amount, idempotency=K)       │                   │
+  │                          │────────────────────────────────────────────────────────►│
+  │                          │◄──────────────────────────────── charge ch_91 ──────────│
+  │                          │ TX: insert payment p_77,                                │
+  │                          │     set K completed, 201 + body     │                   │
+  │      ✕ response lost     │────────────────────────────────────►│                   │
+  │                          │                                     │                   │
+  │ retry, same key K        │                                     │                   │
+  │─────────────────────────►│ INSERT ... conflict                 │                   │
+  │                          │ K completed → replay stored 201     │                   │
+  │◄─────────────────────────│ { "id": "p_77", "status": "succeeded" }                 │
+```
+
+The customer was charged once, and the client got the same payment id on the retry as it would have on the first response.
+
+## Exactly-once effects
+
+You'll hear "exactly-once delivery" claimed. Over an unreliable network, **exactly-once delivery is impossible**: a sender can never be sure a message arrived without an acknowledgment, and the acknowledgment itself can be lost. What systems actually provide is:
+
+```text
+at-least-once delivery  +  idempotent processing  =  exactly-once effect
+```
+
+The sender retries until it's sure (so messages may arrive more than once), and the receiver deduplicates (so the effect happens once). Idempotency keys on an HTTP API, dedup tables on queue consumers, and Kafka's idempotent producer are all versions of this one idea.
+
+### Other ways to get idempotency
+
+Keys aren't the only tool. Sometimes the operation can be made naturally idempotent:
+
+- **Client-chosen resource ids.** `PUT /orders/{client_generated_uuid}` turns "create" into an idempotent "create or no-op".
+- **Natural unique constraints.** A unique index on `(user_id, invoice_id)` means a second "pay invoice" insert fails instead of duplicating.
+- **Absolute instead of relative updates.** `set balance = 500` is idempotent; `balance = balance + 100` is not. Where you must use relative updates, record a transaction id and apply each id once.
+- **Conditional updates.** `UPDATE orders SET status='shipped' WHERE id=7 AND status='paid'` can only succeed once.
+
+<Callout kind="tip">
+In an interview, mention the whole picture: idempotency keys at the API, an atomic claim to handle concurrent duplicates, a transactional write of the result, a TTL, and idempotent calls to downstream providers.
+</Callout>
+
+## Cheat sheet
+
+- A timeout tells you nothing about whether the work happened, so retries must be safe.
+- GET, PUT and DELETE are idempotent by meaning; POST is not, because each call creates something new.
+- The client generates one unique key per logical action (UUID) and reuses it on every retry.
+- Scope keys per account and store a hash of the request; same key with a different body gets 422.
+- Claim the key atomically with a unique constraint or SET NX; never check-then-insert.
+- A concurrent duplicate that finds the key in progress gets 409 and retries later.
+- Commit the key's final response in the same transaction as the business write.
+- Replay the stored status and body exactly, including the created resource id.
+- Cache success and deterministic 4xx results; release the key on 5xx so retries can succeed.
+- Keep keys for longer than the longest retry window, commonly 24 hours or more.
+- Pass the key to downstream providers too: idempotency must hold end to end.
+- At-least-once delivery plus idempotent processing gives an exactly-once effect.

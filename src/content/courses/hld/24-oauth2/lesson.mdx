@@ -1,0 +1,280 @@
+import { HldPkceFlow } from "@/components/widgets/HldPkceFlow";
+
+## The problem OAuth solves
+
+A photo-printing site wants to print pictures from your Google Photos. The naive way: you type your Google password into the printing site, and it logs in as you.
+
+That is terrible for several reasons:
+
+- The printing site now has **full access** to your whole Google account, not just photos.
+- It has it **forever**, until you change your password (which breaks every other app you gave it to).
+- You can't revoke one app without revoking all of them.
+- If the printing site is breached, your Google password leaks.
+- Google can't tell your own logins apart from the app's, so it can't apply MFA or detect abuse sensibly.
+
+**OAuth 2.0** (RFC 6749) solves this with **delegated authorization**: you log in at Google, on Google's page, and approve a narrow permission ("read your photos"). Google then gives the printing site an **access token** limited to that permission, for a limited time, revocable on its own. The app never sees your password.
+
+<Callout kind="remember">
+OAuth 2.0 is about **authorization** (what an app may do on your behalf), not **authentication** (who you are). Login on top of OAuth is a separate layer called OpenID Connect, covered at the end.
+</Callout>
+
+## The four roles
+
+| Role | Who it is | In the example |
+|---|---|---|
+| **Resource owner** | The user who owns the data and grants access | You |
+| **Client** | The application that wants access | The photo-printing site |
+| **Authorization server** | Authenticates the user, gets consent, issues tokens | accounts.google.com |
+| **Resource server** | The API holding the data; accepts access tokens | photoslibrary.googleapis.com |
+
+The authorization server and resource server are often run by the same company but are logically separate. In your own systems you might use an identity provider (Auth0, Okta, Keycloak, Cognito) as the authorization server and your own APIs as resource servers.
+
+### Client types
+
+- **Confidential clients** can keep a secret: a server-side web app whose `client_secret` lives on the server.
+- **Public clients** can't: single-page apps, mobile apps, desktop apps, CLIs. Anything shipped to a user's device can be decompiled, so a secret in it is not a secret.
+
+This distinction drives which flow and protections you use.
+
+### Registration
+
+Before any flow, the client registers with the authorization server and gets a `client_id` (public identifier), optionally a `client_secret`, and a list of allowed **redirect URIs**. The authorization server will only ever send codes or tokens back to a redirect URI registered exactly in advance; that check stops an attacker from redirecting your code to their site.
+
+## Scopes and consent
+
+A **scope** is a named permission the client asks for: `photos.read`, `calendar.events.write`, `repo`, `openid email`. The client requests scopes; the user sees a consent screen listing them; the authorization server issues a token limited to what was approved (possibly fewer than requested).
+
+Good scope design follows least privilege:
+
+- Separate read and write (`orders:read`, `orders:write`).
+- Avoid one giant `admin` scope.
+- Request only what the feature needs now; ask for more later (**incremental authorization**) when the user enables a feature that needs it.
+
+Scopes describe what the **app** may do. They don't replace your own authorization checks: a token with `orders:read` still only lets user 7 read user 7's orders.
+
+## Access tokens and refresh tokens
+
+**Access token**: the credential the client sends to the resource server on each call.
+
+```http
+GET /v1/mediaItems HTTP/1.1
+Host: photoslibrary.googleapis.com
+Authorization: Bearer ya29.a0AfH6SM...
+```
+
+- **Short-lived**: typically 5 to 60 minutes.
+- A **bearer** token: whoever holds it can use it. So it must only travel over TLS and must not leak into logs or URLs.
+- Format is not defined by OAuth. It can be an **opaque** random string (the resource server checks it by calling the authorization server's **introspection** endpoint) or a **self-contained JWT** (the resource server verifies the signature and claims locally). JWTs have their own lesson.
+
+**Refresh token**: a longer-lived credential the client uses only with the authorization server to get new access tokens without bothering the user.
+
+- Lifetime of days to months, or until revoked.
+- Sent **only** to the token endpoint, never to resource servers.
+- Should be stored securely server-side (or in secure OS storage on mobile).
+- Modern servers use **refresh token rotation**: each refresh returns a new refresh token and invalidates the old one. If an old refresh token is ever presented again, that signals theft, and the server revokes the whole token family.
+
+Why two tokens? The access token is used constantly and sent to many APIs, so it's the one most likely to leak; keeping it short-lived limits the damage. The refresh token is used rarely and only with one server, so it can live longer, and revoking it cuts off the app at the next refresh.
+
+| | Access token | Refresh token |
+|---|---|---|
+| Sent to | Resource servers, every request | Authorization server token endpoint only |
+| Lifetime | Minutes | Days to months |
+| Format | Opaque or JWT | Usually opaque |
+| If stolen | Usable until expiry | Usable until revoked or rotated |
+| Revocation | Hard if JWT (wait for expiry) | Revoke at the authorization server |
+
+## Grant types
+
+A **grant type** is a way for the client to obtain tokens. OAuth 2.0 defined several; current best practice (OAuth 2.0 Security BCP, RFC 9700, and the OAuth 2.1 draft) keeps only a few.
+
+| Grant type | Use it for | Status |
+|---|---|---|
+| **Authorization code + PKCE** | Any app acting for a user: web, SPA, mobile, desktop | Recommended for all user-facing apps |
+| **Client credentials** | Service-to-service, no user involved | Recommended |
+| **Refresh token** | Getting new access tokens | Recommended, with rotation for public clients |
+| **Device authorization** | TVs, CLIs, devices without a browser or keyboard | Recommended for that niche |
+| **Implicit** | Old SPAs: token returned directly in the URL fragment | Deprecated: tokens leak via history, referrers, logs |
+| **Resource owner password** | App collects the user's password and trades it for a token | Deprecated: defeats the point of OAuth |
+
+## Authorization code flow with PKCE
+
+This is the flow to know cold. Our client is a single-page app at `https://print.example`, so it's a public client and uses **PKCE** (Proof Key for Code Exchange, pronounced "pixie", RFC 7636).
+
+### Step 1, create the PKCE pair
+
+Before redirecting, the client generates a random secret, the **code verifier** (43 to 128 characters), and derives the **code challenge** from it:
+
+```
+code_verifier  = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"   (random, kept in the app)
+code_challenge = BASE64URL(SHA256(code_verifier))
+               = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+```
+
+It also creates a random `state` value to tie the response to this browser session (CSRF protection).
+
+### Step 2, redirect the user to the authorization endpoint
+
+```http
+GET /authorize?response_type=code
+  &client_id=print-app
+  &redirect_uri=https%3A%2F%2Fprint.example%2Fcallback
+  &scope=photos.read
+  &state=xyz123
+  &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+  &code_challenge_method=S256 HTTP/1.1
+Host: auth.example
+```
+
+Only the **challenge** (the hash) goes through the browser. The verifier stays in the app.
+
+### Step 3, the user authenticates and consents
+
+On the authorization server's own page, the user logs in (password, passkey, MFA) and approves "Print App wants to view your photos". The client never sees any of this.
+
+### Step 4, redirect back with a code
+
+```http
+HTTP/1.1 302 Found
+Location: https://print.example/callback?code=SplxlOBeZQQYbYS6WxSbIA&state=xyz123
+```
+
+The client checks that `state` matches the one it stored. The **authorization code** is short-lived (often under a minute), single-use, and useless on its own.
+
+### Step 5, exchange the code for tokens
+
+This is a direct back-channel `POST` from the client to the token endpoint, not through the browser's address bar.
+
+```http
+POST /token HTTP/1.1
+Host: auth.example
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=authorization_code
+&code=SplxlOBeZQQYbYS6WxSbIA
+&redirect_uri=https%3A%2F%2Fprint.example%2Fcallback
+&client_id=print-app
+&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+```
+
+The authorization server hashes the `code_verifier`, compares it with the `code_challenge` it stored in step 2, checks the code hasn't been used, and that `redirect_uri` and `client_id` match. A confidential client would also authenticate here with its `client_secret` (or a signed JWT, or mutual TLS).
+
+### Step 6, receive tokens
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Cache-Control: no-store
+
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIs...",
+  "token_type": "Bearer",
+  "expires_in": 900,
+  "refresh_token": "8xLOxBtZp8",
+  "scope": "photos.read"
+}
+```
+
+### Step 7, call the API
+
+The client sends `Authorization: Bearer` with the access token to the resource server, which validates it and checks the scope.
+
+### Why the code step exists
+
+Why not just return the token in step 4? Because the redirect travels through the **browser**: the URL can end up in history, logs, `Referer` headers, or be read by a malicious app registered for the same custom URL scheme on mobile. A code is harmless there because it still needs a second step to redeem.
+
+### What PKCE adds
+
+For a public client, the second step is protected only by the `client_id`, which is public. An attacker who intercepts the code could redeem it themselves. PKCE closes that: only the app that generated the verifier can redeem the code, because the attacker saw only the challenge (a one-way hash). It also stops **code injection**, where an attacker plants their own code in your session. PKCE is now recommended for confidential clients too.
+
+<HldPkceFlow />
+
+<Callout kind="warn">
+Always use `S256`. The `plain` method sends the verifier itself as the challenge, so anyone who sees the authorization request has the verifier.
+</Callout>
+
+## Client credentials flow
+
+When there's no user at all, for example a billing service calling a reporting service at night, the client authenticates as **itself**:
+
+```http
+POST /token HTTP/1.1
+Host: auth.example
+Authorization: Basic YmlsbGluZzpzM2NyM3Q=
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials&scope=reports:read
+```
+
+```json
+{ "access_token": "eyJhbGciOi...", "token_type": "Bearer", "expires_in": 3600 }
+```
+
+- Only for **confidential** clients (it needs a secret, a private key, or mTLS).
+- No refresh token: the service just requests a new access token when the old one expires.
+- The token represents the service, so authorize on the service's identity and scopes, not on any user.
+
+## Device authorization flow
+
+A smart TV or a CLI can't easily show a login page. The device asks for a **device code** and a short **user code**, displays "go to example.com/device and enter WDJB-MJHT", and polls the token endpoint. The user approves on their phone; the device's next poll receives tokens. This is how you log into streaming apps on a TV or authenticate many cloud CLIs.
+
+## OpenID Connect
+
+OAuth tells an app "this token may read photos". It does **not** tell the app who the user is in a standard, verifiable way. Using an access token as proof of identity is a classic mistake: a token issued to some other app could be replayed at yours.
+
+**OpenID Connect (OIDC)** is a thin identity layer on top of OAuth 2.0:
+
+- The client adds the `openid` scope (plus `profile`, `email` as needed).
+- The token response includes an **ID token**: a signed JWT **about the user, for the client**.
+
+```json
+{
+  "iss": "https://auth.example",
+  "sub": "248289761001",
+  "aud": "print-app",
+  "exp": 1760000900,
+  "iat": 1760000000,
+  "nonce": "n-0S6_WzA2Mj",
+  "email": "asha@example.com",
+  "email_verified": true
+}
+```
+
+The client verifies the signature (keys from the provider's **JWKS** endpoint), then checks `iss`, that `aud` equals its own `client_id`, `exp`, and that `nonce` matches the one it sent. `sub` is the stable user identifier to key accounts on (not email, which can change or be reassigned).
+
+OIDC also standardises:
+
+- A **UserInfo** endpoint returning profile claims for an access token.
+- **Discovery** at `/.well-known/openid-configuration`, listing endpoints, supported algorithms and the JWKS URL.
+
+| | Access token | ID token |
+|---|---|---|
+| Purpose | Authorize API calls | Prove the user's identity to the client |
+| Audience | Resource server (API) | The client app |
+| Should the client parse it? | No, treat as opaque | Yes, validate and read claims |
+| Send to APIs? | Yes | No |
+
+"Sign in with Google" is OIDC: authorization code + PKCE with `scope=openid email profile`.
+
+## Common mistakes
+
+- **Using implicit or password grants** in new apps. Use authorization code + PKCE.
+- **Loose redirect URI matching** (prefix or wildcard). Register exact URIs; attackers exploit open redirects to steal codes.
+- **Skipping `state`** (or `nonce` with OIDC), enabling CSRF and login injection.
+- **Long-lived access tokens** instead of short ones plus refresh.
+- **Refresh tokens in browser localStorage**, readable by any XSS. Prefer a backend-for-frontend (BFF) that keeps tokens server-side and gives the browser an HttpOnly session cookie.
+- **Treating an access token as login** instead of validating an ID token.
+- **Not checking audience**: an API must reject tokens issued for a different API.
+
+## Cheat sheet
+
+- OAuth 2.0 delegates limited, revocable access without sharing passwords; it's authorization, not login.
+- Roles: resource owner, client, authorization server, resource server.
+- Public clients (SPA, mobile, CLI) can't keep secrets; confidential clients can.
+- Scopes limit what the app may do; your API still checks per-user permissions.
+- Access tokens are short-lived bearer tokens; refresh tokens are longer-lived and go only to the token endpoint.
+- Rotate refresh tokens; reuse of an old one signals theft.
+- Authorization code + PKCE for every user-facing app; client credentials for service-to-service.
+- PKCE: send SHA-256 challenge up front, prove with the verifier at the token exchange.
+- state stops CSRF; exact redirect URIs stop code theft.
+- Implicit and password grants are deprecated.
+- OIDC adds an ID token (JWT about the user, audience is the client) plus discovery and JWKS.

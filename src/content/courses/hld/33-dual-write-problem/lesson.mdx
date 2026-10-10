@@ -1,0 +1,262 @@
+import { HldDualWriteLab } from "@/components/widgets/HldDualWriteLab";
+
+## What a dual write is
+
+A **dual write** happens whenever one piece of code changes **two separate systems** to record one business fact, with no transaction spanning both.
+
+The classic example: an order service saves a new order in Postgres and then publishes an `OrderPlaced` event to Kafka so that inventory, email and analytics services can react.
+
+```ts
+async function placeOrder(cmd: PlaceOrder) {
+  await db.insert(orders).values(cmd.order);        // write 1: database
+  await kafka.send("orders", orderPlaced(cmd.order)); // write 2: message broker
+}
+```
+
+It looks harmless. It is one of the most common sources of silent data inconsistency in microservice systems. The same shape appears in many places:
+
+| Write 1 | Write 2 | What goes wrong if they disagree |
+|---|---|---|
+| Database row | Kafka / RabbitMQ event | Other services never hear about the order, or hear about an order that doesn't exist |
+| Database row | Redis cache entry | Readers see a stale value until the TTL runs out (or forever, with no TTL) |
+| Database row | Elasticsearch index | Search shows deleted products, or misses new ones |
+| Your database | A third-party API (Stripe, email) | The customer is charged but your records say they weren't |
+
+## Why it breaks
+
+The database and the broker are two independent systems. Each can succeed or fail on its own, and your process can die between them. There is no shared commit point, so there is no guarantee that both happen or neither happens.
+
+### Failure after the first write
+
+The database commit succeeds. Then, before `kafka.send` runs, the pod is killed by a deploy, the broker is briefly unreachable, or the send times out. The order exists, but no event was ever published. Inventory is never reserved and the confirmation email never goes out. Nothing errors loudly: the data is just quietly wrong.
+
+### Reversing the order doesn't help
+
+"Publish first, then write to the database" just flips the problem. Now the event can go out and the database insert can fail (a constraint violation, a deadlock, a crash). Downstream services act on an order that doesn't exist: they reserve stock, send an email, and maybe charge a card.
+
+### Wrapping both in a database transaction doesn't help either
+
+```ts
+await db.transaction(async (tx) => {
+  await tx.insert(orders).values(order);
+  await kafka.send("orders", orderPlaced(order)); // not part of the transaction!
+});
+```
+
+The broker knows nothing about your database transaction. If the send succeeds and the commit then fails, the event is already out and cannot be recalled. If the send fails and you swallow the error, the commit goes through without an event. Worse, you're now holding a database transaction open across a network call, which holds locks longer and hurts throughput.
+
+### Ambiguous outcomes
+
+Even without crashes, a **timeout** is ambiguous. If `kafka.send` times out, the message may or may not have been written. Retrying risks a duplicate; not retrying risks a loss. Any fix has to cope with "I don't know whether it happened".
+
+### Races between concurrent writers
+
+Dual writes to a cache add an ordering problem. Two requests update the same product price: A writes 10 to the DB, B writes 12 to the DB, B writes 12 to the cache, A writes 10 to the cache. The database says 12, the cache says 10, and it stays that way until something evicts it. Each write succeeded; the interleaving is what broke consistency.
+
+<Callout kind="warn">
+Dual-write bugs rarely show up in tests or on a developer laptop. They show up as a slow trickle of "orders with no shipment" or "products that won't disappear from search", usually discovered weeks later by someone running a reconciliation query.
+</Callout>
+
+## Why not a distributed transaction
+
+The textbook answer to "make two systems commit atomically" is **two-phase commit (2PC)**, for example XA transactions. A coordinator asks every participant to *prepare*, and only if all say yes does it tell them to *commit*.
+
+In practice 2PC is rarely the answer here:
+
+- **Support**: Kafka, Redis, Elasticsearch and most SaaS APIs don't participate in XA at all.
+- **Availability**: if the coordinator dies after prepare, participants hold locks until it comes back. Every participant is now a single point of failure for the others.
+- **Latency and throughput**: extra round trips and long-held locks on the hot path.
+
+So the industry answer is different: **make only one write authoritative, and derive the second one from it, reliably and asynchronously.** That gives you eventual consistency with no lost updates, which is what most systems actually need.
+
+## The transactional outbox
+
+The **transactional outbox** pattern turns the dual write into a single local transaction.
+
+1. In the **same database transaction** as the business change, insert a row into an `outbox` table describing the event.
+2. Commit. Either both the order and its outbox row exist, or neither does. This is an ordinary ACID guarantee from one database.
+3. A separate **relay** process reads unpublished outbox rows and publishes them to the broker.
+4. Once the broker acknowledges, the relay marks the row as sent (or deletes it).
+
+```sql
+CREATE TABLE outbox (
+  id            uuid PRIMARY KEY,
+  aggregate_type text NOT NULL,        -- 'order'
+  aggregate_id   text NOT NULL,        -- '8812' (used as the Kafka key)
+  event_type     text NOT NULL,        -- 'OrderPlaced'
+  payload        jsonb NOT NULL,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  published_at   timestamptz            -- NULL until relayed
+);
+
+BEGIN;
+INSERT INTO orders (id, user_id, total) VALUES ('8812', 'u42', 59.00);
+INSERT INTO outbox (id, aggregate_type, aggregate_id, event_type, payload)
+VALUES (gen_random_uuid(), 'order', '8812', 'OrderPlaced', '{"orderId":"8812","total":59.0}');
+COMMIT;
+```
+
+### The polling relay
+
+The simplest relay polls the table:
+
+```sql
+SELECT * FROM outbox
+WHERE published_at IS NULL
+ORDER BY created_at
+LIMIT 100
+FOR UPDATE SKIP LOCKED;
+```
+
+`FOR UPDATE SKIP LOCKED` lets several relay instances run without grabbing the same rows. The relay publishes each row, waits for the broker's acknowledgement, then sets `published_at`.
+
+### What the outbox guarantees
+
+Look at the failure points:
+
+- Crash **before commit**: no order, no outbox row. Consistent.
+- Crash **after commit, before publish**: the row is still unpublished; the relay picks it up when it restarts. Delayed, not lost.
+- Crash **after publish, before marking sent**: the relay publishes it **again**.
+
+That last case is the important one. The outbox gives you **at-least-once** delivery, not exactly-once. Consumers will occasionally see duplicates, so they must be idempotent (covered below).
+
+### Practical concerns
+
+- **Ordering**: publish in `created_at` order, and use the aggregate id as the message key so all events for one order land in the same Kafka partition, in order. Multiple parallel relays can reorder events for the same key unless you partition the work by key.
+- **Table growth**: delete or archive published rows on a schedule, or the table and its index bloat.
+- **Polling cost and latency**: polling every 100 ms adds load and up to that much latency. That's usually fine; when it isn't, use CDC.
+
+<HldDualWriteLab />
+
+## Change data capture
+
+**Change data capture (CDC)** reads changes straight from the database's own **transaction log** instead of querying tables. Every committed change is already in that log, in commit order, for crash recovery and replication:
+
+| Database | Log CDC reads |
+|---|---|
+| PostgreSQL | Write-ahead log (WAL), via logical replication slots |
+| MySQL | Binary log (binlog), row-based format |
+| MongoDB | Oplog / change streams |
+| SQL Server | The transaction log, via its built-in CDC tables |
+
+A CDC tool attaches like a replica, turns each insert, update and delete into an event, and streams it to Kafka. Because it only sees **committed** transactions, it can never publish something that was rolled back.
+
+### Debezium
+
+**Debezium** is the best-known open-source CDC platform. It usually runs as a set of **Kafka Connect** source connectors. For Postgres it creates a replication slot, reads the WAL through logical decoding (`pgoutput`), and writes one Kafka topic per table by default. Each event carries the row's `before` and `after` state, the operation (`c`, `u`, `d`, or `r` for snapshot reads) and source metadata such as the log position.
+
+```json
+{
+  "op": "u",
+  "before": { "id": "8812", "status": "PLACED" },
+  "after":  { "id": "8812", "status": "PAID" },
+  "source": { "table": "orders", "lsn": 23900112 }
+}
+```
+
+Debezium stores its log position (offset) in Kafka, so after a restart it resumes where it left off. It can also take an initial **snapshot** of existing rows before switching to streaming.
+
+### CDC on raw tables vs outbox plus CDC
+
+There are two ways to use CDC:
+
+1. **CDC on business tables.** Stream every change of `orders` directly. Zero application changes, great for feeding a search index, cache or warehouse. The downside: your internal table schema becomes a public contract. Rename a column and every consumer breaks, and consumers see low-level row changes ("status went from 2 to 3") instead of meaningful domain events.
+2. **Outbox plus CDC.** Keep the outbox table, but let Debezium tail it instead of polling. Debezium's **outbox event router** turns each outbox insert into a clean event on a topic chosen by `aggregate_type`, keyed by `aggregate_id`. You get explicit, versioned domain events *and* log-based delivery with no polling.
+
+The second is the most common production setup for service-to-service events.
+
+### Comparing the approaches
+
+| Approach | Atomic with DB write | Latency | App changes | Operational cost |
+|---|---|---|---|---|
+| Naive dual write | No | Lowest | None | None, until it breaks |
+| Outbox + polling relay | Yes | Polling interval | Outbox insert in each transaction | A relay process, table cleanup |
+| CDC on business tables | Yes | Sub-second | None | Kafka Connect, Debezium, replication slots |
+| Outbox + CDC (Debezium) | Yes | Sub-second | Outbox insert in each transaction | Same as CDC, cleanest event contract |
+
+<Callout kind="warn">
+A Postgres replication slot keeps WAL on disk until its consumer confirms it. If Debezium is down for a day, WAL piles up and can fill the disk. Monitor slot lag and set a maximum retained WAL size.
+</Callout>
+
+## Listen to yourself
+
+The **listen-to-yourself** pattern (sometimes called event-sourcing-lite) flips the order: the service **only publishes the event**, and then **consumes its own event** to update its own database.
+
+```text
+API request → publish OrderPlaced to Kafka → 202 Accepted
+                   │
+                   ├── order service consumer → INSERT INTO orders
+                   ├── inventory service      → reserve stock
+                   └── email service          → send confirmation
+```
+
+Now there's one authoritative write (the log). Every view, including the service's own table, is derived from it, so they can't permanently disagree.
+
+The trade-offs:
+
+- **Read-your-writes breaks.** The client gets a response before the order is in the database. If it immediately fetches `GET /orders/8812`, it may get a 404. You need to return 202 with a status URL, keep a short-lived local cache of pending writes, or have the UI tolerate the delay.
+- **Validation is harder.** Checks that need current state (enough stock, unique email) can't be done against a table you haven't updated yet. You either validate before publishing against possibly stale data, or validate in the consumer and publish a rejection event.
+- **The broker is on the critical path for writes.**
+
+It fits well when the log is genuinely the source of truth, as in event-sourced systems. For most CRUD services, the outbox is simpler.
+
+## Idempotent consumers
+
+Every reliable fix above delivers **at least once**. Relays retry, Debezium replays from its last committed offset after a crash, and consumers themselves can crash after doing the work but before committing their offset. So **every consumer must tolerate duplicates**. An operation is **idempotent** when applying it twice has the same effect as applying it once.
+
+### Techniques
+
+**1. Deduplicate by event id.** Store processed event ids in the same transaction as the side effect.
+
+```sql
+BEGIN;
+INSERT INTO processed_events (event_id) VALUES ('e-7f3a')
+  ON CONFLICT (event_id) DO NOTHING;   -- 0 rows inserted → already handled → ROLLBACK and ack
+UPDATE stock SET reserved = reserved + 1 WHERE sku = 'MUG-01';
+COMMIT;
+```
+
+The key point: the dedup record and the effect commit **atomically**. If you record the id in Redis and the effect in Postgres, you've built another dual write.
+
+**2. Make the operation naturally idempotent.** `SET status = 'PAID'` is idempotent; `balance = balance - 10` is not. Prefer absolute writes and upserts (`INSERT ... ON CONFLICT DO UPDATE`) keyed by business ids.
+
+**3. Version checks.** Carry a version or log position in each event and only apply it if it's newer than what you have: `UPDATE products SET price = 12, version = 7 WHERE id = 5 AND version < 7`. This also fixes **out-of-order** delivery, which plain dedup does not.
+
+**4. Idempotency keys on external calls.** When the consumer calls a payment API, pass the event id as the idempotency key so the provider deduplicates retries for you.
+
+<Callout kind="remember">
+At-least-once delivery plus idempotent consumers gives you **effectively-once processing**. That's the realistic goal; true exactly-once delivery across independent systems isn't available.
+</Callout>
+
+## Fixing cache dual writes
+
+Caches deserve their own note, because the fix is usually simpler than an outbox:
+
+- **Delete, don't set.** On write, update the DB and then **delete** the cache key. The next read repopulates it from the DB. Deleting is idempotent and avoids the "older value overwrites newer" race in most cases.
+- **Always set a TTL** so that any inconsistency heals itself eventually.
+- **Use CDC for invalidation** when correctness matters: a Debezium consumer deletes cache keys for every committed change, so even writes that bypass your app code (migrations, admin scripts) invalidate the cache.
+
+## Choosing an approach
+
+| Situation | Reasonable choice |
+|---|---|
+| Publish domain events from a service you own | Transactional outbox (polling to start, Debezium later) |
+| Feed search, analytics or a data lake from an existing DB | CDC on the business tables |
+| Event-sourced system where the log is the truth | Listen to yourself |
+| Keep a cache roughly in sync | Delete-on-write plus TTL; CDC invalidation if staleness hurts |
+| Calling an external API as part of a write | Outbox row, then a worker calls the API with an idempotency key |
+
+## Cheat sheet
+
+- A dual write updates two systems for one fact with no shared transaction; any crash in between leaves them inconsistent.
+- Swapping the order or wrapping the send in a DB transaction does not fix it.
+- 2PC is rarely available or desirable across brokers, caches and APIs.
+- Outbox: write the event to an outbox table in the same local transaction, and relay it afterwards.
+- A polling relay with `FOR UPDATE SKIP LOCKED` is the simplest outbox relay.
+- CDC reads the DB transaction log (WAL, binlog) and only ever sees committed changes.
+- Debezium runs on Kafka Connect; its outbox event router turns outbox rows into clean domain events.
+- Watch replication slot lag; an idle CDC consumer can fill the database disk with WAL.
+- Listen to yourself: publish first and consume your own event; costs read-your-writes.
+- All reliable fixes are at-least-once, so consumers must be idempotent.
+- Commit the dedup record and the side effect in the same transaction; use versions to handle reordering.
+- For caches: update the DB, delete the key, keep a TTL.

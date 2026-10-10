@@ -1,0 +1,236 @@
+import { HldBreakerStateMachine } from "@/components/widgets/HldBreakerStateMachine";
+
+## The problem a breaker solves
+
+When a downstream service fails, each caller keeps trying. Every call waits for a timeout (say 2 seconds), uses a thread or connection while it waits, and then fails anyway. Retries add more of the same. Meanwhile:
+
+- **Users wait** the full timeout for an error that was predictable.
+- **Caller resources drain**: threads and connections pile up on a dependency that isn't answering.
+- **The failing service never gets a break.** It's hit with full traffic (plus retries) while it's trying to recover, which may be exactly why it can't.
+
+If the last 50 calls to the payment provider failed, the 51st almost certainly will too. A **circuit breaker** acts on that observation: it watches calls to a dependency, and once failures cross a threshold it **stops making the calls** for a while and fails immediately instead. After a pause, it lets a few calls through to check whether the dependency has recovered.
+
+The name comes from electrical circuit breakers, which cut the circuit when current is dangerous, protecting the wiring, until someone resets them. The software version resets itself.
+
+<Callout kind="remember">
+Retries assume the failure is brief. Circuit breakers assume it isn't. A resilient client needs both: retries to absorb blips, a breaker to stop hammering something that is properly down.
+</Callout>
+
+## The three states
+
+A breaker is a small state machine wrapped around calls to one dependency.
+
+### Closed
+
+Normal operation. Calls pass through to the dependency, and the breaker **records outcomes** (success, failure, slow). When the failure rate over recent calls crosses the threshold, it **trips to open**.
+
+### Open
+
+The breaker **rejects every call immediately** without contacting the dependency, typically by throwing a specific error (Resilience4j's `CallNotPermittedException`) that the caller turns into a fallback. This is fast (microseconds instead of a 2-second timeout), frees the caller's resources, and gives the dependency room to recover.
+
+After a configured **wait duration** (for example 30 seconds), the breaker moves to half-open.
+
+### Half-open
+
+The breaker allows a **small number of trial calls** through (say 3 to 10). Everything else is still rejected.
+
+- If the trial calls succeed (failure rate below threshold), the dependency looks healthy: go back to **closed** and reset the statistics.
+- If they fail, it's still broken: go back to **open** and start another wait.
+
+```text
+CLOSED     ── failure rate ≥ threshold ──▶  OPEN
+OPEN       ── wait duration elapsed ─────▶  HALF-OPEN
+HALF-OPEN  ── trial calls succeed ───────▶  CLOSED
+HALF-OPEN  ── trial calls fail ──────────▶  OPEN
+```
+
+Half-open is what makes the breaker self-healing. Without it, you'd need either a human to reset it, or you'd have to send full traffic to test recovery, which could knock the dependency straight over again.
+
+## Deciding when to trip
+
+### What counts as a failure
+
+Not every error says something about the dependency's health:
+
+| Outcome | Count as failure? |
+|---|---|
+| Timeout, connection refused/reset | Yes |
+| 5xx (500, 502, 503, 504) | Yes |
+| 429 Too Many Requests | Usually yes (the dependency is overloaded); some teams prefer to handle it via backoff only |
+| 400, 404, 409, 422 | **No**: the dependency is fine, the request was bad or the item doesn't exist |
+| Business exceptions ("insufficient funds") | **No** |
+| Very slow successes | Often yes, as **slow calls** |
+
+If you count 404s as failures, a burst of lookups for missing items can open the breaker and block lookups for items that exist. Most libraries let you list exceptions to **record** and exceptions to **ignore**.
+
+### Consecutive failures vs failure rate
+
+The simplest breakers count **consecutive failures** ("open after 5 failures in a row"). Easy to understand, but brittle: at high traffic, a few successes interleaved with many failures never trip it, while at low traffic five unlucky failures in an hour can.
+
+Modern breakers use a **failure rate over a sliding window**:
+
+- **Count-based window**: the last N calls (e.g. 100).
+- **Time-based window**: calls in the last N seconds (e.g. 60), usually aggregated into per-second buckets.
+
+Trip when the failure rate in the window exceeds a threshold, for example 50%.
+
+### Minimum number of calls
+
+A rate on tiny samples is meaningless: 1 failure out of 2 calls is 50%. A **minimum number of calls** (say 20) must be recorded before the rate is evaluated at all. Pick it based on traffic: a high-volume service can use a large minimum; a low-volume one needs a smaller window or a time-based one.
+
+### Slow calls
+
+A dependency that answers in 8 seconds is effectively down, and it's arguably worse than one that errors, because it holds your resources. Breakers such as Resilience4j can treat calls slower than a **slow-call duration threshold** as bad, and open when the **slow-call rate** crosses its own threshold. This catches degradation that never produces an error.
+
+<HldBreakerStateMachine />
+
+## Tuning the parameters
+
+A Resilience4j configuration shows the knobs every breaker has, in one form or another:
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      payments:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 50
+        minimumNumberOfCalls: 20
+        failureRateThreshold: 50          # percent
+        slowCallDurationThreshold: 2s
+        slowCallRateThreshold: 80         # percent
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 5
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        recordExceptions:
+          - java.io.IOException
+          - java.util.concurrent.TimeoutException
+        ignoreExceptions:
+          - com.shop.payments.CardDeclinedException
+```
+
+| Parameter | Too low | Too high |
+|---|---|---|
+| Failure rate threshold | Trips on normal noise | Keeps calling a badly broken dependency |
+| Window / minimum calls | Decisions on too little data | Slow to react |
+| Wait duration in open | Hammers a recovering dependency, flaps open/closed | Stays broken long after the dependency recovered |
+| Half-open trial calls | One unlucky call re-opens it | Too much load on a fragile dependency |
+
+Start with library defaults, then tune with real data: the normal error rate of the dependency, its traffic volume, and how long its typical incidents last. Some teams add **exponential backoff on the open wait** (30s, then 60s, then 120s) when the breaker keeps re-opening.
+
+## Fallbacks
+
+When the breaker is open, the caller needs something to return. The breaker only decides *whether* to call; the fallback decides *what the user sees*.
+
+| Dependency | Reasonable fallback |
+|---|---|
+| Recommendations | Cached or static "popular items" |
+| Product reviews | Hide the section |
+| Currency rates | Last known rates from a cache, marked as approximate |
+| Feature flags | Built-in defaults |
+| Payment provider | Fail clearly, or switch to a secondary provider; or accept the order and charge later if the business allows it |
+| Fraud check | A business decision: allow low-value orders, hold high-value ones for review |
+
+Some rules for fallbacks:
+
+- **Fallbacks must be cheaper and more reliable than the primary.** A fallback that calls another remote service can fail too, and now you need a fallback for the fallback.
+- **Don't hide critical failures.** Silently returning an empty balance or a zero price is worse than an honest error.
+- **Make degraded responses visible** in metrics, and where appropriate in the UI ("prices may be out of date").
+
+## One breaker per dependency
+
+A breaker should guard a single **failure domain**. Put one breaker around everything and a failing recommendations service would block payments too, which is the very cascade you're trying to prevent.
+
+Typical granularity:
+
+- **Per downstream service**: the common default.
+- **Per endpoint or operation**, when one endpoint can fail independently (a slow report endpoint vs a fast lookup on the same service).
+- **Per host or instance**, when instances fail independently. If one of five instances is broken, a service-level breaker sees a 20% failure rate and may not trip, while a per-instance breaker (or **outlier detection** in a load balancer or mesh) removes just the bad instance.
+- **Per tenant or region** for multi-region or multi-tenant third-party APIs.
+
+Breaker state is normally **local to each client instance**. With 50 instances, each one trips independently from its own observations. That's usually fine and avoids a shared-state dependency; it just means a few calls per instance hit the failing service before every breaker has opened.
+
+## Combining with retries and bulkheads
+
+The three patterns cover different failure modes and are designed to be stacked:
+
+| Pattern | Protects against | Mechanism |
+|---|---|---|
+| **Timeout** | One call taking forever | Bound each attempt |
+| **Retry** | Brief, transient failures | Try again, with backoff and jitter |
+| **Bulkhead** | One dependency consuming all resources | Cap concurrent calls per dependency |
+| **Circuit breaker** | Sustained failure of a dependency | Stop calling it for a while |
+
+Order matters. The usual stack, from outermost to innermost:
+
+```text
+fallback
+  └─ retry
+       └─ circuit breaker
+            └─ bulkhead
+                 └─ timeout
+                      └─ remote call
+```
+
+Why this order:
+
+- **Retry outside the breaker**: each retry attempt goes through the breaker. If the breaker is open, the attempt is rejected instantly, and the retry policy should treat `CallNotPermittedException` as **non-retryable**, so you don't burn the retry schedule hitting a closed door.
+- **Breaker outside the bulkhead**: an open breaker rejects calls before they take a bulkhead permit.
+- **Timeout innermost**: each attempt is bounded, and timeouts are recorded by the breaker as failures (or slow calls).
+- **Fallback outermost**: it catches whatever finally escapes, whether a breaker rejection, a full bulkhead or an exhausted retry.
+
+Should retries count toward the breaker? With the breaker inside the retry, **every attempt** is recorded, which is what you want: three failed attempts are three data points about the dependency's health.
+
+```java
+CircuitBreaker cb = CircuitBreaker.of("payments", cbConfig);
+Retry retry = Retry.of("payments", RetryConfig.custom()
+    .maxAttempts(3)
+    .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(200, 2.0))
+    .ignoreExceptions(CallNotPermittedException.class)
+    .build());
+
+Supplier<Receipt> guarded = Decorators.ofSupplier(() -> payments.charge(order))
+    .withCircuitBreaker(cb)
+    .withRetry(retry)
+    .withFallback(List.of(CallNotPermittedException.class), e -> Receipt.pending(order))
+    .decorate();
+```
+
+## Libraries and infrastructure
+
+| Tool | Where it runs | Notes |
+|---|---|---|
+| **Resilience4j** | In-process (Java/Kotlin) | Circuit breaker, retry, bulkhead, rate limiter, time limiter; integrates with Spring Boot and Micrometer |
+| **Hystrix** (Netflix) | In-process (Java) | Popularised the pattern; in maintenance mode since 2018, replaced by Resilience4j |
+| **Polly** | In-process (.NET) | Resilience pipelines with breaker, retry, timeout |
+| **opossum**, **cockatiel** | In-process (Node.js) | Breaker and policy libraries |
+| **sony/gobreaker** | In-process (Go) | Simple state-machine breaker |
+| **Envoy / Istio** | Sidecar proxy | Circuit breaking as connection and pending-request limits, plus **outlier detection** that ejects failing hosts |
+
+Note the naming trap: Envoy's "circuit breaking" settings (max connections, max pending requests) behave more like **bulkheads**; its **outlier detection** is closer to the classic per-host breaker.
+
+## Observing breakers
+
+A breaker that opens silently is a hidden outage. Expose:
+
+- **State** per breaker (closed/open/half-open) as a metric, with an alert when a critical one opens.
+- **Failure and slow-call rates** that feed the decision.
+- **Rejected call counts** (calls short-circuited while open).
+- **State transition events** in logs, so incident timelines show when each breaker opened and closed.
+
+A dashboard of breaker states across services is often the fastest way to see where an incident started: the breakers nearest the root cause open first.
+
+## Cheat sheet
+
+- A circuit breaker stops calling a dependency that is clearly failing and fails fast instead.
+- Closed: calls flow and outcomes are recorded. Open: calls are rejected instantly. Half-open: a few trial calls decide.
+- Trip on failure rate over a sliding window (count- or time-based), not just consecutive failures.
+- Require a minimum number of calls before evaluating the rate.
+- Count timeouts, 5xx and slow calls as failures; ignore 4xx and business errors.
+- Slow-call thresholds catch degradation that never throws an error.
+- Wait duration in open gives the dependency time to recover; half-open tests it gently.
+- Always pair a breaker with a fallback that is cheaper and more reliable than the primary.
+- Use one breaker per dependency (or per endpoint or host), never one for everything.
+- Stack as fallback, retry, breaker, bulkhead, timeout; don't retry breaker rejections.
+- Resilience4j is the standard JVM library; Hystrix is retired; meshes offer outlier detection.
+- Alert on breaker state changes; open breakers point at the source of an incident.

@@ -1,0 +1,248 @@
+import { HldDiffieHellman } from "@/components/widgets/HldDiffieHellman";
+
+## What we want from cryptography
+
+When two parties talk over a network they don't control, they usually want four properties:
+
+| Goal | Question it answers | Tool |
+|---|---|---|
+| **Confidentiality** | Can anyone else read this? | Encryption |
+| **Integrity** | Was it changed in transit? | MACs, authenticated encryption, signatures |
+| **Authentication** | Am I really talking to bank.com? | Signatures, certificates |
+| **Non-repudiation** | Can the sender later deny sending it? | Digital signatures |
+
+Encryption alone gives only the first. This lesson builds up the pieces, then shows how TLS combines them.
+
+A ground rule first, **Kerckhoffs's principle**: a system must stay secure even if everything about it except the key is public. Algorithms like AES and RSA are fully published; security lives entirely in the secrecy of keys. Never use a homemade or secret algorithm.
+
+## Symmetric encryption
+
+In **symmetric** encryption the same key encrypts and decrypts:
+
+```
+ciphertext = Encrypt(key, plaintext)
+plaintext  = Decrypt(key, ciphertext)
+```
+
+### AES
+
+**AES** (Advanced Encryption Standard) is the symmetric cipher you'll meet almost everywhere: TLS, disk encryption, database encryption at rest, VPNs.
+
+- It's a **block cipher**: it transforms fixed 128-bit (16-byte) blocks.
+- Keys are 128, 192 or 256 bits. AES-128 is already far beyond brute force (2 to the 128th keys); AES-256 adds margin, including against future quantum attacks.
+- It's **fast**: modern CPUs have dedicated AES instructions (AES-NI) and encrypt several gigabytes per second per core.
+
+Other symmetric ciphers worth recognising: **ChaCha20** (a stream cipher, fast on phones without AES hardware, used in TLS as ChaCha20-Poly1305), and the obsolete DES and 3DES.
+
+### Modes of operation
+
+A block cipher only knows how to encrypt one 16-byte block. A **mode** defines how to encrypt messages of any length.
+
+| Mode | How it works | Verdict |
+|---|---|---|
+| **ECB** | Encrypt each block independently | Never use: identical plaintext blocks give identical ciphertext blocks, so patterns leak (the famous "ECB penguin" image is still recognisable after encryption) |
+| **CBC** | XOR each block with the previous ciphertext block before encrypting; needs a random IV | Legacy. Confidential but not authenticated; vulnerable to padding-oracle attacks if errors leak |
+| **CTR** | Encrypt a counter to make a keystream, XOR with plaintext | Fast and parallel, but not authenticated on its own |
+| **GCM** | CTR mode plus a built-in authentication tag | The default today: **AEAD** (authenticated encryption with associated data) |
+
+**AEAD** modes such as AES-GCM and ChaCha20-Poly1305 give confidentiality **and** integrity in one step. Decryption fails loudly if a single bit of the ciphertext was changed. Encryption without integrity lets an attacker flip bits in ways that change the plaintext predictably, so always choose an AEAD mode.
+
+### Nonces and IVs
+
+Most modes need a **nonce** or **IV** (a per-message value that doesn't have to be secret but must not repeat). With GCM, reusing a nonce under the same key is catastrophic: it leaks the XOR of the two plaintexts and lets an attacker forge messages. Use a random 96-bit nonce per message (or a counter) and send it alongside the ciphertext.
+
+```python
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import os
+
+key = AESGCM.generate_key(bit_length=256)
+nonce = os.urandom(12)                         # unique per message
+ct = AESGCM(key).encrypt(nonce, b"card=4242...", b"order:991")   # last arg: associated data
+pt = AESGCM(key).decrypt(nonce, ct, b"order:991")                # raises if tampered
+```
+
+### The key distribution problem
+
+Symmetric encryption is fast and strong, but both sides need the **same secret key**. How do a browser and a server that have never met agree on one, over a network an eavesdropper can read? Sending the key in the clear defeats the purpose. Solving that problem is what asymmetric cryptography is for.
+
+## Asymmetric encryption
+
+In **asymmetric** (public-key) cryptography each party has a **key pair**:
+
+- A **public key**, which can be published to the world.
+- A **private key**, which never leaves its owner.
+
+They're mathematically linked so that:
+
+- Data **encrypted with the public key** can only be decrypted with the private key. Anyone can send you a secret; only you can read it.
+- Data **signed with the private key** can be verified with the public key. Only you can sign; anyone can check.
+
+Deriving the private key from the public one is computationally infeasible.
+
+### RSA
+
+**RSA** rests on the difficulty of factoring the product of two large primes. The public key is a modulus n (the product) and an exponent e; the private key is derived from the two secret primes. Multiplying primes is easy; factoring a 2048-bit n back into them is, as far as anyone knows, infeasible with classical computers.
+
+- Key sizes: 2048 bits minimum today, 3072 or 4096 for long-term use.
+- Slow: hundreds to thousands of times slower than AES, and it can only encrypt data smaller than the key.
+- Used for signatures (certificates, JWT RS256) and, historically, to encrypt a symmetric key in TLS.
+- Always used with padding schemes (OAEP for encryption, PSS for signatures). "Textbook" RSA without padding is insecure.
+
+### Elliptic curve cryptography
+
+**ECC** bases security on the elliptic curve discrete logarithm problem. Its big advantage is **much smaller keys for the same strength**:
+
+| Security level | RSA key | ECC key |
+|---|---|---|
+| 128-bit | 3072 bits | 256 bits |
+| 192-bit | 7680 bits | 384 bits |
+
+Smaller keys mean faster handshakes, smaller certificates and less CPU, which is why modern TLS prefers ECDHE for key exchange and ECDSA or Ed25519 for signatures. Common curves: P-256 and Curve25519 (X25519 for key exchange, Ed25519 for signatures).
+
+### Symmetric vs asymmetric
+
+| | Symmetric (AES) | Asymmetric (RSA, ECC) |
+|---|---|---|
+| Keys | One shared secret | Public and private pair |
+| Speed | Very fast | Slow |
+| Data size | Any (with a mode) | Small (a key, a hash) |
+| Key distribution | The hard problem | Public keys can be shared openly |
+| Typical use | Bulk data encryption | Key exchange, signatures, identity |
+
+The real-world answer is **hybrid encryption**: use asymmetric crypto to agree on or protect a random symmetric key, then encrypt the actual data with AES. TLS, PGP, Signal and encrypted cloud storage all work this way.
+
+## Diffie-Hellman key exchange
+
+**Diffie-Hellman (DH)** lets two parties derive the same secret over a public channel **without ever sending it**. It isn't encryption; it's key agreement.
+
+Public parameters everyone knows: a large prime p and a generator g. Then:
+
+1. Alice picks a secret number a and sends A = g to the power a, mod p.
+2. Bob picks a secret number b and sends B = g to the power b, mod p.
+3. Alice computes B to the power a, mod p. Bob computes A to the power b, mod p.
+4. Both equal g to the power (a times b), mod p: the **shared secret**.
+
+An eavesdropper sees p, g, A and B. To get the secret they'd need a or b, which means solving the **discrete logarithm** problem: easy with toy numbers, infeasible with 2048-bit primes (or with elliptic curves, in **ECDH**).
+
+A tiny example with p = 23 and g = 5: Alice picks a = 6 and sends 5 to the 6th mod 23 = 8. Bob picks b = 15 and sends 5 to the 15th mod 23 = 19. Alice computes 19 to the 6th mod 23 = 2; Bob computes 8 to the 15th mod 23 = 2. Shared secret: 2.
+
+<HldDiffieHellman />
+
+### Ephemeral keys and forward secrecy
+
+If a server uses the **same** long-term key for key exchange (as old RSA key transport in TLS did), an attacker who records traffic today and steals the private key next year can decrypt everything retroactively.
+
+**Ephemeral** Diffie-Hellman (DHE, or ECDHE on curves) generates fresh a and b for **every session** and throws them away afterwards. Stealing the server's long-term key later reveals nothing about past sessions. That property is **forward secrecy**, and TLS 1.3 makes it mandatory.
+
+### The man in the middle
+
+Plain DH has no authentication. Mallory can sit between Alice and Bob, run one exchange with each, and relay (and read) everything. Neither side can tell. DH must be combined with something that proves **who** sent A and B. That's what signatures and certificates do.
+
+## Hashing is not encryption
+
+A **cryptographic hash** (SHA-256, SHA-3, BLAKE2) maps any input to a fixed-size digest:
+
+- **One-way**: you can't recover the input from the digest.
+- **Deterministic**: same input, same digest.
+- **Collision-resistant**: infeasible to find two inputs with the same digest.
+- **Avalanche**: changing one bit changes about half the output bits.
+
+| | Encryption | Hashing |
+|---|---|---|
+| Reversible | Yes, with the key | No |
+| Key | Yes | No (except keyed hashes like HMAC) |
+| Output size | About the input size | Fixed (for example 256 bits) |
+| Purpose | Hide data you'll need back | Fingerprint data, verify integrity |
+
+Uses: file and download checksums, content addressing (Git object ids), the input to signatures, and **HMAC** (a hash keyed with a secret, giving integrity and authenticity between parties who share that key, used for webhook signatures and JWT HS256).
+
+**Passwords** are hashed, never encrypted, so even the server can't recover them. But plain SHA-256 is far too fast: attackers try billions of guesses per second. Use a deliberately slow, salted **password hashing** function: Argon2id, bcrypt or scrypt. MD5 and SHA-1 are broken for collision resistance and should not be used for security.
+
+## Digital signatures
+
+A **digital signature** proves who created a message and that it hasn't changed since:
+
+1. **Sign**: hash the message, then apply the signer's **private key** to the hash. Attach the signature.
+2. **Verify**: anyone hashes the received message and checks the signature with the signer's **public key**. If one byte changed, or a different key signed, verification fails.
+
+```
+signature = Sign(private_key, SHA256(message))
+valid     = Verify(public_key, SHA256(message), signature)   # true or false
+```
+
+Signatures give integrity, authentication and non-repudiation. Note the roles are the reverse of encryption: encrypt with the **recipient's public** key; sign with **your own private** key.
+
+Algorithms: RSA-PSS, ECDSA (P-256) and Ed25519. You'll see signatures in TLS certificates, JWTs (RS256, ES256), software updates, Git commit signing and package registries.
+
+## Certificates and PKI
+
+Signatures need you to know the right public key. If an attacker can hand you **their** public key labelled "bank.com", everything above collapses. **Certificates** bind a public key to an identity.
+
+An **X.509 certificate** contains:
+
+- The **subject** (for example `bank.com`, and alternative names like `www.bank.com`).
+- The subject's **public key**.
+- The **issuer** (the certificate authority that vouches for it).
+- A **validity period** (not before, not after).
+- Extensions such as allowed uses.
+- The issuer's **signature** over all of the above.
+
+### The chain of trust
+
+- Your OS and browser ship with a set of trusted **root CA** certificates.
+- Roots sign **intermediate CA** certificates (roots stay offline for safety).
+- Intermediates sign **leaf** certificates for websites.
+
+When you connect to `bank.com`, the server sends its leaf plus intermediates. Your browser checks that each signature verifies with the next certificate's key up to a trusted root, that the name matches the hostname, that the dates are valid, and that it hasn't been revoked (via OCSP or CRLs, and increasingly via short certificate lifetimes). Public CAs also must log every certificate in **Certificate Transparency** logs, so mis-issued certificates can be spotted.
+
+Free automated CAs like Let's Encrypt (with the ACME protocol) issue short-lived certificates after proving you control the domain.
+
+<Callout kind="remember">
+The private key never leaves the server. The certificate is public; it is what lets strangers trust that a public key really belongs to bank.com.
+</Callout>
+
+## How TLS combines them
+
+**TLS 1.3** (what HTTPS uses today) is where all of this comes together. A simplified handshake:
+
+1. **ClientHello**: the browser sends supported cipher suites (for example `TLS_AES_128_GCM_SHA256`), a random value, and an **ECDHE key share** (its public value, like A above).
+2. **ServerHello**: the server picks a cipher suite and sends **its** ECDHE key share (like B). Both sides now compute the same shared secret, and from it derive symmetric **handshake keys** using a key derivation function (HKDF). Everything after this point is encrypted.
+3. **Certificate**: the server sends its certificate chain.
+4. **CertificateVerify**: the server **signs** a hash of the handshake so far with its certificate's **private key**. This proves it owns the certificate and that the key shares weren't swapped by a man in the middle.
+5. **Finished**: both sides send a MAC over the whole handshake, confirming they saw the same messages.
+6. **Application data**: both derive **traffic keys** and encrypt HTTP with AES-GCM or ChaCha20-Poly1305.
+
+| Piece | Role in TLS |
+|---|---|
+| ECDHE (Diffie-Hellman) | Agree on a fresh shared secret; forward secrecy |
+| Certificate + CA chain | Bind the server's public key to its hostname |
+| Signature (RSA-PSS, ECDSA, Ed25519) | Prove the server holds the private key and authenticate the key exchange |
+| HKDF (hash-based) | Turn the shared secret into encryption keys |
+| AES-GCM / ChaCha20-Poly1305 | Encrypt and integrity-protect all application data fast |
+
+TLS 1.3 completes in **one round trip** (TLS 1.2 needed two), removed RSA key transport and other weak options, and can resume sessions with zero round trips (0-RTT, with replay caveats for non-idempotent requests).
+
+In mutual TLS (**mTLS**), the client also presents a certificate, which is common for service-to-service authentication inside a service mesh.
+
+## Where these show up in system design
+
+- **In transit**: TLS everywhere, including internal service-to-service traffic (often mTLS via a mesh such as Istio or Linkerd).
+- **At rest**: databases, disks and object stores encrypt with AES. Managed services use **envelope encryption**: data is encrypted with a data key, and the data key is itself encrypted by a master key held in a **KMS** (AWS KMS, Google Cloud KMS, HashiCorp Vault). Rotating or revoking the master key doesn't require re-encrypting all data.
+- **Secrets**: never in source code; in a secrets manager, injected at runtime.
+- **Tokens and webhooks**: HMAC or signatures to prove origin (JWT, signed webhook payloads).
+- **Passwords**: Argon2id or bcrypt, never reversible encryption.
+- **End-to-end encryption**: messaging apps do DH between users' devices so the server only relays ciphertext it can't read.
+
+## Cheat sheet
+
+- Symmetric (AES, ChaCha20): one shared key, fast, for bulk data.
+- Use an AEAD mode like AES-GCM; never ECB; never reuse a nonce with the same key.
+- Asymmetric (RSA, ECC): public and private keys, slow, for key exchange and signatures.
+- ECC gives equal strength with much smaller keys than RSA.
+- Real systems are hybrid: asymmetric crypto sets up a symmetric key, AES encrypts the data.
+- Diffie-Hellman derives a shared secret over a public channel; ephemeral DH gives forward secrecy.
+- DH alone is open to man-in-the-middle; signatures and certificates authenticate it.
+- Hashing is one-way, encryption is reversible; hash passwords with Argon2id or bcrypt.
+- Sign with your private key; verify with your public key. Encrypt to someone with their public key.
+- Certificates bind a public key to a name, signed up a chain to a trusted root CA.
+- TLS 1.3: ECDHE key share, certificate, CertificateVerify signature, then AES-GCM traffic.

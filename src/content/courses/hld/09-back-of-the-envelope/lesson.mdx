@@ -1,0 +1,272 @@
+import { HldEstimator } from "@/components/widgets/HldEstimator";
+
+## Why estimate at all
+
+Before you draw a single box, you need to know roughly **how big** the problem is. A system that serves 50 requests per second runs happily on one server with one Postgres database. A system that serves 500,000 requests per second needs sharding, caches, queues and a lot of machines. The architectures are completely different, and the only way to know which one you are building is to do some arithmetic.
+
+Back-of-the-envelope estimation is that arithmetic, done quickly and roughly:
+
+- **Quickly**, because you are using it to make decisions, not to write a budget. Two or three minutes in an interview; an hour in a real design review.
+- **Roughly**, because the inputs are guesses anyway. You want the right **order of magnitude**: is storage 5 TB or 5 PB? Is it 1,000 QPS or 1,000,000? Being off by 30% almost never changes the design. Being off by 1,000× always does.
+
+The output is a handful of numbers that drive decisions: requests per second (how many servers, does one database survive?), storage (do we shard? what does it cost?), bandwidth (do we need a CDN?), and memory (does the hot set fit in a cache?).
+
+<Callout kind="remember">
+Estimation is about **orders of magnitude** and the **decisions they force**. Always finish a calculation by saying what it means for the design.
+</Callout>
+
+## Powers of two and data units
+
+Data sizes are powers of two, but for estimation you can treat them as powers of ten. The error is under 10% at each step, which is irrelevant at this precision.
+
+| Power of two | Exact value | Approximation | Unit |
+|---|---|---|---|
+| 2^10 | 1,024 | one thousand (10^3) | 1 KB |
+| 2^20 | 1,048,576 | one million (10^6) | 1 MB |
+| 2^30 | about 1.07 billion | one billion (10^9) | 1 GB |
+| 2^40 | about 1.1 trillion | one trillion (10^12) | 1 TB |
+| 2^50 | about 1.13 quadrillion | 10^15 | 1 PB |
+
+Useful sizes to keep in your head:
+
+| Thing | Rough size |
+|---|---|
+| A character (ASCII), a boolean | 1 byte |
+| An integer or timestamp | 4 to 8 bytes |
+| A UUID | 16 bytes (36 as a string) |
+| A short text record (tweet, chat message) with metadata | 200 bytes to 1 KB |
+| A JSON API response | 1 to 10 KB |
+| A compressed photo | 200 KB to 2 MB |
+| A minute of compressed HD video | 50 to 100 MB |
+
+Also memorise the doubling trick: **2^32 is about 4 billion**, the size of a 32-bit integer or the IPv4 address space; **2^64 is about 1.8 × 10^19**, effectively infinite for ids.
+
+## Latency numbers every engineer should know
+
+Some operations are a million times slower than others. Knowing the rough ratios tells you where time goes and which designs are hopeless before you build them. The figures below are the classic approximations, with modern hardware noted where it has moved a lot.
+
+| Operation | Rough latency | Notes |
+|---|---|---|
+| L1 cache reference | 0.5 ns | |
+| Branch mispredict | 5 ns | |
+| L2 cache reference | 7 ns | |
+| Mutex lock or unlock (uncontended) | 25 ns | |
+| Main memory reference | 100 ns | about 200× an L1 hit |
+| Compress 1 KB with a fast codec | 2 to 10 µs | |
+| Send 1 KB over a 1 Gbps network | 10 µs | |
+| Random 4 KB read from SSD | 20 to 150 µs | NVMe is at the low end |
+| Read 1 MB sequentially from memory | 10 to 250 µs | modern RAM is far faster than the classic figure |
+| Round trip within a data centre | 500 µs | often 100 to 500 µs today |
+| Read 1 MB sequentially from SSD | 0.2 to 1 ms | |
+| Spinning-disk seek | 10 ms | |
+| Read 1 MB sequentially from spinning disk | 5 to 20 ms | |
+| Round trip across a continent | 30 to 80 ms | |
+| Round trip across an ocean | 100 to 150 ms | |
+
+You do not need the exact values. You need the **ladder**:
+
+- **Memory is fast; disk is slow; the network depends on distance.** Memory is around 100 ns, an SSD read around 100 µs (1,000× slower), and a cross-ocean round trip around 150 ms (another 1,000× slower).
+- **Avoid disk seeks.** Sequential I/O is dramatically faster than random I/O, which is why databases use logs, LSM trees and batching.
+- **Compress before sending** over slow links; the CPU cost is tiny next to the transfer.
+- **Round trips across regions are the most expensive thing** a request can do. A page that makes 10 sequential calls to another continent takes over a second no matter how fast your code is.
+- **A request can afford roughly 1,000 memory lookups for the cost of one SSD read, and about a thousand SSD reads for the cost of one cross-ocean trip.**
+
+## Availability numbers
+
+Availability is usually quoted in "nines". Turn the percentage into allowed downtime to see what it really demands.
+
+| Availability | Downtime per year | Downtime per month | Downtime per day |
+|---|---|---|---|
+| 99% (two nines) | 3.65 days | 7.3 hours | 14.4 minutes |
+| 99.9% (three nines) | 8.77 hours | 43.8 minutes | 1.44 minutes |
+| 99.99% (four nines) | 52.6 minutes | 4.4 minutes | 8.6 seconds |
+| 99.999% (five nines) | 5.26 minutes | 26 seconds | 0.86 seconds |
+
+Two consequences matter in designs. First, **four or five nines cannot involve a human** in recovery; failover must be automatic. Second, **dependencies multiply**: if a request needs three services each at 99.9%, the chain is at best 0.999³ ≈ 99.7%. Redundancy (any one of two replicas) improves it; serial dependencies make it worse.
+
+## Handy conversions
+
+These shortcuts turn daily volumes into per-second rates in your head:
+
+- A day has **86,400 seconds**. Round it to **100,000 (10^5)** for mental math; you will overstate the denominator by about 15%, which is fine.
+- **1 million per day ≈ 12 per second.**
+- **1 billion per day ≈ 12,000 per second.**
+- A month is about **2.5 million seconds**; a year is about **30 million seconds** (3 × 10^7).
+- **Peak is usually 2× to 5× the average.** Traffic follows daily cycles, and events (a match final, a sale, New Year's midnight) spike far higher.
+
+And these per-machine throughputs are reasonable starting points:
+
+| Component | Rough capacity per node |
+|---|---|
+| Stateless web or API server | 1,000 to 10,000 requests/s, depending on work per request |
+| Relational database (simple indexed queries) | a few thousand to tens of thousands of queries/s |
+| Redis or Memcached | 100,000+ operations/s |
+| Kafka broker | hundreds of MB/s of throughput |
+| WebSocket gateway | 100,000 to 1,000,000 idle connections |
+
+These are not facts about your system; they are defaults to reason with until you measure.
+
+## The estimation process
+
+Use the same steps every time, out loud:
+
+1. **State assumptions.** Daily active users, actions per user, read to write ratio, object sizes, retention. Write them down; the interviewer may tweak one.
+2. **Compute traffic.** Daily operations, then average QPS, then peak QPS. Separate reads and writes because they hit different components.
+3. **Compute storage.** New data per day, times retention, times replication factor. Add metadata and indexes if they matter.
+4. **Compute bandwidth.** QPS times payload size, for ingress (writes) and egress (reads).
+5. **Compute memory.** The hot working set you want cached.
+6. **Translate into design decisions.** Number of servers, whether to shard, whether to add a CDN or cache, and what will break first.
+
+Round aggressively at every step: 86,400 becomes 100,000, 365 becomes 400 when convenient, 3.7 becomes 4. Label units on every number; most estimation mistakes are unit mistakes (bits versus bytes, per day versus per second).
+
+## Traffic and QPS
+
+**QPS** (queries per second) is the core traffic number.
+
+```text
+average QPS = daily requests ÷ 86,400
+peak QPS    = average QPS × peak factor (2 to 5)
+```
+
+Example: 50 million DAU, each loading their feed 20 times a day.
+
+```text
+daily reads  = 50M × 20       = 1 billion
+average QPS  = 1B ÷ 10^5      ≈ 10,000/s   (exact: 11,574)
+peak QPS     = 10,000 × 3     = 30,000/s
+```
+
+What it means: 30,000 reads per second is well beyond a single database, but a cache in front can take most of it. If each app server handles about 2,000 requests per second, you need about 15 servers at peak, plus headroom for failures (say 20 to 25).
+
+Keep reads and writes separate. A 100:1 read-heavy system calls for caching and read replicas; a write-heavy one (logging, metrics, chat) calls for partitioned writes, log-structured storage and queues.
+
+## Storage
+
+```text
+storage = new objects per day × size per object × days retained × replication factor
+```
+
+Example: a photo app with 10 million uploads per day, 500 KB average after compression, kept for 5 years, three copies.
+
+```text
+per day   = 10M × 500 KB         = 5 TB/day
+per year  = 5 TB × 365           ≈ 1.8 PB/year
+5 years   = 1.8 PB × 5           ≈ 9 PB
+× 3       = about 27 PB of raw capacity
+```
+
+What it means: this lives in **object storage** (S3 or similar), not a database. The metadata (photo id, owner, caption, timestamps, about 1 KB each) is only 10 GB per day, around 18 TB over five years, which a sharded database handles comfortably. Splitting **blobs** from **metadata** is one of the most common decisions an estimate forces.
+
+Remember that managed object stores already replicate internally (you don't multiply by 3 yourself); databases you run do need the replication factor.
+
+## Bandwidth
+
+```text
+bandwidth = QPS × payload size
+```
+
+Example: a video service serving 1 million concurrent streams at 5 Mbps each.
+
+```text
+egress = 1,000,000 × 5 Mbps = 5,000,000 Mbps = 5 Tbps
+```
+
+What it means: no origin data centre serves 5 Tbps to the internet. You need a **CDN** that serves almost all of it from edge caches near viewers. Careful with units here: network speeds are in **bits** per second, storage in **bytes**. 5 Tbps is about 625 GB per second.
+
+Ingress (upload) bandwidth is usually much smaller but still worth checking: 10 million photos per day at 500 KB is 5 TB per day, or about 58 MB per second on average, which is modest.
+
+## Memory and cache sizing
+
+Most workloads are skewed: a small share of items gets most of the requests. A common rule of thumb is the **80/20 rule**: about 20% of items receive about 80% of reads. So size the cache for the hot 20%.
+
+```text
+cache size ≈ 0.2 × (daily reads × object size)    -- generous upper bound
+```
+
+The daily read volume counts the same popular object many times, so this overestimates; a tighter version is 20% of the **distinct** objects read per day.
+
+Example: a URL shortener with 1 billion redirects per day, 500 bytes per cached record.
+
+```text
+0.2 × 1B × 500 B = 100 GB
+```
+
+What it means: 100 GB fits in a small Redis cluster (a few nodes with 32 to 64 GB each, plus replicas). If the answer had been 50 TB, you would instead rely on the database's own cache, an SSD-backed cache, or a CDN.
+
+Also estimate **per-connection** memory for connection-heavy systems: 10 million concurrent WebSocket connections at about 10 KB of state each is 100 GB spread across your gateway fleet.
+
+## Server count
+
+```text
+servers = peak QPS ÷ QPS per server, then add headroom (often ×1.3 to ×2)
+```
+
+The QPS per server depends entirely on the work per request. A cached lookup might sustain 10,000/s per box; a request that calls three services and renders a page might manage 200/s. State your assumption and move on.
+
+Do the same for storage nodes: 27 PB on machines with 100 TB of usable disk each is about 270 storage nodes. Do it for databases: 50,000 writes per second when one shard comfortably takes about 5,000 means at least 10 shards, so plan for 16 or 32 to grow into.
+
+## Worked example a social feed
+
+Assumptions: 300 million monthly users, 150 million daily. Each user posts 2 times a day and views their timeline 20 times a day; each timeline view returns 20 posts. A post is 300 bytes of text plus metadata (call it 1 KB with indexes); 10% of posts carry a 300 KB image. Keep everything 5 years.
+
+**Traffic**
+
+```text
+post writes   = 150M × 2           = 300M/day     ≈ 3,500/s, peak ~10,000/s
+timeline reads= 150M × 20          = 3B/day       ≈ 35,000/s, peak ~100,000/s
+posts fetched = 3B × 20            = 60B post reads/day
+```
+
+**Storage**
+
+```text
+text      = 300M × 1 KB           = 300 GB/day  → ~550 TB over 5 years
+images    = 30M × 300 KB          = 9 TB/day    → ~16 PB over 5 years
+```
+
+**Bandwidth**
+
+```text
+timeline egress (text) ≈ 35,000/s × 20 KB  ≈ 700 MB/s
+image egress: most image views served by the CDN
+```
+
+**Cache**
+
+Most timelines show recent posts, so caching the last day or two of posts covers most reads: 2 days × 300 GB = 600 GB of hot post data, a modest Redis or Memcached cluster.
+
+**Decisions this forces**
+
+- Text posts go in a sharded database (550 TB is far beyond one node).
+- Images go to object storage behind a CDN.
+- Timeline reads at 100,000/s peak require precomputed timelines or a large cache, not a query per view.
+- Write rate (10,000/s peak) is fine for a sharded store, but fan-out to followers' timelines multiplies it: with 200 followers on average, fan-out on write produces 60 billion timeline inserts per day. That number alone is why real feeds mix push and pull for celebrity accounts.
+
+<HldEstimator />
+
+## Common mistakes
+
+- **Bits versus bytes.** Network figures are bits (Mbps, Gbps); storage is bytes. Divide by 8.
+- **Forgetting peak.** Averages hide the moment your system actually falls over.
+- **Forgetting replication and overhead.** Three replicas triple raw storage; indexes and metadata can add 20 to 50%.
+- **Mixing daily and per-second numbers.** Write the unit next to every intermediate result.
+- **False precision.** Saying "11,574.07 QPS" wastes time and signals you missed the point. Say "about 12,000, call it 10K".
+- **Never connecting numbers to decisions.** "Storage is 9 PB" is half an answer. "Storage is 9 PB, so blobs go in object storage and only metadata in the database" is the whole answer.
+
+<Callout kind="tip">
+In an interview, say your assumptions, round loudly, and pause after each number to say what it implies. Interviewers care far more about the reasoning than the digits.
+</Callout>
+
+## Cheat sheet
+
+- Aim for the right order of magnitude; 30% errors don't change designs, 1,000× errors do.
+- 2^10 ≈ thousand (KB), 2^20 ≈ million (MB), 2^30 ≈ billion (GB), 2^40 ≈ trillion (TB).
+- Memory about 100 ns, SSD read about 100 µs, in-DC round trip about 0.5 ms, cross-ocean about 150 ms.
+- Sequential beats random I/O; avoid cross-region round trips in a request path.
+- 86,400 s per day ≈ 10^5; 1M/day ≈ 12/s; 1B/day ≈ 12K/s; peak is 2× to 5× average.
+- Storage = objects/day × size × retention × replication; split blobs from metadata.
+- Bandwidth = QPS × payload; network is in bits, storage in bytes.
+- Cache the hot 20% of daily reads as a first sizing guess.
+- Servers = peak QPS ÷ per-server QPS, plus headroom.
+- Three nines allows about 8.8 hours of downtime a year; four nines about 53 minutes.
+- Always end each estimate with the design decision it forces.

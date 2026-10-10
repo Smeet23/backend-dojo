@@ -1,0 +1,297 @@
+import { HldBase62Lab } from "@/components/widgets/HldBase62Lab";
+
+## What we are designing
+
+A URL shortener turns a long link such as `https://shop.example.com/products/winter-sale?utm_source=newsletter&utm_campaign=oct` into something like `https://sho.rt/aZ3kQ9x`. When anyone opens the short link, the service looks up the original and **redirects** the browser there.
+
+It looks like a toy, and that is exactly why it is a classic interview problem. The whole product is one table and two endpoints, so every minute of the discussion goes into the things that actually matter at scale:
+
+- how to generate **unique, short** codes when many servers create them at once
+- a workload that is **heavily read-dominated**, where a cache does most of the work
+- what the HTTP redirect itself should look like, and what that choice costs you
+- side features (custom aliases, expiry, analytics) that each touch the core design
+
+## Requirements
+
+### Functional requirements
+
+- **Shorten**: given a long URL, return a short URL.
+- **Redirect**: opening the short URL sends the user to the original.
+- **Custom alias** (optional): a user may ask for `sho.rt/winter-sale` instead of a random code.
+- **Expiry** (optional): links can expire at a chosen time, or after a default period.
+- **Analytics** (optional): click counts, referrers, countries, devices per link.
+
+Out of scope unless asked: editing the destination of an existing link, user accounts beyond an API key, link previews.
+
+### Non-functional requirements
+
+- **Low redirect latency.** A redirect sits in front of every click; users should not notice it. Target tens of milliseconds at p99 on the server.
+- **High availability for redirects.** If redirects fail, every link anyone ever shared is broken. Creating links can tolerate a little more downtime than following them.
+- **Uniqueness.** Two different long URLs must never get the same code. A collision sends someone to the wrong site, which is a correctness and a security bug.
+- **Unpredictable codes.** Codes should not be guessable in sequence, or people can enumerate private links.
+- **Durability.** Once a link is created it must not disappear before it expires.
+
+<Callout kind="remember">
+The asymmetry is the key insight: redirects are far more frequent and far more critical than creates. Design the read path first; the write path just has to be correct and reasonably fast.
+</Callout>
+
+## Scale estimates
+
+Assume **100 million new URLs per day** and a **read to write ratio of 100:1** (a link is created once and clicked many times).
+
+| Quantity | Calculation | Result |
+|---|---|---|
+| Write QPS | 100M ÷ 86,400 s | about 1,200/s |
+| Read QPS | 1,200 × 100 | about 120,000/s |
+| Peak read QPS | ×2 to ×3 | 250,000 to 350,000/s |
+| Records over 10 years | 100M × 365 × 10 | 365 billion |
+| Size per record | code, long URL, owner, timestamps | about 500 bytes |
+| Storage over 10 years | 365B × 500 B | about 180 TB (before replication) |
+| Cache for hot links | 20% of a day's distinct links × 500 B | tens of GB |
+
+Two things fall out of this immediately. First, 180 TB will not sit on a single database server, so the store must be **partitioned**. Second, 120,000 reads per second is easy for a cache and painful for a disk-backed database, so **caching is not optional**.
+
+## API design
+
+Two endpoints carry the product.
+
+```http
+POST /api/v1/urls
+Authorization: Bearer <api-key>
+Content-Type: application/json
+
+{ "longUrl": "https://shop.example.com/products/winter-sale?...",
+  "customAlias": "winter-sale",
+  "expiresAt": "2027-01-31T00:00:00Z" }
+
+201 Created
+{ "shortUrl": "https://sho.rt/winter-sale", "code": "winter-sale",
+  "expiresAt": "2027-01-31T00:00:00Z" }
+```
+
+```http
+GET /aZ3kQ9x
+
+302 Found
+Location: https://shop.example.com/products/winter-sale?...
+Cache-Control: private, max-age=0
+```
+
+Add `DELETE /api/v1/urls/{code}` and `GET /api/v1/urls/{code}/stats` if those features are in scope. The create endpoint needs an API key so you can **rate-limit** per caller; an open shortener becomes a spam and phishing tool within days.
+
+## Generating the short code
+
+This is the heart of the problem: produce a short string that is **unique across all servers**, never reused while the old link lives, and hard to guess.
+
+### Why base62
+
+A URL path can safely contain `0-9`, `a-z` and `A-Z` without escaping. That is 10 + 26 + 26 = **62 symbols**. Writing a number in base 62 packs about 5.95 bits into each character, compared with about 3.3 bits for decimal.
+
+Encoding works like converting to any base: divide by 62 repeatedly and map each remainder to a symbol.
+
+```python
+ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def base62(n: int) -> str:
+    if n == 0:
+        return ALPHABET[0]
+    out = []
+    while n > 0:
+        n, r = divmod(n, 62)
+        out.append(ALPHABET[r])
+    return "".join(reversed(out))
+
+base62(125_000)  # "ww8"
+```
+
+Why not base64? Its two extra symbols (`+` and `/`, or `-` and `_` in the URL-safe variant) either need escaping or look odd in a link. Some services also drop look-alike characters (`0/O`, `1/l/I`) so codes are easier to read aloud; that is base58, and it trades a little length for fewer typos.
+
+### How long should the code be
+
+Pick the length from the estimate. We need room for **365 billion** codes.
+
+| Length | Keyspace 62^n | Enough for 365B? |
+|---|---|---|
+| 6 | about 56.8 billion | No, lasts about 1.5 years at 100M/day |
+| 7 | about 3.5 trillion | Yes, about 96 years |
+| 8 | about 218 trillion | Yes, with huge headroom |
+
+**Seven characters** is the usual answer. Now the real question: how do you choose *which* 7-character code a new URL gets?
+
+### Approach 1 hash and truncate
+
+Hash the long URL (MD5, SHA-256, or a fast non-cryptographic hash), base62-encode the digest, keep the first 7 characters.
+
+- **Pro:** stateless. Any server can compute a code with no coordination. The same long URL always maps to the same code, so deduplication is free.
+- **Con:** truncation destroys uniqueness. 7 characters is about 42 bits, and by the **birthday paradox** a random 42-bit code has a 50% chance of some collision after only about 2.2 million URLs, a fraction of a single day's traffic. Collisions are guaranteed, constantly.
+
+So every create must check the database, and on a collision retry with a tweak (append a counter or salt to the input and hash again):
+
+```text
+code = base62(hash(longUrl))[0:7]
+while exists(code):            # one DB read per attempt
+    salt += 1
+    code = base62(hash(longUrl + salt))[0:7]
+insert(code, longUrl)          # must be a conditional insert
+```
+
+Two creates can pass the `exists` check at the same moment with the same code, so the final insert must be **atomic put-if-absent** (a primary-key constraint, or a conditional write in DynamoDB or Cassandra's lightweight transactions). A **Bloom filter** of used codes in memory can make the existence check cheap: a "definitely not present" answer skips the database read.
+
+### Approach 2 counter plus base62
+
+Give every URL a unique integer and base62-encode it. Unique integers produce unique codes by construction; no collision checks at all.
+
+The hard part moves to generating unique integers across many servers:
+
+- **A single auto-increment column** works, but that one database is a bottleneck and a single point of failure for every create.
+- **Ranges.** A coordinator (a small strongly consistent store such as ZooKeeper or etcd, or a single table updated in a transaction) hands each app server a **block** of, say, one million ids. The server encodes from its block in memory and asks for a new block only when it runs out. Coordination happens once per million creates. If a server crashes, the rest of its block is simply skipped; gaps are harmless.
+- **Snowflake-style ids** (timestamp + machine id + sequence) need no coordinator, but they are 64-bit numbers, which encode to 11 characters. Too long for this product.
+
+Plain counters have one serious flaw: **sequential codes are guessable**. If my link is `sho.rt/0000aZ3`, then `sho.rt/0000aZ4` was probably created right after it, and an attacker can crawl every link you have. Fix it by passing the counter through a **bijective scramble** before encoding: multiply by a large constant coprime to 62 modulo 62^7, or run a small format-preserving cipher (a few Feistel rounds) over the number. A bijection keeps uniqueness and makes neighbours look random.
+
+### Approach 3 pre-generated key service
+
+Generate codes **ahead of time**. An offline job fills a table with random, unused 7-character strings. A **Key Generation Service (KGS)** hands them out:
+
+1. Each app server asks the KGS for a batch of, say, 1,000 unused keys and keeps them in memory.
+2. The KGS marks the batch as used in the same transaction that hands it out, so no two servers ever receive the same key.
+3. The server assigns keys from its batch with no further coordination.
+
+Random keys are unpredictable for free, and creating a link never waits on a collision check. The costs: a new service to run and make highly available (run a standby), storage for the key table (3.5 trillion keys at 7 bytes is about 25 TB if you pre-generate them all, so generate in rolling chunks instead), and keys lost when a server crashes with an unused batch in memory, which is acceptable given the keyspace.
+
+### Comparing the approaches
+
+| | Hash and truncate | Counter plus base62 | Key generation service |
+|---|---|---|---|
+| Collisions | Frequent; needs check and retry | None | None |
+| Coordination | None (but DB check per create) | Once per id block | Once per key batch |
+| Guessable | No | Yes, unless scrambled | No |
+| Same URL, same code | Yes, naturally | No (needs a lookup) | No (needs a lookup) |
+| Extra moving parts | Bloom filter, conditional writes | Range allocator | KGS and key table |
+
+Most strong answers pick **counter ranges plus a scramble** or a **KGS**. Hashing is fine to mention as the obvious first idea, as long as you show you know why truncation forces collision handling.
+
+<HldBase62Lab />
+
+## Redirects 301 vs 302
+
+The redirect response looks trivial, yet its status code is a product decision.
+
+| | 301 Moved Permanently | 302 Found (or 307) |
+|---|---|---|
+| Browser caches it | Yes, often indefinitely | No, by default |
+| Second click by the same user | Goes straight to the destination; never reaches you | Hits your service again |
+| Server load | Lower | Higher |
+| Click analytics | Lost after the first click per browser | Every click counted |
+| Changing or expiring a link later | Unreliable; browsers keep the old answer | Takes effect immediately |
+
+So: **use 302** (or 307, which additionally guarantees the method is not changed) when you care about analytics, expiry, or the ability to disable an abusive link. Use 301 only when you want to minimise traffic and the mapping truly never changes. Commercial shorteners almost always choose 302 for exactly these reasons. Whichever you choose, set `Cache-Control` explicitly so intermediaries behave the way you intend.
+
+<Callout kind="warn">
+A 301 is a promise you cannot take back. If you later need to kill a phishing link, browsers that cached the 301 will keep sending users to it.
+</Callout>
+
+## Data model and database choice
+
+The core record is tiny:
+
+```sql
+CREATE TABLE urls (
+  code        VARCHAR(16) PRIMARY KEY,   -- 7 chars generated, longer for custom aliases
+  long_url    TEXT        NOT NULL,
+  owner_id    BIGINT,
+  created_at  TIMESTAMP   NOT NULL,
+  expires_at  TIMESTAMP                  -- NULL means never
+);
+```
+
+The access pattern is almost pure **key lookup**: given `code`, return `long_url`. There are no joins and no multi-row transactions. The data is huge (hundreds of TB) and needs to scale horizontally. That profile fits a **distributed key-value or wide-column store** such as DynamoDB or Cassandra very naturally: partition by `code`, replicate three ways, and every lookup is a single-partition read.
+
+A relational database also works if you shard it by `code` (or use a distributed SQL engine). Choose it when you need relational features elsewhere, such as user accounts, billing, or link folders. A common split is: **links in a key-value store, accounts and billing in Postgres.**
+
+If the product promises "same long URL returns the same short link" (per user), add a secondary lookup from `hash(long_url, owner_id)` to `code`. Without that requirement, skip it; deduplication across all users is rarely worth the extra index.
+
+## High-level architecture
+
+```text
+            ┌──────────── create path ─────────────┐
+client ──▶ LB ──▶ API servers ──▶ id/key allocator (range or KGS)
+                      │
+                      ▼
+               KV store (sharded by code, RF=3)
+                      ▲
+client ──▶ CDN/edge ──▶ LB ──▶ redirect servers ──▶ Redis cache
+            └──────────── redirect path ───────────┘
+                      │
+                      └──▶ click events ──▶ Kafka ──▶ analytics pipeline
+```
+
+- **Create path:** validate the URL (scheme is http or https, length limit, not on a malware blocklist), take the next code from the local id block or key batch, write the record with a conditional insert, return the short URL.
+- **Redirect path:** look up `code` in the cache, fall back to the database on a miss, check expiry, return a 302, and emit a click event asynchronously.
+
+Redirect servers and API servers can be the same binary, but splitting them lets you scale and protect the critical redirect path independently.
+
+## Caching
+
+With a 100:1 read ratio and a strongly skewed popularity curve (a few links go viral; most are clicked a handful of times), a cache absorbs most redirects.
+
+- **Cache-aside with Redis or Memcached**, keyed by `code`, value the long URL plus expiry.
+- **LRU eviction** suits the workload: hot links stay, old links fall out.
+- **Sizing:** a common rule is to cache the hot 20% of a day's traffic. Even generously, that is tens of GB, which a small Redis cluster holds easily.
+- **Negative caching:** cache "not found" for a short time too, or bots probing random codes will hammer the database.
+- **TTL no longer than the link's remaining life**, so an expired link does not keep redirecting from cache.
+- **Edge caching:** for the very hottest links, a CDN or edge worker can answer the 302 itself, close to the user. You lose some per-click visibility unless the edge logs clicks too.
+
+Because a link's destination never changes after creation (in the base design), the cache never holds wrong data except around deletion and expiry. That is why this system caches so well.
+
+## Custom aliases
+
+A custom alias is just a code the user chose instead of one you generated. The rules:
+
+- **Validate:** allowed characters only, a length range (say 4 to 30), and a **reserved word list** so nobody claims `api`, `admin`, `login` or `help`.
+- **Insert with put-if-absent.** If the alias exists, return `409 Conflict`. Never "check then insert" in two steps.
+- **Avoid future clashes with generated codes.** If an alias happens to look like a 7-character base62 string, your generator might produce that same code later. Either check every generated code against the table (cheap with a conditional insert), or keep the namespaces disjoint, for example by requiring aliases to be a different length or to contain a hyphen.
+
+## Expiry and cleanup
+
+Store `expires_at` on each record and enforce it in two places:
+
+1. **On read (lazy expiry):** if `now` is past `expires_at`, return `404 Not Found` (or `410 Gone`) instead of redirecting. This is what makes expiry correct.
+2. **In the background (cleanup):** a periodic job, or the database's own TTL feature (DynamoDB TTL, Cassandra column TTL), deletes expired rows to reclaim space. This is housekeeping; it can lag without breaking anything because step 1 already hides expired links.
+
+Should expired codes be recycled? With a 3.5 trillion keyspace you do not need to, and reusing a code that was printed on a poster years ago would send people somewhere unexpected. Most designs never reuse codes.
+
+## Analytics
+
+Analytics must **never slow down the redirect**. The redirect server does the lookup, sends the 302, and fires a small event onto a queue without waiting:
+
+```json
+{ "code": "aZ3kQ9x", "ts": "2026-10-10T12:00:03Z",
+  "referrer": "https://news.example.com/", "ua": "Mozilla/5.0 ...", "ip": "203.0.113.9" }
+```
+
+A stream processor consumes the events, enriches them (IP to country, user agent to device type), and writes aggregates to an analytics store such as ClickHouse or a time-series database, rolled up per link per hour or day. If the queue is briefly unavailable, buffer locally or drop events: losing a few clicks is far better than failing redirects.
+
+Exact real-time counters per link would mean an atomic increment on every click, which turns hot links into hot keys. Pre-aggregating in the stream (count per link per minute, then write once) avoids that.
+
+## Bottlenecks and trade-offs
+
+- **Hot links.** A viral link can receive a large share of all traffic. The cache and edge handle it; make sure one hot key does not overload a single cache shard (replicate hot keys, or use a small in-process cache on each redirect server).
+- **Id allocator availability.** If the range allocator or KGS is down, servers keep creating links from the blocks they already hold. Make blocks large enough to ride out a short outage.
+- **Abuse.** Rate-limit creates per API key and IP, scan destinations against malware and phishing lists, and keep the ability to disable a code (another reason for 302).
+- **Consistency.** Read-your-writes matters right after creation: the creator often clicks the link immediately. Write to the database before returning, and on a cache miss read from the database (not a lagging replica) or populate the cache on create.
+- **Multi-region.** Redirects should be served from the region nearest the user. Links are immutable, so asynchronous cross-region replication is fine; the rare miss in a far region can fall back to the home region.
+
+## Cheat sheet
+
+- Reads dominate (about 100:1); design and protect the redirect path first.
+- 7 base62 characters give about 3.5 trillion codes, enough for 100M links a day for decades.
+- Hash-and-truncate collides early because of the birthday bound; it needs a check, a retry and an atomic insert.
+- Counter ranges give collision-free codes with rare coordination; scramble them so codes are not guessable.
+- A key generation service hands out pre-made random keys in batches; losing a few on a crash is fine.
+- 302 (or 307) keeps every click visible and lets you expire or kill links; 301 is cached by browsers for good.
+- Store links in a key-value store partitioned by code; there are no joins to lose.
+- Cache-aside with LRU absorbs most redirects; cache misses too, and cap TTL at the link's expiry.
+- Enforce expiry on read; clean up with a background job or database TTL.
+- Custom aliases need validation, reserved words and put-if-absent; keep them from clashing with generated codes.
+- Send click events to a queue asynchronously; never block the redirect on analytics.

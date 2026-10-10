@@ -1,0 +1,220 @@
+import { HldProxyPath } from "@/components/widgets/HldProxyPath";
+
+## What a proxy is
+
+A **proxy** is a server that sits in the middle of a conversation and **acts on behalf of someone else**. Instead of a client talking directly to a server, the client talks to the proxy, and the proxy talks to the server.
+
+Because it sees every request and response, a proxy can inspect, modify, block, cache, log or redirect traffic. That makes it one of the most useful building blocks in networking.
+
+There are two kinds, and the only real difference is **whose side the proxy is on**:
+
+- A **forward proxy** acts on behalf of **clients**. It sits near the clients and hides them from the servers they talk to.
+- A **reverse proxy** acts on behalf of **servers**. It sits in front of the servers and hides them from the clients.
+
+```text
+Forward proxy                              Reverse proxy
+
+[client]──┐                                                 ┌──[server 1]
+[client]──┼──► [proxy] ──► internet ──► [server]  [client] ──► internet ──► [proxy] ──┼──[server 2]
+[client]──┘                                                 └──[server 3]
+  client side                                                    server side
+```
+
+<Callout kind="remember">
+Ask "who configured the proxy, and who does it protect?" If the **client's** organisation set it up to control or hide clients, it's a forward proxy. If the **service owner** set it up to front their servers, it's a reverse proxy.
+</Callout>
+
+## Forward proxy
+
+### How a forward proxy works
+
+With a forward proxy, the **client knows about the proxy** and deliberately sends requests to it. A browser or OS is configured with the proxy's address (manually, via a PAC file, or through company device management). For HTTPS, the client sends a `CONNECT` request asking the proxy to open a tunnel:
+
+```http
+CONNECT api.example.com:443 HTTP/1.1
+Host: api.example.com:443
+Proxy-Authorization: Basic ZW1wbG95ZWU6cGFzcw==
+```
+
+The proxy opens a TCP connection to `api.example.com` and relays bytes in both directions. The destination server sees the connection coming **from the proxy's IP**, not the client's.
+
+The server usually doesn't know a forward proxy is involved, unless the proxy adds a header such as `Via` or `X-Forwarded-For`.
+
+### Forward proxy uses
+
+- **Content filtering and policy.** Companies and schools block categories of sites, malware domains or file types at the proxy.
+- **Monitoring and auditing.** All outbound traffic passes one point, so it can be logged for security and compliance. Some corporate proxies decrypt TLS for inspection, using a company certificate installed on every managed device.
+- **Anonymity and privacy.** Servers see the proxy's IP, not the user's. VPN-like services and Tor build on this idea (Tor chains several proxies so no single one knows both ends).
+- **Bypassing geographic restrictions.** A proxy in another country makes requests appear to come from there.
+- **Caching shared content.** A proxy at an office can cache popular downloads (OS updates, packages) so they cross the internet link once. This was common before HTTPS everywhere made caching of encrypted traffic impossible without interception.
+- **Controlled egress for servers.** Backend services in a private network often reach the internet only through an egress proxy, so you have one allow-list of destinations (for example, only the payment provider's API) and one place to log outbound calls. This is a forward proxy used by servers acting as clients.
+
+### Transparent proxies
+
+A **transparent** (or intercepting) proxy sits on the network path and intercepts traffic **without** client configuration. ISPs and public Wi-Fi networks use them for captive portals or caching. The client may not know it's there.
+
+## Reverse proxy
+
+### How a reverse proxy works
+
+With a reverse proxy, the **client has no idea** it's talking to a proxy. DNS for `api.example.com` points at the reverse proxy. The client connects to it as if it were the server. The proxy then decides which backend should handle the request, forwards it, and relays the response.
+
+```text
+Client ──HTTPS──► reverse proxy (api.example.com, public IP)
+                       │
+                       ├──HTTP──► orders-service:8080   (path /orders/*)
+                       ├──HTTP──► users-service:8080    (path /users/*)
+                       └──HTTP──► static bucket         (path /assets/*)
+```
+
+The backends live on a private network with no public IPs. The only thing exposed to the internet is the proxy.
+
+Because the backend now sees the proxy as its client, the proxy passes the original client details in headers:
+
+```http
+X-Forwarded-For: 203.0.113.42
+X-Forwarded-Proto: https
+X-Forwarded-Host: api.example.com
+X-Request-Id: 9f2c1a7e
+```
+
+The standard `Forwarded` header carries the same information. The backend must only trust these headers when they come from its own proxy, or clients could spoof their IP.
+
+### Reverse proxy uses
+
+A reverse proxy is where many cross-cutting concerns live, so individual services don't each reimplement them.
+
+### TLS termination
+
+The proxy holds the certificates and does the TLS handshake with clients. Traffic to backends is either plain HTTP inside a trusted network, or re-encrypted (mutual TLS) in zero-trust setups.
+
+Why this helps:
+
+- **Certificates in one place.** Renewal (for example with Let's Encrypt) and configuration happen once, not on 50 services.
+- **CPU offload.** Handshakes are expensive; the proxy can be tuned and scaled for them.
+- **Modern protocols at the edge.** The proxy can speak HTTP/2 and HTTP/3 to clients while backends speak plain HTTP/1.1.
+
+### Load balancing
+
+The proxy spreads requests across several instances of a backend and stops sending to unhealthy ones. A load balancer **is** a reverse proxy with a focus on distribution; the next lesson covers the algorithms.
+
+### Caching
+
+The proxy can store responses and serve repeats without touching the backend: static assets, public API responses, rendered pages. It respects `Cache-Control` from the backend. A **CDN** is essentially a globally distributed reverse-proxy cache.
+
+```nginx
+proxy_cache_path /var/cache/nginx keys_zone=api:50m max_size=2g;
+
+location /products/ {
+    proxy_cache api;
+    proxy_cache_valid 200 60s;
+    proxy_cache_use_stale error timeout updating;   # serve stale if the backend is down
+    proxy_pass http://catalog;
+}
+```
+
+### Compression
+
+The proxy compresses responses with gzip or Brotli based on the client's `Accept-Encoding`, so backends don't spend CPU on it. Compressing a 200 KB JSON response to around 30 KB matters a lot on mobile networks.
+
+### Security and the WAF
+
+- **Hiding the backend.** Clients never learn backend IPs, ports or server software, so they can't target them directly.
+- **WAF (Web Application Firewall).** Inspects requests for attack patterns such as SQL injection, XSS and path traversal, and blocks them before they reach the app. ModSecurity with the OWASP Core Rule Set is the classic open-source WAF; cloud providers offer managed ones.
+- **DDoS absorption.** A large edge network can soak up floods that would overwhelm your servers.
+- **Rate limiting** per IP or API key.
+- **Request limits.** Maximum body size, header size and timeouts, which defend against slow-client attacks (Slowloris) because the proxy buffers slow clients instead of tying up app threads.
+
+### Routing and API gateway features
+
+- **Path and host routing:** `/api/*` to the API, `/` to the frontend, `admin.example.com` to the admin app. One public domain can front many services.
+- **Gradual rollouts:** send 5% of traffic to a canary version.
+- **Authentication** at the edge: validate a JWT or session before forwarding.
+- **Request and response rewriting:** add headers, strip internal ones, rewrite paths.
+- **Observability:** one consistent access log, metrics and tracing headers for all traffic.
+
+An **API gateway** is a reverse proxy specialised for APIs, adding auth, quotas, API keys and request transformation.
+
+<HldProxyPath />
+
+## Side by side
+
+| | Forward proxy | Reverse proxy |
+|---|---|---|
+| Acts for | Clients | Servers |
+| Configured by | Client side (user, company IT) | Service owner |
+| Client aware of it | Usually yes | No |
+| Hides | Clients' identities from servers | Servers' identities from clients |
+| Sits | Near the clients, at their network edge | In front of the servers, at the service edge |
+| Typical uses | Filtering, auditing, anonymity, egress control, shared caching | TLS termination, load balancing, caching, compression, WAF, routing |
+| Examples | Squid, corporate web gateways, Tor, VPN-like services | Nginx, HAProxy, Envoy, Traefik, Cloudflare, AWS ALB |
+
+### Proxies versus VPNs
+
+A VPN also routes traffic through another machine, but it works at the **network layer**: it tunnels **all** of the device's traffic (every app, every protocol) and usually encrypts it. A forward proxy typically handles traffic from applications configured to use it, often just HTTP and HTTPS.
+
+## Common reverse proxies
+
+### Nginx
+
+A high-performance web server and reverse proxy with an event-driven architecture that handles tens of thousands of connections with little memory. It's excellent at serving static files, TLS termination, caching and HTTP routing. Configuration is a static file, reloaded gracefully.
+
+```nginx
+upstream orders {
+    least_conn;
+    server 10.0.1.11:8080 max_fails=3 fail_timeout=10s;
+    server 10.0.1.12:8080 max_fails=3 fail_timeout=10s;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name api.example.com;
+    ssl_certificate     /etc/ssl/api.crt;
+    ssl_certificate_key /etc/ssl/api.key;
+    gzip on;
+    client_max_body_size 10m;
+
+    location /orders/ {
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_pass http://orders;
+    }
+}
+```
+
+### HAProxy
+
+A dedicated load balancer and proxy, known for performance, very detailed health checking and stats, and strong **TCP (layer 4)** as well as HTTP (layer 7) support. A common choice for load-balancing databases, message brokers or any non-HTTP TCP service.
+
+### Envoy
+
+A modern proxy built for microservices. Its configuration can be changed **dynamically** through APIs (xDS) without reloads, and it has first-class support for gRPC, HTTP/2, retries, circuit breaking, outlier detection and distributed tracing. Envoy is the data plane of service meshes like Istio: a copy runs as a **sidecar** next to each service, proxying both inbound and outbound calls.
+
+### Others
+
+Traefik (auto-discovers routes from Docker and Kubernetes labels), Caddy (automatic HTTPS by default), and managed options such as AWS ALB, Google Cloud Load Balancing and Cloudflare.
+
+## Trade-offs
+
+A reverse proxy is in the path of **every** request, so it brings its own concerns:
+
+- **Single point of failure.** One proxy instance is a SPOF. Run at least two, with a floating IP, DNS across both, or a managed load balancer in front.
+- **Extra hop.** Each proxy adds a little latency, usually well under a millisecond inside a data centre, plus connection overhead. Keep-alive connection pools to backends offset most of it.
+- **Bottleneck.** It must be scaled for peak traffic and TLS handshakes.
+- **Lost client context.** Backends must read `X-Forwarded-For` for the real client IP, and must trust it only from the proxy.
+- **Configuration complexity.** Routing, timeouts and buffering settings interact. A proxy timeout shorter than a slow backend endpoint produces confusing `504 Gateway Timeout` errors.
+
+Proxies also explain two status codes you'll see often: **`502 Bad Gateway`** (the proxy got an invalid response or no connection from the backend) and **`504 Gateway Timeout`** (the backend didn't answer in time).
+
+## Cheat sheet
+
+- A proxy sits in the middle and acts on someone's behalf; the difference is whose side it's on.
+- Forward proxy: acts for clients, configured by the client side, hides clients from servers.
+- Forward proxy uses: filtering, auditing, anonymity, geo-unblocking, shared caching, controlled server egress.
+- Reverse proxy: acts for servers, invisible to clients, hides backends behind one public address.
+- Reverse proxy uses: TLS termination, load balancing, caching, compression, WAF, rate limiting, routing.
+- Backends learn the real client from X-Forwarded-For or Forwarded, trusted only from their own proxy.
+- A load balancer, an API gateway and a CDN are all specialised reverse proxies.
+- Nginx: fast web server and HTTP proxy. HAProxy: L4 and L7 load balancing. Envoy: dynamic, mesh sidecar.
+- Run proxies redundantly; a single proxy is a single point of failure.
+- 502 means the backend gave a bad or no response; 504 means it timed out.

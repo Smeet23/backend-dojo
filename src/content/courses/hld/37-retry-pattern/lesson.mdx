@@ -1,0 +1,235 @@
+import { HldBackoffTimeline } from "@/components/widgets/HldBackoffTimeline";
+
+## Why retry at all
+
+In a distributed system, many failures are **brief**. A packet is dropped, a connection is reset because a load balancer recycled it, a pod is being replaced during a deploy, a database fails over in a few seconds, a downstream sheds load for a moment. Trying again a little later often just works.
+
+The **retry pattern** turns those transient failures into successes the user never sees. It's one of the cheapest resilience tools available, and also one of the easiest to get dangerously wrong. A bad retry policy can turn a 5-second blip into a 30-minute outage.
+
+A good retry policy answers five questions:
+
+1. **Which** failures are worth retrying?
+2. **How long** to wait between attempts?
+3. **How many** attempts, and how much total time?
+4. Is it **safe** to repeat this operation?
+5. **Where** in the call chain should the retry happen?
+
+## Transient vs permanent errors
+
+Retrying only helps if a second attempt has a real chance of a different result.
+
+| Error | Transient? | Retry? |
+|---|---|---|
+| Connection refused / reset, DNS timeout | Usually | Yes, ideally to another instance |
+| Request timeout | Maybe (it may have succeeded!) | Only if the operation is idempotent |
+| 503 Service Unavailable | Yes | Yes, honouring `Retry-After` |
+| 429 Too Many Requests | Yes, but you're the problem | Yes, after `Retry-After`, slowly |
+| 502 / 504 from a gateway | Usually | Yes, if idempotent |
+| 500 Internal Server Error | Unclear: often a bug | Maybe once; not repeatedly |
+| 400, 422 validation errors | No | Never: the same input fails again |
+| 401 / 403 | No | No (except a single refresh of an expired token) |
+| 404 | No (usually) | No |
+| 409 Conflict | Depends | Re-read state and decide; don't blindly resend |
+| Database deadlock / serialization failure | Yes | Yes, retry the whole transaction |
+
+Classify errors explicitly in code rather than "retry on any exception". Retrying a validation error three times just triples the load and the latency before the inevitable failure.
+
+```ts
+function isRetryable(err: unknown): boolean {
+  if (err instanceof HttpError) {
+    return [408, 429, 502, 503, 504].includes(err.status);
+  }
+  if (err instanceof NetworkError) {
+    return ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN"].includes(err.code);
+  }
+  return false;
+}
+```
+
+<Callout kind="warn">
+A **timeout** is the trickiest case. The server may have received the request and completed it; only the response was lost. Retrying a non-idempotent operation after a timeout can do it twice: two charges, two emails, two orders.
+</Callout>
+
+## How long to wait
+
+### Immediate retry
+
+Retrying immediately is fine for exactly one case: a single, fast retry after something like a stale pooled connection being reset. For anything else, an immediate retry hits the dependency while it's still broken.
+
+### Fixed delay
+
+Wait the same time between each attempt, for example 500 ms. Better than nothing, but every client that failed at the same moment retries at the same moments: 500 ms, 1,000 ms, 1,500 ms. The dependency sees synchronised spikes.
+
+### Exponential backoff
+
+Double the wait after each failure, up to a **cap**:
+
+```text
+delay(n) = min(cap, base × 2^n)
+
+base = 100 ms, cap = 5 s
+attempt 1 → wait 100 ms
+attempt 2 → wait 200 ms
+attempt 3 → wait 400 ms
+attempt 4 → wait 800 ms
+attempt 5 → wait 1.6 s
+```
+
+The logic: if the first retry failed, the problem is probably not momentary, so give the dependency progressively more room to recover. The cap keeps any single wait reasonable.
+
+Exponential backoff alone has the same flaw as a fixed delay. If a thousand clients all failed at the same instant, they all retry at 100 ms, then all at 300 ms, then all at 700 ms. The waves get further apart but each wave is still a thousand requests at once.
+
+### Jitter
+
+**Jitter** adds randomness to the delay so clients that failed together spread out. The common variants (described well in an AWS architecture blog post on backoff and jitter):
+
+| Variant | Formula | Behaviour |
+|---|---|---|
+| **Full jitter** | `random(0, min(cap, base × 2^n))` | Most spread out; lowest total load. A sensible default |
+| **Equal jitter** | `d / 2 + random(0, d / 2)`, where `d = min(cap, base × 2^n)` | Guarantees at least half the backoff; a bit less spread |
+| **Decorrelated jitter** | `min(cap, random(base, previous × 3))` | Each delay based on the last one; also spreads well |
+
+```ts
+function fullJitter(attempt: number, baseMs = 100, capMs = 5_000): number {
+  const exp = Math.min(capMs, baseMs * 2 ** attempt);
+  return Math.random() * exp;
+}
+```
+
+<HldBackoffTimeline />
+
+<Callout kind="remember">
+Backoff reduces **how often** each client retries. Jitter prevents clients from **retrying together**. You almost always want both.
+</Callout>
+
+### Honour Retry-After
+
+If the server tells you when to come back (`Retry-After: 2` on a 429 or 503), use that rather than your own schedule. The server knows its state better than you do.
+
+## How many attempts
+
+Every retry adds latency for the user and load for the dependency. Bound both:
+
+- **Max attempts.** Typically 2 to 4 attempts in total for synchronous user-facing calls. More attempts rarely help: if three spaced-out tries failed, the dependency is down, not blipping.
+- **Overall deadline.** Cap the total time across all attempts, not just each attempt. If the user's request has a 2-second budget, there's no point starting a third attempt at 1.9 seconds. Pass the remaining budget along as each attempt's timeout.
+- **Background work is different.** A queue consumer or a webhook sender can retry for minutes or hours with long backoff (and eventually a dead-letter queue), because no user is waiting.
+
+```ts
+async function withRetry<T>(fn: (timeoutMs: number) => Promise<T>, opts = { attempts: 3, deadlineMs: 2_000 }): Promise<T> {
+  const start = Date.now();
+  for (let attempt = 0; ; attempt++) {
+    const remaining = opts.deadlineMs - (Date.now() - start);
+    try {
+      return await fn(remaining);
+    } catch (err) {
+      const last = attempt + 1 >= opts.attempts;
+      if (last || !isRetryable(err) || remaining <= 0) throw err;
+      await sleep(Math.min(fullJitter(attempt), remaining));
+    }
+  }
+}
+```
+
+## Retry storms and amplification
+
+Retries **add load at exactly the moment the dependency is weakest**. If a service is failing because it's overloaded, every client retrying 3 times can multiply its incoming traffic by up to 4.
+
+It gets much worse in deep call chains. Suppose each of four layers retries up to 3 times (4 attempts total):
+
+```text
+user → gateway → orders → pricing → database
+
+4 × 4 × 4 × 4 = 256 attempts at the database for one user action
+```
+
+This is **retry amplification**. During an outage, it turns a struggling database into a dead one, and the outage outlasts its original cause because the retry traffic keeps the system saturated after the trigger is gone.
+
+### Retry budgets
+
+A **retry budget** caps retries as a fraction of normal traffic, instead of per request:
+
+- "Retries may add at most 10% on top of first attempts." Track a ratio (often with a token bucket that gains a fraction of a token per successful request and spends a token per retry). When the budget is spent, fail without retrying.
+- When things are healthy, the few failures easily fit in the budget and get retried.
+- When the dependency is truly down, almost every request fails, the budget runs out immediately, and load stays near 1.1x instead of 4x.
+
+gRPC's retry policy includes **retry throttling** on this principle, and service meshes like Envoy and Linkerd offer retry budgets as configuration.
+
+### Retry at one layer
+
+Pick **one** layer to retry for a given failure, usually the one closest to the failing dependency (it knows the most about the error), or the outermost one (it knows the user's deadline). Other layers should pass the failure up. A useful convention: when a service gives up after its own retries, it returns an error that tells its callers **not** to retry (for example a specific status or a header), so retries don't stack.
+
+<Callout kind="warn">
+Check your libraries. HTTP clients, database drivers, SDKs, service meshes and load balancers often retry by default. It's easy to have three layers of retries without writing a single retry loop yourself.
+</Callout>
+
+## Idempotency is a requirement
+
+A retry is only safe if doing the operation twice has the same effect as doing it once.
+
+| Operation | Safe to retry? |
+|---|---|
+| `GET /orders/42` | Yes: reads are idempotent |
+| `PUT /users/7/email` with the full value | Yes: same final state |
+| `DELETE /carts/9` | Yes: the second delete finds nothing |
+| `POST /payments` | **No**, unless made idempotent |
+| `UPDATE accounts SET balance = balance - 10` | **No** |
+| Sending an email | **No** |
+
+For non-idempotent operations, make them idempotent with an **idempotency key**:
+
+1. The client generates a unique key per logical operation (a UUID) and reuses it on every retry of that operation.
+2. The server stores the key with the result in the same transaction as the effect.
+3. A repeated key returns the stored result without doing the work again.
+
+```http
+POST /payments HTTP/1.1
+Idempotency-Key: 6c8f0d2e-91b4-4a3e-9d7f-2f6a1b0c44aa
+Content-Type: application/json
+
+{"orderId":"8812","amount":5900,"currency":"USD"}
+```
+
+Stripe's API is the well-known example. If you can't make an operation idempotent, don't retry it automatically: surface the failure and let a person or a reconciliation job decide.
+
+## Where to retry
+
+### In the client, close to the error
+
+The service that makes the call can retry on another instance (with discovery) and knows the error details. This is the most common place.
+
+### In the infrastructure
+
+A service mesh or load balancer can retry transparently (Envoy's `retry_on: 5xx,reset,connect-failure`, for instance). Convenient, consistent across languages, but the proxy doesn't know whether your POST is idempotent. Restrict mesh retries to connection-level failures and idempotent methods.
+
+### Asynchronously
+
+For work that doesn't need an immediate answer, put it on a **queue** and let a consumer retry with long backoff. Failed messages that keep failing go to a **dead-letter queue** for inspection rather than retrying forever. This takes retries off the user's critical path entirely.
+
+### Not at all
+
+Sometimes the right answer is to fail fast and let the **user** retry (they'll do it anyway), or to show a degraded response. For a heavily overloaded dependency, a circuit breaker should stop retries altogether.
+
+## Retries with other patterns
+
+| Combined with | How they fit |
+|---|---|
+| **Timeouts** | Every attempt needs a timeout; the sum of attempts must fit the overall deadline |
+| **Circuit breaker** | Retry inside the breaker's protection: when the breaker is open, don't retry at all; it already knows the dependency is down |
+| **Bulkhead** | Each retry attempt takes a permit like any other call, so retries can't exceed the dependency's share |
+| **Rate limiting** | 429 with Retry-After is a request to slow down; obey it, and count it against the retry budget |
+| **Hedging** | A different idea: send a second request *before* the first fails (after p95 latency), take whichever answers first. Cuts tail latency for idempotent reads, at the cost of extra load |
+
+## Cheat sheet
+
+- Retry only transient failures: resets, 502/503/504, 429, deadlocks; never 400, 401, 403 or 422.
+- A timeout doesn't mean the request failed; only retry it if the operation is idempotent.
+- Exponential backoff spaces retries out; jitter de-synchronises clients. Use both.
+- Full jitter, `random(0, min(cap, base × 2^n))`, is a sensible default.
+- Honour Retry-After when the server sends it.
+- Use 2 to 4 attempts for user-facing calls and an overall deadline across all attempts.
+- Retries at every layer multiply: 4 layers of 3 retries can mean 256 calls.
+- Retry budgets cap retries to a fraction of traffic, so outages don't multiply load.
+- Retry at one layer only, and watch out for libraries and meshes that retry by default.
+- Non-idempotent operations need idempotency keys before they can be retried.
+- For background work, retry from a queue with long backoff and a dead-letter queue.
+- When a circuit breaker is open, don't retry.

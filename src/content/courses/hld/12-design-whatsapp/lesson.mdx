@@ -1,0 +1,266 @@
+import { HldDeliveryStepper } from "@/components/widgets/HldDeliveryStepper";
+
+## What we are designing
+
+A chat app like WhatsApp lets people send text, photos, voice notes and video to one person or a group, see when messages are delivered and read, and see whether a contact is online. It feels instant, works on flaky mobile networks, and keeps messages safe while a phone is switched off for a week.
+
+Behind that are a few hard problems that make it a favourite design exercise:
+
+- holding **hundreds of millions of persistent connections** open at once
+- getting a message from one connection to another, across thousands of servers, in well under a second
+- **never losing** a message and never showing it twice, even when phones go offline mid-send
+- receipts, presence and groups, each of which multiplies traffic
+- media that is thousands of times bigger than text
+- **end-to-end encryption**, which means the servers cannot read what they relay
+
+## Requirements
+
+### Functional requirements
+
+- **One-to-one chat** with text messages.
+- **Group chat** (up to, say, 1,024 members).
+- **Delivery states**: sent (server has it), delivered (recipient's device has it), read.
+- **Offline delivery**: messages to an offline user arrive when they come back.
+- **Presence**: online indicator and "last seen".
+- **Media**: images, video, voice notes, documents.
+- **Push notifications** when the app is not open.
+
+Out of scope unless asked: voice and video calls, stories, payments, message search on the server.
+
+### Non-functional requirements
+
+- **Low latency**: a message to an online user arrives in a few hundred milliseconds.
+- **Reliability**: no message lost once the sender sees one tick.
+- **Ordering**: messages within a conversation appear in the order they were sent.
+- **High availability**: chat is a primary communication channel; downtime is front-page news.
+- **Privacy**: messages are end-to-end encrypted; the server stores as little as possible, for as short as possible.
+- **Mobile-friendly**: tolerate dropped connections, high latency, and battery and data limits.
+
+## Scale estimates
+
+Assume 2 billion registered users, **500 million daily active users**, each sending about 40 messages a day.
+
+| Quantity | Calculation | Result |
+|---|---|---|
+| Messages per day | 500M × 40 | 20 billion |
+| Average message rate | 20B ÷ 86,400 | about 230,000/s |
+| Peak rate (holidays, New Year) | ×3 to ×5 | about 1 million/s |
+| Concurrent connections | about half of DAU at peak | about 250 million |
+| Gateway servers | 250M ÷ 500K connections each | about 500 (plus spare) |
+| Text storage, if kept 30 days on server | 20B × 200 B × 30 | about 120 TB |
+| Media per day | 10% of messages × 200 KB | about 400 TB/day |
+
+What this forces: connection handling is its own tier, horizontally scaled. Text is small and manageable; **media dominates storage and bandwidth**, so it lives in object storage behind a CDN. Every delivery generates receipts too, so real event traffic is a multiple of the raw message rate.
+
+## Why WebSockets
+
+HTTP is request-response: the client asks, the server answers. Chat needs the **server to push** a message to Bob the moment Alice sends it. The options:
+
+| Approach | How it works | Problem for chat |
+|---|---|---|
+| Short polling | Client asks "anything new?" every few seconds | Wasteful at scale, adds seconds of latency, drains battery |
+| Long polling | Server holds the request open until there's data | Better, but a new HTTP request after every message; awkward for two-way traffic |
+| Server-Sent Events | Server streams events over one HTTP response | One-way only; sending still needs separate requests |
+| **WebSocket** | One persistent, full-duplex TCP connection | Fits: both sides send whenever they like, with tiny framing overhead |
+
+So each online client keeps **one long-lived WebSocket** (WhatsApp historically used a custom protocol over a persistent TCP connection, which is the same idea). Messages, acks, receipts, typing indicators and presence all travel over it. Heartbeats (a ping every 30 seconds or so) keep NATs and load balancers from closing idle connections and let the server notice dead phones.
+
+## High-level architecture
+
+```text
+ phones ──WebSocket──▶ L4 load balancer ──▶ Gateway servers (hold connections)
+                                                 │
+                                                 ▼
+                         ┌───────────── Chat service ─────────────┐
+                         │ assigns sequence numbers, routes,      │
+                         │ writes to message store, emits events  │
+                         └───┬───────────┬────────────┬───────────┘
+                             │           │            │
+                 Session registry   Message store   Group service
+                 (user → gateway)   (inboxes,       (members)
+                  Redis-like        Cassandra-like)
+                             │
+                 Presence service    Push service (APNs / FCM)
+
+ media: phone ──HTTPS──▶ Media service ──▶ object storage ──▶ CDN
+```
+
+- **Gateway servers** terminate WebSockets. They are kept thin: authenticate, hold the socket, forward frames to the chat service, and push frames down to clients.
+- **Session registry** maps `user_id → gateway server` (and per device). It is a fast in-memory store, updated on connect and disconnect.
+- **Chat service** is stateless business logic: validate, persist, route.
+- **Message store** holds messages until they are delivered (and, depending on product policy, for history).
+- **Push service** wakes offline phones through Apple's and Google's push networks.
+
+The load balancer for WebSockets is usually **layer 4** (TCP) for efficiency. Connections are long-lived, so balancing is by connection count, and draining a gateway for deploys means asking clients to reconnect gradually.
+
+## One-to-one message flow
+
+Alice sends "on my way" to Bob, and Bob is online.
+
+1. **Client prepares.** Alice's app assigns a **client message id** (a UUID), stores the message locally as pending, encrypts it for Bob, and sends it over her WebSocket to gateway G1.
+2. **Gateway forwards** the frame to the chat service.
+3. **Persist first.** The chat service assigns a **sequence number** in the Alice–Bob conversation and writes the message to the message store (Bob's undelivered inbox). Only after a durable write does it **ack Alice**. Alice now sees one grey tick.
+4. **Route.** The chat service looks up Bob in the session registry: connected to G7.
+5. **Deliver.** It sends the message to G7, which pushes it down Bob's socket.
+6. **Recipient ack.** Bob's app stores the message and sends a delivery ack. The server marks it delivered (removing it from Bob's pending inbox) and sends a **delivered receipt** to Alice: two grey ticks.
+7. **Read.** When Bob opens the chat, his app sends a **read receipt**, which reaches Alice the same way: two blue ticks.
+
+Routing between the chat service and gateways is commonly done either by direct RPC to the gateway named in the registry, or through a pub/sub channel per gateway (each gateway subscribes to its own topic). Both work; the registry lookup is the key step.
+
+<Callout kind="remember">
+**Persist before ack.** The single grey tick is a promise that the server has the message durably. Ack before persisting and a crash between the two loses a message the sender believes was sent.
+</Callout>
+
+## Message ids, retries and ordering
+
+Mobile networks drop connections constantly, so every step must be safe to **retry**.
+
+- **Idempotent sends.** If Alice's app doesn't get an ack, it resends with the **same client message id**. The server deduplicates by `(sender, client_msg_id)`, so the retry doesn't create a second message.
+- **Idempotent delivery.** If Bob's ack is lost, the server redelivers; Bob's app ignores ids it already has.
+- **Together** this gives **effectively-once** delivery from the user's point of view: at-least-once transport plus deduplication at both ends.
+
+**Ordering** matters per conversation, not globally. There is no need for one global clock across all chats. Options:
+
+- A **per-conversation sequence number** assigned by the server (from a counter in the conversation's partition). Clients display by sequence and can detect gaps ("I have 41 and 43, fetch 42").
+- Route all messages of a conversation through the **same partition** (for example, hash the conversation id to a partition of the chat service or a Kafka partition) so they're processed in order.
+- Client timestamps alone are unreliable because phone clocks drift; use them for display only.
+
+## Delivery and read receipts
+
+Receipts are just small messages flowing the other way, with the same reliability machinery:
+
+| State | Meaning | Triggered by |
+|---|---|---|
+| Pending (clock) | On Alice's phone, not yet acked by the server | Message created locally |
+| Sent (one tick) | Server has persisted it | Server ack after durable write |
+| Delivered (two ticks) | Bob's device has stored it | Bob's device ack |
+| Read (two blue ticks) | Bob has seen it on screen | Bob's app when the chat is open |
+
+Receipts can be **batched** ("read up to sequence 57" instead of one receipt per message), which cuts traffic dramatically in active chats. If Alice is offline when Bob's receipt is generated, it waits in Alice's inbox like any other message. Users who disable read receipts simply never send the read event.
+
+<HldDeliveryStepper />
+
+## Offline storage and delivery
+
+When the registry has no live session for Bob:
+
+1. The message is already durable in **Bob's inbox** (step 3 above). Nothing more is needed for correctness.
+2. The chat service asks the **push service** to send a notification through APNs (iOS) or FCM (Android). With end-to-end encryption, the notification payload is either a generic "new message" or an encrypted blob the app decrypts locally.
+3. When Bob reconnects, his app sends the last sequence number it has per conversation (or a global inbox cursor). The server streams everything after it, **in order**, in batches.
+4. Bob's app acks; the server deletes those messages from the inbox and sends delivered receipts to the senders.
+
+The inbox is a natural fit for a **wide-column store**: partition by recipient (or by conversation), cluster by sequence number, so "everything for Bob after cursor X" is one partition range read. Apply a retention limit (say 30 days); a phone offline longer than that misses messages, which is a product decision WhatsApp has made explicitly.
+
+**Server-side history**: WhatsApp's model treats the phone as the store of record and deletes messages from servers after delivery (backups go to the user's own cloud storage, encrypted). Apps such as Slack or Telegram cloud chats instead keep full history on the server for search and multi-device sync. The architecture is the same; retention and storage cost differ hugely.
+
+## Group chat
+
+A group message from Alice to a 200-member group must reach 199 other people. The usual approach is **fan-out on write** at the server:
+
+1. Alice sends one message to the group id.
+2. The chat service fetches the member list from the **group service** (cached, since membership changes rarely).
+3. It writes the message once (or a reference to it) and creates a delivery entry in each member's inbox.
+4. For each member, it looks up their sessions and delivers to online devices; offline members get push notifications.
+
+Fan-out on write works because groups are **bounded** (WhatsApp caps them around a thousand). For very large audiences (broadcast channels with millions of followers), fan-out on write is too expensive, so those systems switch to **fan-out on read**: store the message once per channel, and clients pull it when they open the channel.
+
+Receipts in groups are per member. Showing "delivered" or "read" for the group as a whole means tracking which members have acked; the sender's info screen lists them. To control traffic, receipts are batched and the sender's app only needs aggregated updates.
+
+With end-to-end encryption, group messages use a **sender key** scheme: Alice encrypts the message once with a group key she has distributed to members (over their pairwise encrypted channels), so she uploads one ciphertext rather than 199.
+
+## Presence and last seen
+
+Presence answers "is Bob online right now, and when was he last active?"
+
+- On connect, the gateway marks Bob **online** in a presence store (an in-memory key-value store with a TTL).
+- **Heartbeats** refresh the entry. If heartbeats stop (phone in a tunnel), the TTL expires and Bob becomes **offline**, with last seen set to the last heartbeat.
+- On a clean disconnect, mark offline immediately and record **last seen**.
+
+Presence is expensive because of **fan-out**: every change could notify every contact. Practical limits:
+
+- Only send presence updates to users who are **currently looking** at Bob's chat (subscribe when the chat screen opens, unsubscribe when it closes), not to all 500 of his contacts.
+- **Debounce** flapping: a phone that drops and reconnects within a few seconds shouldn't broadcast offline/online.
+- Presence is **best effort**: losing an update is harmless, so it doesn't need the durable path messages use.
+- Respect privacy settings (last seen hidden from everyone, or from non-contacts).
+
+**Typing indicators** follow the same pattern: ephemeral, sent only to the open chat, never stored.
+
+## Media messages
+
+Sending a 15 MB video through the chat pipeline would clog gateways and the message store. Instead, media travels **out of band**:
+
+1. Alice's app compresses the media and **encrypts it with a fresh random key**.
+2. It uploads the encrypted blob over HTTPS to the media service (often with a **pre-signed URL** straight to object storage), and gets back a media id or URL.
+3. Alice sends a normal chat message containing the **media URL, the decryption key, a hash** for integrity, and a small thumbnail. That message is end-to-end encrypted like any other.
+4. Bob's app receives the message, downloads the blob (through a **CDN** for popular or forwarded content), verifies the hash, and decrypts it.
+
+Because the server only stores encrypted blobs, it can't read media either. Forwarding a viral video doesn't re-upload it: the forwarded message reuses the same blob reference and key. Blobs are deleted after a retention period once delivered.
+
+## End-to-end encryption
+
+With **end-to-end encryption (E2EE)**, only the sender's and recipient's devices hold the keys. Servers relay and store **ciphertext** they cannot decrypt. WhatsApp uses the **Signal Protocol**. In outline:
+
+- Each device generates a long-term **identity key pair** and a set of **pre-keys**, and uploads only the **public** halves to a key server.
+- To start a session with Bob, even while he's offline, Alice's app fetches Bob's public identity key and a one-time pre-key and runs a key agreement (**X3DH**) to derive a shared secret.
+- Each message then uses a fresh key derived by the **Double Ratchet**, so compromising one key doesn't expose past messages (**forward secrecy**) and the session recovers security after a compromise.
+- Users can compare **safety numbers** (fingerprints of identity keys) to detect a man-in-the-middle.
+
+Design consequences you should state in an interview:
+
+- The server can't do **server-side search, spam scanning of content, or previews**; those move to the client or rely on metadata.
+- **Multi-device** means each device has its own keys; a message to Bob is encrypted separately for each of Bob's devices (or via sender keys).
+- The server still sees **metadata**: who talks to whom, when, and message sizes. Minimising stored metadata is part of the privacy design.
+
+## Storage model
+
+| Data | Store | Why |
+|---|---|---|
+| Undelivered messages / inbox | Wide-column (Cassandra, HBase) | Huge write rate, read by recipient + sequence range |
+| Message history (if kept) | Wide-column, partitioned by conversation | Append-only, read latest N per chat |
+| Session registry, presence | In-memory KV (Redis-like) | Very frequent updates, small values, TTLs |
+| Users, groups, membership | Relational or KV with strong consistency | Low volume, needs correctness |
+| Media | Object storage + CDN | Large immutable blobs |
+| Public keys | Replicated KV | Read on session setup |
+
+A sample inbox table:
+
+```sql
+CREATE TABLE inbox (
+  recipient_id  bigint,
+  seq           bigint,      -- per-recipient (or per-conversation) sequence
+  conversation  bigint,
+  sender_id     bigint,
+  client_msg_id uuid,
+  ciphertext    blob,
+  sent_at       timestamp,
+  PRIMARY KEY ((recipient_id), seq)
+);
+```
+
+## Multi-device
+
+Modern WhatsApp lets one account use a phone plus several linked devices, each with its own connection and keys. The session registry therefore maps a user to **a set of device sessions**, and delivery fans out to each device. Each device tracks its own cursor, and a message counts as "delivered" once at least one of the recipient's devices has it (the exact rule is a product choice).
+
+## Bottlenecks and trade-offs
+
+- **Gateway failures.** When a gateway dies, hundreds of thousands of clients reconnect at once. Clients use **exponential backoff with jitter** to avoid a thundering herd, and the registry entries for that gateway expire or are cleared.
+- **Session registry consistency.** A stale entry (Bob moved to another gateway) causes a failed delivery; the message is still in the inbox, so the fallback is "treat as offline and let him sync". Correctness never depends on the registry being perfect.
+- **Hot groups and celebrities.** Large groups multiply writes and receipts; cap group size and batch receipts. Broadcast channels use fan-out on read.
+- **Ordering across devices.** Server-assigned sequence numbers per conversation keep every device's view consistent.
+- **Regional deployment.** Users connect to the nearest region; cross-region messages are routed between regions over a backbone. Each user's inbox has a home region.
+- **Retention vs cost.** Deleting after delivery keeps server storage small and limits what can leak; keeping history enables multi-device sync and search but multiplies storage.
+
+## Cheat sheet
+
+- Each online device holds one persistent WebSocket to a thin gateway; heartbeats keep it alive.
+- A session registry maps users (and devices) to gateways; the chat service routes through it.
+- Persist the message before acking the sender: one tick means the server has it durably.
+- Client message ids plus dedup on both ends turn at-least-once delivery into effectively-once.
+- Order per conversation with server-assigned sequence numbers, not phone clocks.
+- Delivered and read receipts are small messages in the reverse direction; batch them.
+- Offline users get a push notification; on reconnect they sync everything after their last sequence.
+- Groups fan out on write to each member's inbox; huge broadcast channels fan out on read.
+- Presence is ephemeral, TTL-based, debounced, and only sent to users viewing the chat.
+- Media is encrypted on the device, uploaded to object storage, and referenced in the message with its key.
+- E2EE (Signal Protocol) means servers relay ciphertext only; search and scanning move to clients.
+- Inboxes and history fit a wide-column store; sessions and presence fit an in-memory KV store.

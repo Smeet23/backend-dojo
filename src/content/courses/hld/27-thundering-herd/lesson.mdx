@@ -1,0 +1,248 @@
+import { HldStampedeSim } from "@/components/widgets/HldStampedeSim";
+
+## What a thundering herd is
+
+A **thundering herd** happens when a large number of clients, threads or processes are all waiting on the same thing, and the moment that thing changes they all wake up and rush at the same resource together. The resource could be a database row, a cache key, a lock, a login service or a ticket inventory. Usually it could easily handle the same traffic spread out over time. What breaks it is the **synchronisation**: everyone arrives in the same few milliseconds.
+
+The name comes from operating systems. When many processes block on the same event (say, a socket accepting connections) and the kernel wakes **all** of them, only one can actually win the work. The rest wake up, compete, lose and go back to sleep, having burned CPU and context switches for nothing. Distributed systems have the same shape at a larger scale:
+
+- Many callers want the same thing.
+- Something makes them all act at once: a cache key expiring, a server restarting, a sale opening at 10:00:00, a network blip ending.
+- A shared backend gets a spike far above its steady load, slows down, and often falls over.
+
+<Callout kind="remember">
+A thundering herd is a **coordination problem**, not a capacity problem. Total demand may be fine; it's the fact that it lands all at once, on one resource, that hurts.
+</Callout>
+
+### Why the spike gets worse, not better
+
+Herds tend to feed themselves. When the backend slows down under the spike:
+
+1. Requests take longer, so more of them are in flight at once.
+2. Clients time out and **retry**, adding even more load.
+3. Connection pools fill up, so unrelated requests start failing too.
+4. Health checks fail, the load balancer pulls instances out, and the survivors take even more traffic.
+
+This is why a ten-second burst can turn into a twenty-minute outage. The system has entered a state where the load it is shedding (via timeouts) comes straight back as retries. Breaking the synchronisation early is far cheaper than recovering later.
+
+## Cache stampede
+
+The most common herd in backend systems is the **cache stampede** (also called dog-piling). It shows up whenever a popular cache key disappears.
+
+Picture a product page for a phone launch. The page data sits in Redis under `product:42`, with a 60-second TTL, and it is read 5,000 times per second. Every read hits the cache, so the database barely notices the page exists.
+
+Now the TTL runs out. Here is what a naive cache-aside read path does:
+
+```ts
+async function getProduct(id: string) {
+  const cached = await redis.get(`product:${id}`);
+  if (cached) return JSON.parse(cached);
+
+  // MISS: go to the database
+  const product = await db.query("SELECT ... WHERE id = $1", [id]); // ~200 ms
+  await redis.set(`product:${id}`, JSON.stringify(product), "EX", 60);
+  return product;
+}
+```
+
+The database query takes 200 ms. During those 200 ms, about 1,000 more requests arrive. Every one of them sees a miss, because the first request hasn't written the value back yet. So **1,000 identical queries** hit the database at the same instant, all to compute the exact same answer. Then all 1,000 write the same value into Redis.
+
+If the query is expensive (a join over several tables, an aggregation, a call to a slow third-party API) the database may not survive it. And if the database slows down, the query takes longer, the window of misses gets wider, and even more requests pile in. That's the feedback loop again.
+
+### Common triggers
+
+| Trigger | What happens |
+|---|---|
+| **A hot key expires** | Every reader misses at once and recomputes. |
+| **Many keys share the same TTL** | Keys written together (by a warm-up job, a deploy, a batch import) all expire together, minutes later. |
+| **Cache node restarts or is flushed** | Every key is cold at once. The whole read load lands on the database. |
+| **A deploy changes the cache key format** | New code reads `v2:product:42`, finds nothing, and the cache is effectively empty. |
+| **Clients reconnect after an outage** | Thousands of mobile apps or websocket clients reconnect, re-authenticate and re-fetch state at the same moment. |
+
+The last row isn't a cache problem at all, which is the point: the herd pattern appears anywhere many clients get synchronised.
+
+## The ticket-booking flash sale
+
+A different flavour of herd appears when the trigger is a **business event** rather than a technical one. Consider a concert ticket sale that opens at exactly 10:00.
+
+- 2 million fans are sitting on the page, refreshing.
+- At 10:00:00 the "Buy" button activates and nearly all of them click within the first few seconds.
+- There are only 50,000 seats, so at most 50,000 purchases can ever succeed.
+- Each purchase must check availability, hold a seat, take payment and confirm, touching the inventory database every time.
+
+Normal traffic for the site might be 2,000 requests per second. In the first second of the sale it might be 500,000. No sensible amount of autoscaling reacts in one second, and the inventory table has a few hot rows (the best sections) that every transaction wants to lock.
+
+What goes wrong without a plan:
+
+- **Database lock contention.** Thousands of transactions queue for the same seat rows. Most of them time out.
+- **Retries.** Fans hammer refresh and the app retries failed calls, multiplying load.
+- **Unfairness.** Who gets a ticket depends on which request happened to win a race, not on who arrived first.
+- **Collateral damage.** The login, search and payment services share infrastructure with the sale, so the whole site goes down.
+
+The fixes here are about **admission control**: don't let more work into the system than it can complete. We come back to this with waiting rooms below.
+
+## Fix 1, request coalescing
+
+The single most effective fix for a cache stampede is to make sure that, for any one key, **only one request recomputes the value while everyone else waits for that result**. This is called **request coalescing**, and the in-process version is often called **single-flight** (after Go's `singleflight` package).
+
+The idea: keep a map of in-flight loads. The first caller for a key starts the load and stores its promise in the map. Every later caller for the same key, until the load finishes, gets the same promise instead of starting a new query.
+
+```ts
+const inFlight = new Map<string, Promise<Product>>();
+
+async function getProduct(id: string): Promise<Product> {
+  const key = `product:${id}`;
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+
+  const existing = inFlight.get(key);
+  if (existing) return existing; // join the flight already in the air
+
+  const load = (async () => {
+    try {
+      const product = await db.loadProduct(id);
+      await redis.set(key, JSON.stringify(product), "EX", 60);
+      return product;
+    } finally {
+      inFlight.delete(key);
+    }
+  })();
+  inFlight.set(key, load);
+  return load;
+}
+```
+
+With 1,000 concurrent misses on one server, the database now sees **one** query instead of 1,000.
+
+There's a catch: this only coalesces **within one process**. If you run 50 app servers, each one sends its own single query, so the database sees 50. That is usually fine (50 is a lot better than 1,000), but for very expensive computations you need coordination across servers, which is what a lock does.
+
+<Callout kind="tip">
+Many caching libraries and CDNs have coalescing built in. CDNs call it **request collapsing**: when many users request the same uncached object, the edge sends one request to the origin and fans the response out to everyone waiting.
+</Callout>
+
+## Fix 2, a distributed lock
+
+To coalesce across servers, use a short-lived lock in the cache itself. On a miss, a request tries to acquire a lock key; only the winner recomputes.
+
+```text
+GET product:42            -> miss
+SET lock:product:42 <token> NX PX 5000
+  -> OK       : I'm the leader. Load from DB, SET product:42, DEL lock.
+  -> (nil)    : someone else is loading. Wait 50 ms, then GET product:42 again.
+```
+
+Details that matter:
+
+- **`NX`** means "only set if it doesn't exist", which makes acquiring atomic.
+- **The lock has an expiry** (`PX 5000`). If the leader crashes mid-load, the lock frees itself instead of blocking everyone forever.
+- **Losers need a plan.** They can poll the cache a few times with short sleeps, serve a stale copy if one exists, or return a fallback. Polling adds a little latency; that's the trade for protecting the database.
+- **Release safely.** Delete the lock only if it still holds your token, so a slow leader doesn't delete a lock that has since been taken by someone else.
+
+The lock version is more moving parts than single-flight, so use it when recomputation is truly expensive, or when you have many app servers and each duplicate query hurts.
+
+## Fix 3, jittered TTLs
+
+Coalescing handles one hot key expiring. It doesn't help when **thousands of keys expire in the same second** because they were all written in the same second with the same TTL. A cache warm-up job that loads 100,000 products with `EX 3600` has quietly scheduled a stampede for exactly one hour later.
+
+The fix is **jitter**: add a small random amount to each TTL so expirations spread out.
+
+```ts
+const BASE_TTL = 3600;
+const ttl = BASE_TTL + Math.floor(Math.random() * 600); // 60 to 70 minutes
+await redis.set(key, value, "EX", ttl);
+```
+
+Instead of 100,000 misses in one second, you get roughly 170 per second spread over ten minutes, which the database barely notices. Jitter costs nothing and should be the default for any bulk-written cache.
+
+The same idea appears in **retry backoff**. If 10,000 clients all fail at once and all retry after exactly 1 second, then 2, then 4, they stay perfectly synchronised and keep hitting the server in waves. **Exponential backoff with jitter** (a random wait between 0 and the backoff ceiling) spreads them out.
+
+## Fix 4, refresh before expiry
+
+Both fixes so far still let the key expire and then react. A better approach for hot keys is to **never let them go cold**.
+
+### Background refresh
+
+Store the value with a long hard TTL and a shorter **soft TTL** (a "refresh after" timestamp in the value). When a reader sees the soft TTL has passed, it returns the current value immediately and triggers a background refresh (guarded by a lock so only one refresh runs). Users always get a fast answer, and the value is refreshed before it ever disappears. HTTP has the same idea built in as `Cache-Control: stale-while-revalidate`.
+
+### Probabilistic early expiration
+
+A clever variant avoids even the lock. Each reader, as the key approaches expiry, rolls a die: the closer to expiry and the more expensive the recompute, the higher the chance it decides to refresh **early**. With thousands of readers, one of them almost certainly refreshes a little before the deadline, and the rest keep using the cached value. This technique is known as **XFetch** or probabilistic early recomputation.
+
+### Pre-warming
+
+For predictable events (a product launch, a sale at 10:00, a morning batch) load the cache **before** traffic arrives, and stagger the warming so it doesn't become its own herd.
+
+| Technique | Prevents | Cost |
+|---|---|---|
+| Single-flight | Duplicate loads of one key in one process | Tiny; per-process only |
+| Distributed lock | Duplicate loads across all servers | Lock round trip; waiters add latency |
+| Jittered TTL | Many keys expiring together | Nothing |
+| Soft TTL / stale-while-revalidate | Any user seeing a miss on a hot key | Serves slightly stale data |
+| Probabilistic early refresh | Hot keys expiring at all | A few extra recomputations |
+| Pre-warming | Cold cache at a known event | Needs a schedule and a warm-up job |
+
+<HldStampedeSim />
+
+## Fix 5, queues and waiting rooms
+
+For the flash-sale herd, caching isn't the answer. Every purchase genuinely needs to touch the inventory. The fix is to **control how fast work enters the system**.
+
+### Virtual waiting rooms
+
+Large ticketing and retail sites put a **waiting room** in front of the sale:
+
+1. Before 10:00, users land on a lightweight static page served from a CDN (cheap to serve to millions).
+2. At 10:00 each user gets a **queue position**, often randomised among everyone who arrived before the opening so that refreshing at 9:59:59.9 doesn't beat everyone else.
+3. The waiting room lets users through at a fixed rate, say 2,000 per minute, which matches what checkout can actually handle.
+4. Admitted users get a signed, short-lived token; the purchase API rejects requests without one.
+
+The backend sees a smooth, known load instead of a spike. Users see an honest "you are number 14,203, about 7 minutes" instead of errors.
+
+### Queue-based processing
+
+Inside the system, purchase requests can go into a **message queue** instead of hitting the database directly. A fixed pool of workers drains the queue at the rate the database can handle. The queue absorbs the burst; the workers set the pace. The client gets "your order is being processed" and is notified (or polls) when it is confirmed.
+
+### Seat holds instead of long locks
+
+Rather than locking seat rows for the length of a payment, mark a seat as **held** with a short expiry (say five minutes) in a quick, atomic update. Payment happens outside the transaction. If the hold expires, the seat goes back into the pool. This keeps database locks short, which is what lets throughput stay high under contention.
+
+## Fix 6, rate limiting and load shedding
+
+The final layer is defensive: if a herd does form, **refuse excess work early and cheaply** rather than accepting it and failing slowly.
+
+- **Rate limiting** at the gateway caps requests per user, per IP or per endpoint. A user refreshing 20 times a second gets `429 Too Many Requests` after the first few, at almost zero cost to the backend.
+- **Load shedding** drops lower-priority requests when the system is overloaded. During a sale, keep checkout alive and shed recommendations or analytics.
+- **Concurrency limits** on calls to the database (a bounded pool or semaphore) mean a herd queues briefly in the app instead of swamping the database.
+- **Circuit breakers** stop calling a dependency that is clearly failing, giving it room to recover instead of feeding the retry storm.
+- **Client-side discipline**: exponential backoff with jitter, a retry budget, and honouring `Retry-After`.
+
+<Callout kind="warn">
+Retries without jitter and without a budget are one of the most common ways a small hiccup becomes a full outage. Every client library you ship should back off with randomness.
+</Callout>
+
+## Putting it together
+
+Different herds need different fixes, and real systems layer several:
+
+| Scenario | Primary fixes |
+|---|---|
+| One very hot key expiring | Single-flight plus a lock, or soft TTL with background refresh |
+| A bulk-loaded cache expiring together | Jittered TTLs |
+| Cache cluster restart | Coalescing, concurrency limits to the DB, gradual warm-up |
+| Flash sale or ticket drop | Waiting room, queue, short seat holds, rate limits |
+| Mass client reconnect after an outage | Client backoff with jitter, server-side rate limits, staggered reconnect |
+
+A good interview answer names the trigger, explains why synchronisation is the problem, and then picks fixes that either **de-duplicate** the work (coalescing, locks), **spread it out in time** (jitter, early refresh, backoff, queues) or **cap it** (waiting rooms, rate limits, shedding).
+
+## Cheat sheet
+
+- A thundering herd is many clients hitting one resource at the same instant after a shared trigger.
+- A cache stampede is the classic case: a hot key expires and every reader recomputes it at once.
+- Slowdown leads to timeouts, then retries, then more load; herds feed themselves.
+- Single-flight (request coalescing) lets one request per key per process do the load while others wait.
+- A distributed lock with NX and an expiry coalesces across all servers.
+- Add random jitter to TTLs so bulk-written keys don't all expire together.
+- Soft TTLs, stale-while-revalidate and probabilistic early refresh keep hot keys from ever going cold.
+- Flash sales need admission control: a virtual waiting room, queues and short seat holds.
+- Rate limit, shed load and bound DB concurrency so a herd fails fast and cheaply.
+- Clients must retry with exponential backoff plus jitter, inside a retry budget.

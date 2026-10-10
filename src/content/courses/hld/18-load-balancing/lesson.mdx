@@ -1,0 +1,230 @@
+import { HldLbAlgoRace } from "@/components/widgets/HldLbAlgoRace";
+import { HldHashRemap } from "@/components/widgets/HldHashRemap";
+
+## Why load balance
+
+One server has limits: CPU, memory, connections, network bandwidth. When traffic outgrows it, you can buy a bigger machine (**vertical scaling**) until you hit the biggest one money can buy, or add more machines (**horizontal scaling**). Horizontal scaling needs something to **spread requests across the machines**. That's a load balancer.
+
+A load balancer (LB) sits in front of a pool of servers, receives every request, and forwards each one to a server chosen by some **algorithm**. Done well, it gives you:
+
+- **Scalability:** add servers to the pool to handle more traffic, with no change for clients.
+- **Availability:** if a server dies, the LB stops sending it traffic, and users don't notice.
+- **Zero-downtime deployments:** drain a server, upgrade it, put it back.
+- **One stable address:** clients talk to `api.example.com`; the servers behind it can change at any time.
+
+A load balancer is a kind of **reverse proxy**, specialised in distributing traffic.
+
+<Callout kind="remember">
+Load balancing works best when servers are **stateless**. If any server can handle any request, the LB is free to choose purely on load. State (sessions, carts) belongs in a shared store such as Redis or a database.
+</Callout>
+
+## L4 versus L7
+
+Load balancers are classified by the network layer they make decisions at.
+
+### Layer 4
+
+A **layer 4** (transport) LB sees only IP addresses and TCP or UDP ports. It picks a backend when a **connection** opens and then forwards packets for that connection without looking inside them.
+
+- **Very fast and cheap:** no parsing, often no TLS work. Can handle millions of connections.
+- **Protocol-agnostic:** works for HTTP, databases, MQTT, game servers, anything over TCP or UDP.
+- **Coarse:** it can't route by URL, header or cookie, and it balances **connections**, not requests. With long-lived connections (HTTP/2, gRPC, WebSockets), one connection can carry thousands of requests, all to the same server.
+
+Examples: AWS Network Load Balancer, HAProxy in TCP mode, Linux IPVS, Google's Maglev.
+
+### Layer 7
+
+A **layer 7** (application) LB terminates the connection, reads the HTTP request, and decides **per request** based on its content:
+
+- Route `/api/*` to API servers and `/images/*` to an image service.
+- Route by `Host` header, so many domains share one LB.
+- Route by cookie or header (send beta users or a canary percentage to a new version).
+- Balance individual gRPC or HTTP/2 **requests** across servers, even on one client connection.
+- Add headers, terminate TLS, cache, compress, apply WAF rules and rate limits.
+
+The price is more CPU and a little more latency, since it must decrypt and parse each request.
+
+Examples: AWS Application Load Balancer, Nginx, Envoy, HAProxy in HTTP mode, Traefik.
+
+| | Layer 4 | Layer 7 |
+|---|---|---|
+| Sees | IPs, ports | Full HTTP request: path, headers, cookies |
+| Unit balanced | Connection | Request |
+| TLS | Usually passes through | Usually terminates |
+| Routing by content | No | Yes |
+| Speed and cost | Faster, cheaper | Slower, more CPU |
+| Good for | Non-HTTP protocols, raw throughput, first tier | Microservice routing, gRPC, canaries, sticky cookies |
+
+Large systems often **stack** them: an L4 tier spreads connections across a fleet of L7 proxies, which then route individual requests to services.
+
+## Balancing algorithms
+
+The algorithm decides which server gets the next request. They fall into two groups: **static** algorithms that ignore current load, and **dynamic** ones that react to it.
+
+### Round robin
+
+Send requests to servers in turn: A, B, C, A, B, C… It's simple, stateless and fair **when servers are identical and requests cost about the same**. It breaks down when either is false: a slow request and a fast request count the same, so one unlucky server can pile up heavy work while others idle.
+
+### Weighted round robin
+
+Give each server a **weight** proportional to its capacity. A server with weight 3 gets three requests for every one sent to a weight-1 server. Useful for mixed hardware, or for **gradual rollouts**: give a new version weight 1 out of 20 to send it 5% of traffic.
+
+Good implementations interleave rather than burst (A, A, B, A, C rather than A, A, A, B, C), as Nginx's smooth weighted round robin does.
+
+### Least connections
+
+Send each request to the server with the **fewest active connections** right now. This adapts naturally to uneven work: a server stuck on slow requests has more open connections, so it gets fewer new ones. It's a strong default for workloads where request durations vary, such as APIs with some slow endpoints or long-lived connections.
+
+**Weighted least connections** divides active connections by weight, combining both ideas.
+
+### Least response time
+
+Choose the server with the **lowest recent response time** (often combined with fewest active connections). It reacts to a server that is slow for any reason: a noisy neighbour, garbage collection, a cold cache. It needs the LB to track latency, and it can over-react if one fast response attracts a flood.
+
+### Power of two choices
+
+Checking every server for the least-loaded one is expensive with thousands of servers and many LBs, and every LB might pile onto the same "best" server at once. **Power of two random choices** picks **two servers at random** and sends the request to the less loaded of the two. It's cheap and avoids herding, and its results are surprisingly close to checking all servers. Envoy and Nginx (`random two least_conn`) support it.
+
+### IP hash
+
+Hash the client's IP address and take it modulo the number of servers: `server = hash(client_ip) % N`. The same client always lands on the same server, giving **stickiness without cookies**, which helps when servers hold per-client caches.
+
+Two problems:
+
+- **Uneven load:** many users behind one corporate NAT or mobile carrier share an IP and all land on one server.
+- **Reshuffling:** when N changes (a server is added or dies), `% N` changes for almost every client, so nearly everyone moves. For per-server caches, that's a cold-cache storm.
+
+### Consistent hashing
+
+**Consistent hashing** fixes the reshuffling. Place servers on a hash **ring** (each server at several points, called **virtual nodes**, to spread load evenly). Hash each key (client id, session id, cache key) onto the ring and walk clockwise to the first server.
+
+When a server is removed, only the keys it owned move, to the next server on the ring. When one is added, it takes over only a slice of keys from its neighbours. With N servers, roughly **1/N** of keys move, instead of nearly all of them.
+
+Consistent hashing is the right choice when **where a request lands matters**: distributed caches, sharded storage, or routing all of a user's requests to the server holding their data. Variants include rendezvous (highest random weight) hashing and Google's Maglev hashing.
+
+<HldHashRemap />
+
+### Choosing
+
+| Situation | Good choice |
+|---|---|
+| Identical servers, short uniform requests | Round robin |
+| Mixed server sizes, or a canary percentage | Weighted round robin |
+| Request durations vary a lot, or long-lived connections | Least connections |
+| Some servers occasionally slow (GC, noisy neighbours) | Least response time, or power of two choices |
+| Huge fleet with many independent LBs | Power of two choices |
+| Same client must hit the same server, servers rarely change | IP hash |
+| Key affinity with servers coming and going (caches, shards) | Consistent hashing |
+
+<HldLbAlgoRace />
+
+## Health checks
+
+An LB must know which servers can take traffic. Sending requests to a dead server means errors for users.
+
+### Active checks
+
+The LB probes each server on a schedule:
+
+- **TCP check:** can a connection be opened? Proves the process is listening, not that it works.
+- **HTTP check:** `GET /healthz` must return `200` within a timeout. Better: it proves the app is serving.
+
+```text
+interval 5s · timeout 2s · unhealthy after 3 failures · healthy after 2 successes
+```
+
+Thresholds avoid **flapping** (a server bouncing in and out of the pool on one slow probe), at the cost of slower detection: here, about 15 seconds to notice a dead server.
+
+### Passive checks
+
+The LB also watches **real traffic**. If a server returns several `5xx` errors or connection failures in a row, it's ejected for a cool-down period. Envoy calls this **outlier detection**; Nginx uses `max_fails` and `fail_timeout`. Passive checks catch problems faster than probes, but only for servers already receiving traffic.
+
+### Draining and slow start
+
+- **Connection draining:** when removing a server (for a deploy or scale-in), stop sending it **new** requests but let in-flight ones finish, up to a timeout.
+- **Slow start:** a freshly added server gets a gradually increasing share of traffic, so a cold JVM or empty cache isn't flooded instantly. Least connections is especially prone to this, since a new server has zero connections and looks very attractive.
+
+<Callout kind="warn">
+Keep LB health checks about the **server itself**. If `/healthz` also checks a shared database, a database blip makes every server fail at once, and the LB ejects the whole pool.
+</Callout>
+
+## Sticky sessions
+
+**Sticky sessions** (session affinity) send all requests from one client to the same server. They exist for apps that keep session state **in server memory**.
+
+How the LB pins a client:
+
+- **Cookie-based:** on the first response, the LB sets a cookie like `SERVERID=app3` (or a hashed value). Later requests carry it, and the LB routes accordingly. This is the common L7 approach.
+- **IP-based:** hash the client IP. Works at L4, but suffers the NAT and mobile problems above.
+
+Why to avoid them where possible:
+
+- **Uneven load:** a few heavy users stuck to one server overload it while others idle.
+- **Lost sessions on failure:** if the pinned server dies, its in-memory sessions die with it, and users are logged out.
+- **Harder scaling:** new servers only get **new** users; existing users stay pinned to old servers.
+- **Harder deployments:** you must drain sessions before restarting a server.
+
+The better design is **stateless servers** with sessions in Redis or a signed token, so any server can handle any request. Stickiness is still legitimately useful as a **performance** optimisation (for example, keeping a user on the server that has their data cached), as long as correctness doesn't depend on it. WebSockets are naturally sticky, since one connection stays on one server.
+
+## Global load balancing
+
+One LB serves one data centre or region. To spread users **across regions** (for latency and to survive a region outage), you need global load balancing.
+
+### DNS-based
+
+DNS returns different IP addresses for the same name:
+
+- **Round robin DNS:** return several IPs; clients pick one. Crude: no health awareness, uneven due to caching.
+- **GeoDNS:** return the IP of the region nearest the client's resolver.
+- **Latency-based routing:** return the region with the lowest measured latency (AWS Route 53 offers this).
+- **Health-checked failover:** stop returning a region's IP when it fails.
+
+DNS's weakness is **caching**. Resolvers and clients cache answers for the TTL, and some ignore it. Even with a 60-second TTL, some users keep hitting a dead region for minutes. Keep TTLs short for anything you may need to fail over.
+
+### Anycast
+
+With **anycast**, the same IP address is announced from many locations via BGP, and the internet's routing sends each user to the **nearest** one. There's no DNS caching delay: if a site stops announcing, traffic reroutes within seconds. CDNs, Cloudflare and Google's global front end use anycast.
+
+### A typical layered setup
+
+```text
+User
+  │  DNS (GeoDNS / latency routing) or anycast IP
+  ▼
+Nearest region
+  │
+  ▼
+L4 load balancer (connection spreading, very high throughput)
+  │
+  ▼
+L7 load balancers / proxies (TLS, routing by path, canaries)
+  │
+  ▼
+Service instances across availability zones
+```
+
+## Load balancer high availability
+
+The load balancer itself must not become a **single point of failure**. Common patterns:
+
+- **Active-passive pair with a floating IP.** Two LB nodes share a virtual IP using VRRP (for example with keepalived). The active node holds the IP; if it stops sending heartbeats, the passive node claims the IP within a second or two.
+- **Active-active with multiple IPs.** Several LBs each have their own IP, and DNS returns all of them. If one dies, health-checked DNS stops returning it.
+- **ECMP and anycast.** Routers spread traffic across many identical LB nodes using equal-cost multi-path routing; a failed node's routes are withdrawn. This is how very large L4 tiers (Maglev, Katran) scale horizontally.
+- **Managed cloud LBs.** AWS ELB, Google Cloud Load Balancing and Azure Load Balancer are themselves distributed, multi-AZ systems. You get one endpoint; the provider handles redundancy.
+
+Also plan **capacity**: the LB tier must handle peak traffic plus TLS handshakes, and survive the loss of a node or zone.
+
+## Cheat sheet
+
+- A load balancer spreads requests across servers for scale, availability and safe deployments.
+- L4 balances connections using IPs and ports: fast, protocol-agnostic, blind to content.
+- L7 balances individual HTTP requests and can route by path, host, header or cookie.
+- Round robin suits identical servers and uniform requests; weighted round robin handles mixed capacity.
+- Least connections adapts to uneven request durations; least response time reacts to slow servers.
+- Power of two choices: pick two random servers, use the less loaded; cheap and avoids herding.
+- IP hash gives stickiness, but hash modulo N remaps almost every client when N changes.
+- Consistent hashing moves only about 1/N of keys when a server joins or leaves.
+- Use active and passive health checks, with draining on removal and slow start on addition.
+- Prefer stateless servers over sticky sessions; stickiness skews load and loses sessions on failure.
+- Global load balancing uses GeoDNS or latency DNS (watch TTL caching) or anycast.
+- Make the LB redundant: floating IP pairs, multiple IPs, ECMP or a managed multi-AZ LB.

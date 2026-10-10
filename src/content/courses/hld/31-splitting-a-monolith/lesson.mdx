@@ -1,0 +1,208 @@
+import { HldBoundarySorter } from "@/components/widgets/HldBoundarySorter";
+
+## The real question
+
+"How many microservices should we have?" sounds like it should have a number for an answer. It doesn't. The useful question is: **where should the boundaries be, and what does each boundary cost?**
+
+Every service boundary turns an in-process function call into a network call. That buys you independence (separate deploys, separate scaling, separate failure, separate ownership) and costs you latency, partial failure, distributed data and operational overhead. A good split places boundaries where the independence is worth that cost, and nowhere else.
+
+This lesson walks through how to decide: when to split at all, how to find natural boundaries with domain-driven design, how data and teams shape the answer, what goes wrong when you split too far, and how to migrate safely.
+
+## Start with a monolith
+
+A **monolith** is one deployable unit containing all of the application's features. That's not a dirty word. For most products, especially early on, it's the right choice:
+
+- **One codebase, one deploy, one database.** Easy to run locally, easy to test end to end.
+- **Refactoring is cheap.** Moving a function between modules is an IDE operation, not a cross-team API negotiation.
+- **Transactions are simple.** Placing an order and decrementing stock can be one ACID transaction.
+- **Calls are fast and reliable.** In-process calls take nanoseconds and never time out.
+
+Early on, you don't yet know where the stable boundaries in your domain are. Drawing service lines too soon locks in guesses that are expensive to undo. A common recommendation is to build a **modular monolith** first: one deployable, but with clearly separated internal modules that talk through defined interfaces and don't reach into each other's tables. If you later need to extract a module into a service, the seams are already there.
+
+<Callout kind="remember">
+Microservices are a solution to **organisational and scaling problems**, not a default architecture. If you don't have those problems yet, a well-structured monolith is usually faster and cheaper.
+</Callout>
+
+## When to split
+
+Split when you can point to a concrete pain that independence would fix. Common, legitimate reasons:
+
+| Signal | Why a separate service helps |
+|---|---|
+| **Teams block each other** | 60 engineers in one repo means merge conflicts, a shared release train and one team's bug delaying everyone's launch. Separate services let teams ship on their own schedule. |
+| **Very different scaling needs** | Image processing needs GPU-heavy workers; the catalogue API needs lots of small instances. In a monolith you scale everything to satisfy the hungriest part. |
+| **Different reliability requirements** | Checkout must stay up even if recommendations crash. A separate process contains the blast radius. |
+| **Different release cadence** | The pricing engine changes daily; the invoicing module changes twice a year under audit. |
+| **Different technology needs** | A machine-learning component wants Python; the core app is in Java. |
+| **Security or compliance isolation** | Card data must live in a small, separately audited service (shrinking PCI scope). |
+
+And reasons that **aren't** good enough on their own:
+
+- "Microservices are modern" or "big tech does it."
+- "The code is messy." A messy monolith split into services becomes a messy distributed system, which is worse. Fix modularity first.
+- "We want to scale." Most monoliths scale horizontally just fine behind a load balancer; the database is usually the bottleneck either way.
+
+## Bounded contexts
+
+The best tool for finding service boundaries comes from **domain-driven design (DDD)**: the **bounded context**.
+
+A bounded context is a part of the business where words have **one consistent meaning** and one model applies. The insight is that large businesses don't have one model of "customer" or "product"; they have several, and each department means something slightly different.
+
+Take an e-commerce company and the word **"product"**:
+
+| Context | What "product" means there |
+|---|---|
+| **Catalogue** | Title, description, images, category, attributes for search |
+| **Pricing** | Base price, discounts, currency rules, tax class |
+| **Inventory** | SKU, quantity per warehouse, reorder threshold |
+| **Shipping** | Weight, dimensions, hazardous-goods flag |
+| **Reviews** | Something that has star ratings and comments |
+
+A single giant `Product` table with 80 columns, touched by every team, is exactly how monoliths become tangled. Bounded contexts say: let each context own **its own model** with only the fields it needs, sharing just an identifier (`product_id`).
+
+How to find bounded contexts in practice:
+
+- **Listen to the language.** When the same word means different things to different people, or when different words are used for the same thing, you're probably crossing a boundary.
+- **Follow the business capabilities.** Ask "what does the business do?": take orders, take payment, fulfil, invoice, support customers. Each capability is a candidate context.
+- **Look at who changes together.** Code that always changes in the same commit belongs together; code that changes for different reasons, driven by different people, can be separated.
+- **Event storming.** A workshop technique: put every business event ("Order placed", "Payment captured", "Parcel shipped") on a wall in time order, then look for clusters and the points where responsibility hands off.
+
+A bounded context is a strong **candidate** for a service, but not every context must be its own service. Several small, related contexts can live in one service owned by one team. A context should rarely be split **across** services, though, because that splits one consistent model in two.
+
+## Single responsibility per service
+
+A useful rule of thumb: each service should own **one business capability** and be able to do its job **mostly on its own**. Good services have:
+
+- **High cohesion**: everything inside is about the same thing and tends to change together.
+- **Loose coupling**: other services depend on a small, stable API, not on internals.
+- **Autonomy**: it can serve most requests without synchronously calling five other services.
+
+A quick test: **can this team ship a typical feature by changing and deploying only their service?** If most features require coordinated changes in three services, the boundaries are wrong, and you've built a **distributed monolith**: all the costs of microservices with none of the independence.
+
+Another test is the reason to change. "Notification service" is a good boundary if it owns templates, preferences, channels and delivery, and changes when how we notify people changes. It's a bad one if every other service's feature work requires editing it.
+
+<Callout kind="tip">
+Split by **business capability** (orders, payments, catalogue), not by **technical layer** (a "database service", a "validation service", an "API service"). Layer-based services force every feature to touch every service.
+</Callout>
+
+## Data ownership
+
+The rule that makes or breaks a microservice architecture: **each service owns its data, and no other service touches that data directly.**
+
+```text
+Good:  orders service ──API/event──▶ inventory service ──▶ inventory DB
+Bad:   orders service ─────────── SQL ───────────────────▶ inventory DB
+```
+
+If orders reads the inventory tables directly, the inventory team can't change their schema without breaking orders. The two services are coupled through the database, so they're not really separate. Shared databases are the most common way teams end up with a distributed monolith.
+
+Owning data has consequences you must design for:
+
+- **No cross-service joins.** "Orders with product names" means calling catalogue, or keeping a local copy of the name.
+- **No cross-service transactions.** Placing an order, reserving stock and charging payment can't be one ACID transaction. Use a **saga**: a sequence of local transactions, each publishing an event, with **compensating actions** (release the stock, refund the charge) if a later step fails.
+- **Reliable events.** To update your database and publish an event without losing one or the other, use the **transactional outbox**: write the event to an outbox table in the same transaction, and have a relay publish it.
+- **Local read models.** Services often keep a denormalised copy of data they need from others (order history storing the product name at purchase time), updated from events. This is eventual consistency by design.
+
+A practical boundary check: **where does the data need strong consistency?** Data that must change atomically together (an account's balance and its ledger entries) belongs in one service. If you'd need a distributed transaction to keep two things consistent, they probably shouldn't be split.
+
+## Teams and Conway's law
+
+**Conway's law** observes that organisations design systems that mirror their own communication structures. If three teams build a compiler, you get a three-pass compiler.
+
+For microservices, the practical consequences:
+
+- **Service boundaries should match team boundaries.** A service owned by two teams becomes a coordination bottleneck; a team owning a dozen unrelated services can't keep any of them healthy.
+- **The inverse Conway manoeuvre**: design the team structure you want first, so the architecture follows. If you want independent checkout and catalogue services, create independent checkout and catalogue teams.
+- **Team size sets a sensible scale.** A common guideline is a team small enough to feed with two pizzas (roughly 5 to 9 people) owning one or a few services. That team can hold the whole service in its head, be on call for it, and deploy it independently.
+
+This gives a rough sanity check for "how many services?": think in terms of **services per team**. If you have 4 teams and 80 services, each team owns 20 services, and they will be spending their time on upgrades, pipelines, dashboards and on-call rotations instead of features. If you have 30 teams and one monolith, they'll be fighting over releases.
+
+## The cost of splitting too far
+
+**Nanoservices** (services so small they do one function each) are a well-known anti-pattern. Each boundary has real costs:
+
+| Cost | What it looks like |
+|---|---|
+| **Network latency** | A page that made 10 in-process calls now makes 10 network calls, each adding milliseconds, more at the tail. Deep call chains multiply it. |
+| **Partial failure** | Every call can time out, fail or return stale data. Each caller needs timeouts, retries, circuit breakers and fallbacks. |
+| **Availability math** | If a request needs 10 services, each 99.9% available, the chain is roughly 0.999 to the 10th, about 99.0%: ten times more downtime. |
+| **Distributed data** | Sagas, outboxes, eventual consistency and reconciliation jobs replace simple transactions. |
+| **Operations** | Each service needs a repo, pipeline, deploy config, dashboards, alerts, logs, on-call ownership and dependency upgrades. |
+| **Debugging** | One user action spans many services; you need distributed tracing to understand anything. |
+| **Testing** | End-to-end tests require many services running at matching versions; contract tests become necessary. |
+| **Chatty coupling** | Tiny services must constantly call each other, so they're not truly independent anyway. |
+
+Symptoms you've gone too far:
+
+- Most features require deploying several services in lockstep.
+- Services can't serve a request without synchronously calling many others.
+- Teams own more services than people.
+- Two services share a database "for now".
+- You have a service whose only job is to forward calls to another.
+
+When this happens, the fix is to **merge** services back along the real boundaries. That's a perfectly legitimate move, and several well-known companies have publicly consolidated microservices back into fewer, larger services.
+
+<HldBoundarySorter />
+
+## The strangler fig migration
+
+You almost never rewrite a monolith from scratch. Big-bang rewrites take years, chase a moving target, and usually fail. The standard approach is the **strangler fig pattern**, named after a vine that grows around a tree until it can stand on its own.
+
+The idea: put a routing layer in front of the monolith, then move one capability at a time to a new service, redirecting just that traffic. The monolith shrinks gradually while the system keeps working.
+
+### Step by step
+
+1. **Put a facade in front.** An API gateway, reverse proxy or load balancer receives all traffic and forwards it to the monolith. Nothing changes for users yet.
+2. **Pick the first capability to extract.** Choose something with a clear boundary, real value and low risk: few dependencies on the rest of the monolith, ideally owned by a motivated team. Notifications, search or a reporting feature are common first picks; core billing is not.
+3. **Build the new service** with its own data store. Use an **anti-corruption layer** if the monolith's model is messy, translating between the old model and the new one so the mess doesn't leak in.
+4. **Sync the data.** Backfill historical data, then keep it in sync during the transition, often with change data capture (CDC) from the monolith's database or events from the monolith.
+5. **Shift traffic gradually.** Route a small percentage, or internal users first, to the new service. Compare results (some teams run both and diff responses, often called a shadow or parallel run).
+6. **Cut over** once the new service is trusted, and make it the source of truth for that data.
+7. **Delete the old code** from the monolith. If you skip this, you maintain both forever.
+8. **Repeat** with the next capability.
+
+```text
+Phase 1:   client ──▶ facade ──▶ monolith (everything)
+Phase 2:   client ──▶ facade ─┬─▶ /notifications/*  ──▶ notification service
+                              └─▶ everything else   ──▶ monolith
+Phase N:   client ──▶ facade ──▶ several services, small leftover monolith
+```
+
+Things that make migrations go wrong:
+
+- **Extracting the code but not the data.** The new service still reads the monolith's tables, so you've created coupling, not independence.
+- **Starting with the most tangled module.** The first extraction is where you build the platform (pipelines, observability, service template); do it on something easy.
+- **Never finishing.** Without deleting old code, you end up with two systems doing the same job.
+
+<Callout kind="remember">
+It's fine for the monolith to remain. Many healthy systems are a solid core monolith plus a handful of services extracted where independence really paid off.
+</Callout>
+
+## A worked example
+
+A food-delivery startup has grown to 50 engineers on one Django monolith. Deploys are weekly and often rolled back; restaurant onboarding changes keep breaking checkout; a spike in live order tracking slows the whole site.
+
+A sensible split, driven by the pains:
+
+| Service | Why it's separate | Owns |
+|---|---|---|
+| **Order and checkout** | Revenue-critical; must stay up and deploy safely | Orders, carts, order state machine |
+| **Payments** | Compliance scope, external provider integrations | Payment intents, refunds, ledger |
+| **Restaurant and menu** | Separate team, frequent changes, different users (restaurant staff) | Restaurants, menus, opening hours |
+| **Delivery tracking** | Very different load (frequent location updates), needs independent scaling | Courier locations, ETAs |
+| **Notifications** | Clear boundary, easy first extraction | Templates, preferences, delivery log |
+
+Things left in the monolith for now: user accounts, promotions, support tooling. They don't have a pressing reason to move. Five services for roughly six or seven teams is a healthy ratio; 40 services would not be.
+
+## Cheat sheet
+
+- The question isn't how many services, but where boundaries pay for their network, data and ops cost.
+- Start with a modular monolith; extract services when a concrete pain (teams, scaling, reliability, compliance) justifies it.
+- Bounded contexts from DDD are the best guide: one consistent model and language per context.
+- Split by business capability, not by technical layer.
+- Each service owns its data; no other service reads its tables directly.
+- No cross-service transactions: use sagas with compensating actions and the transactional outbox.
+- Keep data that must be strongly consistent together in one service.
+- Conway's law: align service boundaries with team boundaries; aim for a few services per small team.
+- Too-fine services bring latency, partial failure, worse availability, and a distributed monolith.
+- Migrate with the strangler fig: facade, extract one capability with its data, shift traffic, delete old code, repeat.

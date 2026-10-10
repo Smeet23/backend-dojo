@@ -1,0 +1,272 @@
+import { HldCacheStrategyStepper } from "@/components/widgets/HldCacheStrategyStepper";
+
+## Why a distributed cache
+
+A single database can answer a few thousand complex queries per second before latency climbs. An in-memory key-value store answers a simple `GET` in well under a millisecond and can serve hundreds of thousands of them per second per node. Put the second in front of the first and most reads never reach the database.
+
+A cache that lives inside one application process (a hash map in the JVM, an LRU in Node) is the fastest option, but it breaks down as soon as you run more than one app server:
+
+- **Each server has its own copy.** Ten servers means ten cold caches and ten separate warm-ups, and the hit rate is a tenth of what it could be.
+- **Copies disagree.** Server 3 updates a user's profile and evicts its own entry; servers 1, 2 and 4 to 10 keep serving the old one.
+- **Memory is capped by one machine.** You can't hold 500 GB of hot data in a 16 GB app server.
+
+A **distributed cache** is a separate cluster (Redis, Memcached, Valkey, or a managed service such as ElastiCache or Memorystore) that every app server talks to over the network. All servers see one shared copy, capacity grows by adding nodes, and the cache survives app deploys.
+
+| | In-process cache | Distributed cache |
+|---|---|---|
+| Latency | Nanoseconds (no network) | About 0.2 to 1 ms (one network hop) |
+| Shared across servers | No | Yes |
+| Capacity | One process's heap | Sum of all cache nodes |
+| Consistency across servers | Hard (each copy drifts) | One copy per key |
+| Survives app restart | No | Yes |
+
+Large systems often use **both**: a tiny in-process cache (seconds of TTL) for the very hottest keys, backed by a distributed cache, backed by the database. Each layer absorbs most of the traffic that reaches it.
+
+<Callout kind="remember">
+A cache is a **copy**. The database stays the source of truth. Every caching strategy below is really an answer to one question: when the data changes, how and when does the copy find out?
+</Callout>
+
+## Read strategies
+
+### Cache-aside
+
+**Cache-aside** (also called lazy loading) is the most common pattern. The application owns all the logic; the cache is a dumb key-value store.
+
+On a read:
+
+1. Look up the key in the cache.
+2. **Hit**: return it.
+3. **Miss**: query the database, write the result into the cache with a TTL, return it.
+
+```python
+def get_user(user_id):
+    key = f"user:{user_id}"
+    cached = redis.get(key)
+    if cached is not None:
+        return json.loads(cached)
+    row = db.query("SELECT * FROM users WHERE id = %s", user_id)
+    redis.set(key, json.dumps(row), ex=300)   # 5 minute TTL
+    return row
+```
+
+Why it's popular:
+
+- **Only requested data is cached**, so memory goes to keys people actually read.
+- **The cache is optional.** If the cache cluster dies, reads fall through to the database (slower, but working), as long as the database can take the load.
+- It works with any cache and any database, no special integration.
+
+Its costs:
+
+- **The first read of every key is slow** (miss, then DB, then cache write). A freshly started or flushed cache sends a wave of misses to the database.
+- **Staleness.** If someone updates the database without touching the cache, readers see the old value until the TTL expires. That is why writes in a cache-aside system usually delete the key (more on this under invalidation).
+
+### Read-through
+
+**Read-through** looks the same from the outside, but the cache itself loads missing data. The application only ever calls the cache; on a miss, the cache (or a caching library sitting in front of it) calls a loader you registered, which reads the database.
+
+```java
+// Caffeine / Guava style: the cache owns the loading
+LoadingCache<Long, User> users = Caffeine.newBuilder()
+    .maximumSize(100_000)
+    .expireAfterWrite(Duration.ofMinutes(5))
+    .build(id -> userRepository.findById(id));
+
+User u = users.get(42L);   // miss → loader runs → value cached → returned
+```
+
+The difference from cache-aside is **who** runs the miss logic. Read-through keeps the application code simpler and lets the cache layer collapse duplicate concurrent misses into one database call. The price is coupling: the cache must know how to talk to your data source, which plain Redis does not do on its own (you need a library, a proxy, or a provider like DAX for DynamoDB).
+
+## Write strategies
+
+Reads decide how data gets **into** the cache. Writes decide how the cache and the database stay **in step** when data changes.
+
+### Write-through
+
+The application writes to the cache, and the cache **synchronously** writes the same value to the database before acknowledging. Both are updated on every write.
+
+- **Pro:** the cache is never stale for data written through it; a read right after a write is a hit with the new value.
+- **Con:** every write pays two writes of latency.
+- **Con:** you cache everything that's written, including data nobody will read. Pair it with a TTL so cold data ages out.
+
+Write-through is usually combined with read-through: the cache sits fully in front of the database for both directions.
+
+### Write-back
+
+**Write-back** (also called write-behind) acknowledges the write as soon as the cache has it. The cache flushes dirty entries to the database **later**, asynchronously, often in batches.
+
+- **Pro:** very low write latency, and the database sees far fewer writes. Ten updates to the same counter in a second become one database write.
+- **Con:** **data loss.** If the cache node crashes before flushing, acknowledged writes are gone. Replication and an append-only log on the cache reduce this but don't make it zero.
+- **Con:** the database is behind the cache, so anything reading the database directly (reports, other services) sees old data.
+
+Use it where losing a few seconds of writes is acceptable and write volume is huge: view counters, likes, analytics, game scores, IoT readings. Never for money.
+
+### Write-around
+
+**Write-around** writes straight to the database and does **not** put the value in the cache (it usually deletes any cached copy). The cache only fills when the data is read later, through cache-aside.
+
+- **Pro:** the cache isn't polluted with data that is written once and rarely read (logs, audit records, bulk imports).
+- **Con:** a read right after a write is a miss.
+
+This is what most cache-aside systems actually do on writes: update the database, then delete the key.
+
+### Comparing the strategies
+
+| Strategy | Who loads on miss | Write path | Stale reads | Data loss risk | Good for |
+|---|---|---|---|---|---|
+| Cache-aside | App | App writes DB, deletes key | Until TTL or delete | None | General read-heavy workloads |
+| Read-through | Cache | (pairs with a write strategy) | Until TTL | None | Simple app code, cache libraries |
+| Write-through | Cache | Cache then DB, synchronous | Rare | None | Read-after-write consistency |
+| Write-back | Cache | Cache now, DB later | DB is stale | Yes, on cache crash | Very high write rates, tolerable loss |
+| Write-around | App | DB only | First read after write misses | None | Write-heavy, rarely re-read data |
+
+<HldCacheStrategyStepper />
+
+## Eviction policies
+
+Memory is finite. When the cache is full and a new key arrives, something has to go. The **eviction policy** decides what.
+
+| Policy | Evicts | Strength | Weakness |
+|---|---|---|---|
+| **LRU** (least recently used) | The key not touched for longest | Tracks recency well; simple | A one-off scan of many keys flushes the hot set |
+| **LFU** (least frequently used) | The key with the fewest accesses | Keeps long-term favourites | Slow to forget yesterday's hot key unless counts decay |
+| **FIFO** | The oldest inserted key | Trivial | Ignores usage completely |
+| **TTL-based** | Keys past their expiry | Bounds staleness | Not a capacity policy on its own |
+| **Random** | Any key | Cheap, surprisingly okay | Can drop hot keys |
+
+Two practical notes:
+
+- **TTL and eviction are different things.** TTL removes data because it may be **wrong** (too old). Eviction removes data because there is **no room**. You normally want both: a TTL on every key and an LRU or LFU policy for memory pressure.
+- **Real caches approximate.** Redis does not keep a perfect LRU list (too much memory per key). It samples a few keys and evicts the best candidate among them, and its LFU uses a small logarithmic counter that decays over time. Settings such as `maxmemory-policy allkeys-lru` or `volatile-ttl` choose the behaviour; `noeviction` makes writes fail when full, which is right for a primary data store and wrong for a cache.
+
+<Callout kind="tip">
+Add a little random **jitter** to TTLs (say 300 s plus or minus 30 s). If a million keys are written in the same minute with the same TTL, they all expire in the same second and the database takes the whole refill at once.
+</Callout>
+
+## Partitioning the cache
+
+One node can't hold everything or serve every request, so the key space is **sharded** across nodes. The client (or a proxy) must map each key to a node.
+
+### Why not hash mod N
+
+The obvious mapping is `node = hash(key) % N`. It spreads keys evenly, but when N changes (a node dies, or you add one) almost **every** key maps to a different node. Going from 4 to 5 nodes moves about 80% of keys, which is a near-total cache flush and a stampede on the database.
+
+### Consistent hashing
+
+**Consistent hashing** places nodes and keys on the same ring of hash values. A key belongs to the first node clockwise from it. Adding or removing a node only moves the keys in the arc next to that node, about 1/N of the total. Each physical node is placed on the ring many times (**virtual nodes**) so the load stays even and a departing node's keys are spread over all the survivors, not dumped on one neighbour.
+
+### Hash slots
+
+**Redis Cluster** uses a variant: 16,384 fixed **hash slots**. A key goes to slot `CRC16(key) mod 16384`, and each master owns a range of slots. Resharding moves whole slots between nodes. Clients learn the slot map and get a `MOVED` redirect if they ask the wrong node. You can force related keys into one slot with a **hash tag**: `{user:42}:profile` and `{user:42}:cart` both hash only the part in braces.
+
+## Replication and availability
+
+Partitioning spreads load; **replication** protects against node loss. Each shard has a primary and one or more replicas:
+
+- Writes go to the primary and are replicated **asynchronously** to replicas.
+- Reads can go to replicas to spread load, accepting that they may lag slightly.
+- If the primary fails, a replica is **promoted** (by Redis Sentinel, by the cluster's own failure detection, or by the managed service).
+
+Because replication is asynchronous, a failover can lose the last few writes the old primary acknowledged but hadn't shipped. For a cache that's usually fine: the lost entries are just misses that reload from the database. It is one more reason write-back data is at risk.
+
+Losing a cache node without replicas is also survivable in cache-aside, but watch the **blast radius**: if one node held 25% of keys, 25% of traffic suddenly becomes database reads. Size the database (or protect it with rate limits) for the loss of at least one cache node.
+
+## Cache invalidation
+
+Keeping the cache in step with the database is the hard part. The standard options:
+
+- **TTL only.** Let entries expire. Simple and self-healing; you accept up to TTL seconds of staleness.
+- **Delete on write.** After updating the database, delete the key. The next read reloads fresh data.
+- **Update on write.** After updating the database, write the new value into the cache. Faster next read, but riskier (see the race below).
+- **Event-driven.** Services publish change events (or a CDC pipeline tails the database log, for example Debezium reading the Postgres WAL), and a consumer deletes or refreshes affected keys. This catches writes made by any service, not just yours.
+- **Versioned keys.** Put a version in the key (`product:42:v17`). A change bumps the version; old keys are never read again and age out by TTL.
+
+### Why delete beats update
+
+Two writers race:
+
+```
+t1  Writer A: UPDATE price = 10 in DB
+t2  Writer B: UPDATE price = 12 in DB
+t3  Writer B: SET cache price = 12
+t4  Writer A: SET cache price = 10      ← stale value now cached, no TTL soon
+```
+
+The database says 12, the cache says 10, and it stays wrong until the TTL. If both writers had **deleted** the key instead, the next reader would load 12. Deleting is idempotent and order-independent; setting is not.
+
+### Order of operations
+
+Always **update the database first, then delete the cache**. If you delete first, a reader can slip in between the delete and the database write, read the old row and put it back in the cache.
+
+Even DB-then-delete has a rare race: a reader misses, reads the old row, stalls, the writer updates and deletes, then the slow reader writes the old row into the cache. Mitigations:
+
+- Short TTLs bound the damage.
+- **Delayed double delete**: delete, then delete again a few hundred milliseconds later.
+- Have the cache write use a version or compare-and-set so an older value can't overwrite a newer one.
+
+<Callout kind="warn">
+If the delete after a database write fails (network blip to Redis), the cache stays stale until TTL. Retry the delete, or drive invalidation from a durable source such as an outbox table or the database change log, so a missed delete is replayed rather than lost.
+</Callout>
+
+## Consistency issues
+
+A cache trades consistency for speed. Know which anomalies you're signing up for:
+
+- **Stale reads.** Normal for cache-aside with TTL. Decide per data type how stale is acceptable: product descriptions (minutes), stock levels (seconds), account balance (never cache, or read from the database for the transaction itself).
+- **Read-your-own-writes violations.** A user edits their bio and the next page still shows the old one, because another app server read a replica or a not-yet-invalidated key. Fixes: delete before responding, or route that user's reads to the database for a few seconds after a write.
+- **Cross-region drift.** Each region has its own cache cluster; an invalidation must reach all of them, typically via a replicated message stream.
+- **Dual-write inconsistency.** Writing the database and the cache are two separate operations with no shared transaction. Any crash between them leaves them disagreeing. This is why TTL is the safety net under every other strategy.
+
+## Hot keys and stampedes
+
+### Cache stampede
+
+A very popular key expires. In the next 50 ms, 2,000 requests miss at once and all hit the database for the same row. This is a **stampede** (also called thundering herd or dog-piling). Defences:
+
+- **Request coalescing / single flight.** Only one request per key rebuilds the value; others wait for it. In a distributed setting, use a short lock key (`SET rebuild:key token NX PX 2000`).
+- **Stale-while-revalidate.** Keep serving the expired value while one background worker refreshes it.
+- **Probabilistic early refresh.** Each reader near the expiry has a small, growing chance of refreshing early, so one request refreshes before the deadline instead of thousands after it.
+- **TTL jitter**, as above, so many keys don't expire together.
+
+### Hot keys
+
+Consistent hashing spreads **keys** evenly, not **traffic**. If a celebrity's profile gets 200,000 reads per second, every one of them lands on the same shard, and that node's CPU or network saturates while others idle. Defences:
+
+- **Local in-process cache** for the hottest keys with a TTL of a second or two. Even a 1 s local TTL turns 200,000 network reads into one per app server per second.
+- **Key replication / splitting.** Store copies as `profile:celeb#0` to `profile:celeb#9` on different shards; readers pick one at random. Writes must update or delete all copies.
+- **Read from replicas** for that shard.
+- **Detect them.** `redis-cli --hotkeys` (with LFU), client-side sampling or proxy metrics. You can't fix what you can't see.
+
+### Cache penetration
+
+Requests for keys that **don't exist** (`user:999999999`) always miss and always hit the database, whether by accident or by an attacker iterating ids. Cache the negative result (a "not found" marker with a short TTL) or put a **Bloom filter** of valid ids in front, so impossible keys are rejected without a database query.
+
+### Cold start
+
+After a full flush or a new region launch, the hit rate is zero. Warm the cache before taking traffic (replay recent hot keys, or shift traffic gradually) rather than letting the database absorb the full load.
+
+## Designing it in an interview
+
+A concise structure when asked to "add a cache":
+
+1. **What** to cache: which reads are hot and expensive, and how stale each may be.
+2. **Pattern**: cache-aside with delete-on-write is the safe default; justify anything else (write-back for counters, write-through for read-after-write).
+3. **Sizing**: working set size, memory per node, number of shards, replicas per shard.
+4. **Placement**: consistent hashing or hash slots; hash tags for related keys.
+5. **Eviction**: TTL on every key plus LRU or LFU.
+6. **Invalidation**: DB first, then delete; event-driven for multi-service writes.
+7. **Failure modes**: node loss (blast radius), stampede, hot keys, penetration, and what the database can survive with no cache at all.
+
+## Cheat sheet
+
+- A distributed cache is a shared, sharded in-memory copy; the database stays the source of truth.
+- Cache-aside: app checks cache, loads from DB on miss, writes cache with TTL. Safe default.
+- Read-through: same idea, but the cache library runs the loader.
+- Write-through: cache and DB updated synchronously; fresh but slower writes.
+- Write-back: ack from cache, flush to DB later; fast but can lose data on crash.
+- Write-around: write DB only, fill cache on later reads; avoids polluting the cache.
+- TTL bounds staleness; LRU or LFU handles memory pressure. Add TTL jitter.
+- Shard with consistent hashing or hash slots, never plain hash mod N.
+- Update the DB first, then delete the key. Delete beats set.
+- Stampede: single flight, stale-while-revalidate, early refresh, jitter.
+- Hot keys: local cache, key splitting, replica reads.
+- Penetration: cache negative results or use a Bloom filter.

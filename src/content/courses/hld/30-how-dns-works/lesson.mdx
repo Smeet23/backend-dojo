@@ -1,0 +1,231 @@
+import { HldDnsResolver } from "@/components/widgets/HldDnsResolver";
+
+## What DNS is for
+
+Computers on the internet find each other by **IP address**: `93.184.215.14` for IPv4, or something like `2606:2800:21f:cb07:6820:80da:af6b:8b2c` for IPv6. Humans want names like `shop.example.com`. The **Domain Name System** is the distributed database that maps one to the other.
+
+DNS has three properties that make it interesting from a system-design point of view:
+
+- **It is hierarchical.** No single server knows every name. Responsibility is split by the dots in the name, and each level only knows who to ask next.
+- **It is heavily cached.** Almost every lookup is answered from a cache somewhere, so the authoritative servers see a tiny fraction of the traffic.
+- **It is eventually consistent.** Changes spread as caches expire, controlled by a number called the **TTL**. This is the source of most real-world DNS surprises.
+
+DNS also turns out to be a powerful tool for **routing traffic**: which IP a name resolves to can depend on where you are, which servers are healthy, and how you've weighted them. That is why it shows up in system design interviews, not just networking ones.
+
+## The DNS hierarchy
+
+Read a domain name from **right to left** to see the hierarchy:
+
+```text
+shop.example.com.
+                ^ root (the trailing dot, usually hidden)
+            ^^^ top-level domain (TLD): com
+    ^^^^^^^ second-level domain: example (registered by you)
+^^^^ subdomain: shop (you create it in your own zone)
+```
+
+Each level is a **zone** run by different people:
+
+| Level | Who runs it | What it knows |
+|---|---|---|
+| **Root** | 13 named root server identities (`a.root-servers.net` to `m.root-servers.net`), operated by 12 organisations | Which servers are authoritative for each TLD (`.com`, `.org`, `.in`, `.dev`...) |
+| **TLD** | A registry (for `.com`, Verisign) | Which name servers are authoritative for each domain under it (`example.com`) |
+| **Authoritative** | You, or your DNS provider (Route 53, Cloudflare, NS1...) | The actual records: `shop.example.com` is `203.0.113.10` |
+
+Each level **delegates** to the next using `NS` records. The root doesn't know the IP of `shop.example.com`; it only knows who handles `.com`. The `.com` servers don't know it either; they only know which name servers handle `example.com`. That delegation is what lets DNS scale to hundreds of millions of domains without any central database.
+
+<Callout kind="remember">
+"13 root servers" is a slightly misleading phrase. There are 13 root **identities** (letters A to M), but each is served by many machines around the world using anycast, well over a thousand instances in total.
+</Callout>
+
+## Resolving a name step by step
+
+When you type `shop.example.com` into a browser, several layers get a chance to answer before any root server is involved.
+
+### 1. Browser cache
+
+The browser keeps its own small DNS cache. If you visited the site a minute ago, it already has the answer.
+
+### 2. Operating system cache
+
+On a miss, the browser asks the OS **stub resolver** (for example, via `getaddrinfo`). The OS checks the `hosts` file and its own cache. The stub resolver is "stub" because it can't do the full lookup itself; it forwards the question to a configured **recursive resolver**.
+
+### 3. Recursive resolver
+
+The recursive resolver does the real work. It's usually run by your ISP, your company, or a public service such as `8.8.8.8` (Google), `1.1.1.1` (Cloudflare) or `9.9.9.9` (Quad9). Your home router often sits in between as a caching forwarder.
+
+The resolver has a large shared cache, so for any popular name it almost certainly has the answer already. If it doesn't, it walks the hierarchy on your behalf.
+
+### 4. Root server
+
+The resolver asks a root server: "where is `shop.example.com`?" The root answers with a **referral**: "I don't know, but here are the name servers for `.com`." (Resolvers have the root server addresses built in, in a file called the root hints.)
+
+### 5. TLD server
+
+The resolver asks a `.com` server the same question. Another referral: "the name servers for `example.com` are `ns1.dnsprovider.net` and `ns2.dnsprovider.net`."
+
+### 6. Authoritative server
+
+The resolver asks `ns1.dnsprovider.net`. This server **owns** the zone and gives the real answer: "`shop.example.com` is an `A` record, `203.0.113.10`, TTL 300."
+
+### 7. Back to the client
+
+The resolver caches the answer (and the referrals it collected along the way, so the next `.com` lookup can skip the root), returns it to the OS, which caches it and returns it to the browser, which caches it and opens a connection to `203.0.113.10`.
+
+```text
+browser cache ─miss─▶ OS cache ─miss─▶ recursive resolver ─miss─▶
+     root     ──▶ "ask .com"
+     .com TLD ──▶ "ask ns1.dnsprovider.net"
+     authoritative ──▶ "203.0.113.10, TTL 300"
+◀── answer cached at every layer on the way back
+```
+
+### Recursive versus iterative
+
+There are two kinds of query in that story:
+
+- Your OS asks the resolver a **recursive** query: "give me the final answer, do whatever it takes."
+- The resolver asks root, TLD and authoritative servers **iterative** queries: each one answers with either the final record or a referral to someone closer.
+
+This division matters: root and TLD servers never do work on your behalf. They only hand out referrals, which keeps them cheap enough to serve the entire internet.
+
+DNS normally uses **UDP port 53** for speed (a lookup is one small packet each way), falling back to TCP for large responses. Modern resolvers also support encrypted transports, **DNS over HTTPS** (DoH) and **DNS over TLS** (DoT), so that networks in between can't read or tamper with your lookups.
+
+<HldDnsResolver />
+
+## Record types
+
+A zone holds **resource records**. Each has a name, a type, a TTL and a value. These are the ones you'll meet constantly:
+
+| Type | Maps | Example | Used for |
+|---|---|---|---|
+| **A** | Name to IPv4 address | `shop.example.com. 300 A 203.0.113.10` | Pointing a name at a server |
+| **AAAA** | Name to IPv6 address | `shop.example.com. 300 AAAA 2001:db8::10` | Same, for IPv6 |
+| **CNAME** | Name to another name (an alias) | `www.example.com. 3600 CNAME shop.example.com.` | Pointing at a CDN or SaaS host whose IPs change |
+| **MX** | Domain to mail servers, with priority | `example.com. 3600 MX 10 mail1.example.com.` | Where to deliver email |
+| **TXT** | Name to arbitrary text | `example.com. 3600 TXT "v=spf1 include:_spf.google.com ~all"` | Domain verification, SPF, DKIM, DMARC |
+| **NS** | Zone to its authoritative name servers | `example.com. 172800 NS ns1.dnsprovider.net.` | Delegation |
+
+Some other record types you'll see: **SOA** (zone metadata, including the negative-caching TTL), **SRV** (service host and port, used by some protocols), **CAA** (which certificate authorities may issue certificates for your domain) and **PTR** (reverse lookups, from IP to name).
+
+### CNAME rules worth knowing
+
+- A CNAME means "this name is an alias; go look up that other name instead". The resolver follows the chain until it reaches an `A` or `AAAA` record.
+- A name with a CNAME **cannot have any other records**. That's why you can't put a CNAME on the **zone apex** (`example.com` itself), which must have `NS` and `SOA` records. Providers work around this with non-standard **ALIAS** or **ANAME** records (or "CNAME flattening"), which resolve the target on the server side and return plain `A` records.
+- Each CNAME hop is another lookup, so long chains add latency.
+
+### MX priorities
+
+Lower number means higher priority. With `MX 10 mail1` and `MX 20 mail2`, senders try `mail1` first and fall back to `mail2`. Equal priorities spread load between servers.
+
+## TTL and caching
+
+Every record carries a **TTL** (time to live) in seconds. It tells every cache: "you may reuse this answer for this long without asking again." Caching happens at every layer: the browser, the OS, the recursive resolver, and any forwarding resolvers in between.
+
+TTL is a trade-off:
+
+| | Short TTL (30 to 300 s) | Long TTL (hours to days) |
+|---|---|---|
+| **Changes take effect** | Within minutes | Can take hours or a day |
+| **Query volume to your authoritative servers** | Higher | Much lower |
+| **Lookup latency for users** | More frequent cache misses | Almost always cached |
+| **Resilience if your DNS provider fails** | Caches empty quickly, users fail sooner | Caches keep serving for hours |
+| **Typical use** | Load-balanced or failover endpoints | NS records, MX, stable hosts |
+
+### Planning a migration
+
+Because caches hold the old answer until it expires, you plan changes around the TTL:
+
+1. A day or more before the move, **lower the TTL** on the record (say from 86400 to 60). Wait at least the **old** TTL so every cache picks up the short one.
+2. Change the record to the new IP. Within about a minute, most clients move.
+3. Keep the **old server running** for a while; some clients and resolvers ignore TTLs or cache longer than they should.
+4. Once traffic has moved, raise the TTL again.
+
+<Callout kind="warn">
+"DNS propagation" isn't really propagation. Nothing is pushed anywhere. The new record is live on your authoritative servers instantly; the delay is just caches around the world waiting for their copy of the old answer to expire.
+</Callout>
+
+### Negative caching
+
+If a name doesn't exist, the authoritative server says `NXDOMAIN`, and resolvers **cache that too**, for a duration set in the zone's `SOA` record. So if you query a new subdomain before creating it, you may keep getting "doesn't exist" for a while after you've added it.
+
+### Applications cache too
+
+Some runtimes cache DNS far longer than the TTL. The JVM, for example, has historically cached successful lookups indefinitely under a security manager, and long-lived connection pools never re-resolve at all. If your service points at a database by hostname and the database fails over to a new IP, clients that never re-resolve keep talking to the old one. Make sure connection pools recycle connections and runtimes honour TTLs.
+
+## DNS for load balancing
+
+Because the authoritative server chooses the answer, DNS is a cheap first layer of traffic distribution.
+
+### Round-robin DNS
+
+Return several `A` records for one name. Clients usually try the first, and the server rotates the order on each response, so load spreads roughly evenly.
+
+```text
+api.example.com.  60  A  203.0.113.10
+api.example.com.  60  A  203.0.113.11
+api.example.com.  60  A  203.0.113.12
+```
+
+Limitations: plain DNS has no idea whether those servers are healthy, caching makes the split lumpy (a big corporate resolver sends thousands of users to the same IP), and removing a dead server takes up to a TTL. That's why round-robin DNS usually points at **load balancers**, not individual app servers.
+
+### Health-checked and weighted DNS
+
+Managed DNS (Route 53, Cloudflare, NS1, Azure Traffic Manager) can **health-check** endpoints and stop returning unhealthy ones, which gives you **DNS failover**. It can also return records by **weight** (90% to the current region, 10% to a new one), which is handy for migrations.
+
+### Geo DNS and latency-based routing
+
+The authoritative server can answer **differently depending on where the query came from**: European users get the Frankfurt load balancer, Indian users get Mumbai. Variants include routing by geography and routing by measured latency.
+
+A subtlety: the authoritative server sees the **resolver's** IP, not the user's. If a user in Delhi uses a public resolver whose nearest node happens to be in Singapore, they may be sent to the wrong region. The **EDNS Client Subnet** extension lets resolvers pass along part of the user's IP to fix this, at some cost to privacy.
+
+| Technique | How it decides | Good for | Weak spot |
+|---|---|---|---|
+| Round robin | Rotates the list | Spreading load across several LBs | No health awareness, caching skews it |
+| Failover | Health checks | Primary/standby regions | Clients wait up to a TTL to move |
+| Weighted | Configured percentages | Gradual migrations, canaries | Coarse, cached per resolver |
+| Geo or latency | Where the resolver is | Multi-region apps, CDNs | Resolver location is not user location |
+
+## Anycast
+
+**Anycast** is a network-layer trick, separate from DNS records, that's used heavily to make DNS itself fast and resilient.
+
+With normal **unicast**, one IP address belongs to one machine in one place. With **anycast**, the **same IP address is announced from many locations** around the world using BGP, the internet's routing protocol. Routers send each packet to the **nearest** announcing location in network terms.
+
+That's how `1.1.1.1` or `8.8.8.8` can be one address yet answer from a data center near you, and how each root server letter is served by hundreds of sites.
+
+Why it suits DNS so well:
+
+- **Low latency**: queries go to the closest site automatically.
+- **Resilience**: if a site goes down, it stops announcing the route and traffic flows to the next nearest site, with no DNS change needed.
+- **DDoS absorption**: attack traffic is spread across every site rather than concentrated on one.
+- **DNS uses short, mostly single-packet UDP exchanges**, so it doesn't matter much if routing shifts between two queries.
+
+CDNs and some load balancers also use anycast for HTTP traffic. Geo DNS and anycast often work together: anycast gets your DNS query to a nearby DNS server quickly, and geo DNS then hands you the IP of a nearby application region.
+
+<Callout kind="tip">
+In an interview, a crisp way to separate them: geo DNS chooses **which IP to give you**; anycast chooses **which machine answers a given IP**.
+</Callout>
+
+## DNS in system design
+
+Some practical points that come up when DNS meets real systems:
+
+- **DNS is a dependency.** If your authoritative provider goes down and caches expire, your site is unreachable even though every server is healthy. Large companies use two DNS providers for critical zones.
+- **DNS failover is slow.** Expect it to take at least a TTL, plus clients that cache longer. For fast failover inside a region, use a load balancer or anycast; use DNS for coarse region-level moves.
+- **Service discovery.** Inside Kubernetes, CoreDNS resolves service names like `payments.shop.svc.cluster.local` to a stable virtual IP. Many internal systems use DNS as the simplest form of service discovery.
+- **Security.** Classic DNS is unauthenticated, so a resolver can be fed forged answers (cache poisoning). **DNSSEC** signs records so resolvers can verify them; **DoH and DoT** encrypt the path between client and resolver. They solve different problems: DNSSEC proves the answer is genuine, DoH and DoT hide it from eavesdroppers.
+
+## Cheat sheet
+
+- DNS maps names to IPs through a hierarchy: root, TLD, then the domain's authoritative servers.
+- Lookups check the browser cache, OS cache, then a recursive resolver, which walks root, TLD and authoritative only on a miss.
+- Clients send recursive queries to resolvers; resolvers send iterative queries and follow referrals.
+- A and AAAA map to IPv4 and IPv6; CNAME aliases a name; MX routes mail; TXT holds verification and SPF/DKIM; NS delegates zones.
+- A CNAME can't coexist with other records, so the zone apex needs ALIAS or flattening instead.
+- TTL controls how long every cache may reuse an answer: short for agility, long for load and resilience.
+- Lower TTLs well before a migration, and keep the old server running after the switch.
+- "Propagation" is just caches expiring; NXDOMAIN answers are cached too.
+- DNS load balancing includes round robin, weighted, health-checked failover and geo or latency routing.
+- Geo DNS sees the resolver's location, not the user's, unless EDNS Client Subnet is used.
+- Anycast announces one IP from many sites so the nearest one answers; it powers root servers and public resolvers.

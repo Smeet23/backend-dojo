@@ -1,0 +1,257 @@
+import { HldCsrfLab } from "@/components/widgets/HldCsrfLab";
+import { SqlInjectionLab } from "@/components/widgets/SqlInjectionLab";
+
+## Why these four
+
+Most serious web vulnerabilities come from one root mistake: **treating data as if it were trusted**, or trusting a request just because of where it seems to come from. This lesson covers four topics that show up in nearly every security review and system-design interview:
+
+- **CSRF**: the browser sends your credentials on a request someone else made.
+- **XSS**: someone else's script runs inside your site, with your users' privileges.
+- **CORS**: a browser policy that people often mistake for a security defense.
+- **SQL injection**: user input changes the meaning of a database query.
+
+For each one we'll look at how the attack works conceptually and which defenses actually stop it. The goal is to understand the mechanism well enough to recognise the bug in a design, not to build exploits.
+
+## The browser security model
+
+Two browser ideas underpin everything that follows.
+
+### Origin and the same-origin policy
+
+An **origin** is the triple of **scheme, host and port**. `https://app.bank.com` and `https://api.bank.com` are different origins; so are `http://bank.com` and `https://bank.com`.
+
+The **same-origin policy (SOP)** says a page from one origin cannot **read** data from another origin. JavaScript on `evil.com` can't read your Gmail inbox, even though your browser is logged in to Gmail. Note the word **read**: the SOP doesn't stop a page from **sending** many kinds of requests to another origin. Forms, images and links can all send requests cross-origin; the page just can't see the responses. That gap is exactly where CSRF lives.
+
+### Site versus origin
+
+A **site** is broader than an origin: roughly the scheme plus the registrable domain (`https://bank.com`). `app.bank.com` and `api.bank.com` are **same-site** but **cross-origin**. Cookies' `SameSite` attribute works on sites, not origins.
+
+### Cookies ride along automatically
+
+When the browser sends a request to `bank.com`, it attaches `bank.com`'s cookies, subject to their attributes, **no matter which page started the request**. Historically that included requests triggered by a completely different site. This "ambient authority" is convenient (you stay logged in) and dangerous (anyone can make your browser send authenticated requests).
+
+## CSRF
+
+**Cross-site request forgery** tricks a logged-in user's browser into sending a request that performs an action the user didn't intend.
+
+### How it works
+
+1. You log in to `bank.com`. It sets a session cookie.
+2. In another tab, you visit `evil.com` (a malicious page, or a legitimate site with a malicious ad).
+3. That page contains a hidden form that targets `https://bank.com/transfer` with fields `to=attacker&amount=5000`, and a script submits it automatically.
+4. Your browser sends the POST to `bank.com` and, by default in older browsers, **attaches your session cookie**.
+5. The bank sees a valid session and a valid request, and moves the money.
+
+The attacker never saw your cookie and never read the response. They didn't need to: the **side effect** is the attack. That's why the same-origin policy doesn't help here.
+
+Things CSRF needs:
+
+- The action is triggered by a request the attacker can **predict entirely** (no secret value in it).
+- Authentication relies on something the browser attaches **automatically** (cookies, HTTP basic auth, client certificates).
+- The action has a **side effect** worth doing (transfer money, change email, add an admin).
+
+<Callout kind="remember">
+CSRF exploits the server's trust in the **browser**. XSS, next, exploits the user's trust in the **site**. They're often confused; the difference is whether the attacker's code runs on their own site (CSRF) or on yours (XSS).
+</Callout>
+
+### Defenses
+
+**1. SameSite cookies.** The `SameSite` attribute tells the browser when to attach a cookie to cross-site requests.
+
+| Value | Cross-site requests that carry the cookie | Notes |
+|---|---|---|
+| `Strict` | None | Even clicking a link to your site from email arrives logged out |
+| `Lax` | Top-level navigations using safe methods (GET link clicks) | Blocks cross-site POST forms, images, iframes and fetches. Modern browsers treat cookies with no attribute as Lax |
+| `None` | All | Must also be `Secure`. Needed for genuine cross-site use (embedded widgets, some SSO flows) |
+
+```http
+Set-Cookie: session=abc123; HttpOnly; Secure; SameSite=Lax; Path=/
+```
+
+`SameSite=Lax` stops the classic auto-submitted form attack. It does **not** protect GET endpoints that change state, which is one more reason GET must never have side effects.
+
+**2. CSRF tokens.** The server generates an unpredictable token, ties it to the session, and embeds it in every form (or exposes it for the SPA to send in a header). On every state-changing request, the server checks the token matches. The attacker's page can't read your pages (same-origin policy), so it can't learn the token, so its forged request fails. Common variants are the **synchronizer token** (stored server-side in the session) and the **double-submit cookie** (token in a cookie and in a header, compared by the server; best when signed and tied to the session).
+
+**3. Check Origin and custom headers.** Browsers send an `Origin` header on cross-origin POSTs. Rejecting state-changing requests whose `Origin` isn't yours is a cheap extra layer. APIs that require a custom header (like `X-Requested-With`) or a JSON content type force a CORS preflight for cross-origin callers, which an attacker can't pass.
+
+**4. Don't use ambient credentials.** If your API authenticates with a bearer token in the `Authorization` header that JavaScript attaches explicitly, the browser won't add it to forged requests, so classic CSRF doesn't apply. (Storing that token in JavaScript-readable storage trades CSRF risk for XSS risk, though; there's no free lunch.)
+
+**5. Re-authenticate for sensitive actions.** Changing password or email, or large transfers, should ask for the current password or a second factor.
+
+<HldCsrfLab />
+
+## XSS
+
+**Cross-site scripting** happens when an attacker gets their own JavaScript to run **in your site's pages**, in other users' browsers. Because it runs on your origin, the same-origin policy now works **for** the attacker: the script can read the page, call your APIs with the user's cookies, change what they see and capture what they type.
+
+What injected script can do:
+
+- Read and exfiltrate data shown on the page (messages, account details).
+- Perform any action the user can, by calling your API (and any CSRF token on the page is readable, so CSRF tokens don't help).
+- Steal session cookies, **unless** they're `HttpOnly`.
+- Rewrite the page into a fake login form to harvest passwords.
+
+The root cause is always the same: **untrusted data was placed into a page in a way the browser interpreted as code** rather than as text.
+
+### Stored XSS
+
+The malicious input is **saved** by the server and later shown to other users. Example: a product review field accepts HTML, an attacker posts a review containing a script tag, and every visitor who opens that product page runs the script. This is the most dangerous type because it hits every viewer automatically, including admins viewing a moderation queue.
+
+### Reflected XSS
+
+The input is **echoed straight back** in the response to the same request. Example: a search page shows "No results for X", inserting the raw query parameter into the HTML. The attacker sends a victim a crafted link whose query parameter contains script; when the victim clicks it, the site reflects the script into their page. It requires luring each victim to a link, but the link points at your genuine domain, which makes it convincing.
+
+### DOM-based XSS
+
+The vulnerability is entirely in **client-side JavaScript**. The server response is fine, but the page's own script takes attacker-controlled data (the URL fragment, a query parameter, `postMessage` data) and writes it into a dangerous **sink**, such as `innerHTML`, `document.write`, `eval` or a `javascript:` URL. Since the payload may never reach the server (URL fragments aren't sent), server-side filters and logs won't see it.
+
+| Type | Where the payload lives | How victims get hit | Where the bug is |
+|---|---|---|---|
+| Stored | Your database | Just viewing a page | Server rendering saved data unsafely |
+| Reflected | The request (usually the URL) | Clicking a crafted link | Server echoing input unsafely |
+| DOM-based | The URL or other client-side source | Clicking a crafted link | Client JavaScript writing to a dangerous sink |
+
+### Defenses
+
+**1. Contextual output encoding (the main fix).** Encode data for the exact place it's inserted. In HTML text, `<` becomes `&lt;` and `&` becomes `&amp;`, so the browser displays characters instead of parsing tags. Attribute values, URLs, JavaScript strings and CSS each have their own encoding rules. Modern templating systems (React JSX, Django and Jinja templates, Go's `html/template`) **escape by default**. Most XSS bugs come from opting out:
+
+```tsx
+// Safe: React escapes the string and renders it as text
+<p>{review.body}</p>
+
+// Dangerous: opts out of escaping and parses the string as HTML
+<p dangerouslySetInnerHTML={{ __html: review.body }} />
+```
+
+**2. Use safe DOM APIs.** In plain JavaScript, set `textContent` rather than `innerHTML`. Never pass user data to `eval`, `new Function` or `setTimeout` with a string.
+
+**3. Sanitise when you must accept HTML.** For rich-text features, run input through a well-maintained allowlist sanitiser (DOMPurify is the common choice) that keeps safe tags like bold and links and strips scripts and event handler attributes. Don't write your own regex filter; attackers have decades of bypass tricks.
+
+**4. Validate URLs.** User-supplied links should be restricted to `https:` (and maybe `mailto:`), so a `javascript:` URL can't be used.
+
+**5. Content Security Policy.** A CSP header tells the browser which scripts may run. A strict policy using nonces blocks inline scripts the attacker injects, even when an encoding bug slips through:
+
+```http
+Content-Security-Policy: script-src 'nonce-r4nd0m' 'strict-dynamic'; object-src 'none'; base-uri 'none'
+```
+
+CSP is **defense in depth**, not a substitute for encoding.
+
+**6. HttpOnly cookies.** `HttpOnly` stops JavaScript from reading the session cookie, so injected script can't steal it outright. It doesn't stop the script from making requests **as** the user while the page is open, so it limits damage rather than preventing it.
+
+<Callout kind="tip">
+Validation on input is useful, but output encoding is what actually prevents XSS. The same string can be safe in one context (HTML text) and dangerous in another (inside a script block), so encoding has to happen where data is **used**, not where it arrives.
+</Callout>
+
+## CORS
+
+**Cross-Origin Resource Sharing** is frequently misunderstood as a security wall that protects your API. It's the opposite: CORS is a way to **relax** the same-origin policy, letting a server tell browsers which other origins are allowed to **read** its responses.
+
+### How it works
+
+When JavaScript on `https://app.example.com` calls `https://api.example.com`:
+
+- For **simple requests** (GET, HEAD, or POST with form-like content types and no custom headers), the browser sends the request straight away with an `Origin` header. When the response comes back, the browser checks `Access-Control-Allow-Origin`. If the calling origin isn't allowed, the browser **hides the response from the script**. The request still reached the server, and any side effect already happened.
+- For **non-simple requests** (PUT, DELETE, `application/json` bodies, custom headers like `Authorization`), the browser first sends an `OPTIONS` **preflight** asking permission. Only if the server approves does the real request go out.
+- To include cookies, the request must opt in (`credentials: "include"`) and the server must reply with `Access-Control-Allow-Credentials: true` and a specific origin, never the wildcard `*`.
+
+```http
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Credentials: true
+Vary: Origin
+```
+
+### Why CORS is not a defense
+
+- **It's enforced by browsers only.** `curl`, Postman, a Python script or another server ignore CORS completely. Anyone can call your API directly. Your API must authenticate and authorise every request on its own.
+- **It doesn't stop requests from being sent.** Simple cross-origin requests reach the server even when CORS denies the response, so CORS **does not prevent CSRF**. A forged form POST never even consults CORS.
+- **It protects your users' data from other sites**, not your server from attackers. Its job is to stop `evil.com`'s JavaScript from reading responses that a logged-in user's browser fetched from your API.
+
+### Misconfigurations that create holes
+
+Because CORS relaxes protection, getting it wrong opens a hole that wasn't there before:
+
+- **Reflecting any Origin** back in `Access-Control-Allow-Origin` while allowing credentials. Now every website can make your users' browsers fetch their private data and **read** it.
+- **Sloppy origin matching**, such as allowing anything that ends with `example.com` (which `evilexample.com` does) or allowing the `null` origin.
+- **Forgetting `Vary: Origin`** when the header changes per origin, so a cache serves one origin's CORS response to another.
+
+<Callout kind="warn">
+The correct mental model: the same-origin policy is the protection, CORS is a controlled exception to it, and your server-side authentication and authorisation are what actually protect your API.
+</Callout>
+
+## SQL injection
+
+**SQL injection** happens when user input is pasted into the **text** of a SQL query, so that special characters in the input change the query's structure instead of being treated as a value.
+
+### How it works
+
+A login check built by string concatenation:
+
+```ts
+// VULNERABLE: never build SQL by concatenating input
+const sql = "SELECT * FROM users WHERE email = '" + email + "' AND password_hash = '" + hash + "'";
+```
+
+With a normal email, this works. Now suppose the email field contains the classic textbook input `' OR '1'='1`. The quote **closes** the string literal early, and the rest is read as SQL:
+
+```sql
+SELECT * FROM users WHERE email = '' OR '1'='1' AND ...
+```
+
+The condition `'1'='1'` is always true, so the `WHERE` clause no longer filters what the developer intended. Depending on the query, injection can bypass logins, dump other users' data, modify or delete rows, and on badly configured databases even reach the file system or run commands. Even an honest user named O'Brien breaks the query, which is often how these bugs are first noticed.
+
+The underlying problem: the database receives **one string** and has no way of knowing which parts came from the developer and which from the user.
+
+### Defenses
+
+**1. Parameterised queries (prepared statements).** Send the query structure and the values **separately**. The database parses the SQL first, with placeholders, and then binds the values as pure data. No value can ever change the query's grammar, whatever characters it contains.
+
+```ts
+// Safe: the query text is fixed; email is only ever a value
+const { rows } = await db.query(
+  "SELECT id, password_hash FROM users WHERE email = $1",
+  [email],
+);
+```
+
+```python
+cur.execute("SELECT id FROM users WHERE email = %s", (email,))
+```
+
+ORMs and query builders (Prisma, Drizzle, SQLAlchemy, Django ORM) parameterise for you, as long as you stay away from their raw-SQL escape hatches with string interpolation.
+
+**2. Allowlist what can't be parameterised.** Placeholders work for **values**, not identifiers or keywords. For dynamic sort columns or directions, map user input onto a fixed list (`"newest"` maps to `created_at DESC`) and reject anything else. Never interpolate a column name from the request.
+
+**3. Least privilege.** The app's database user should have only the permissions it needs: no `DROP`, no access to other schemas, ideally read-only users for read-only services. Injection that does slip through then does far less damage.
+
+**4. Input validation as an extra layer.** Checking that an ID is an integer or an email looks like an email reduces attack surface, but it's not the fix. Escaping functions and blocklists of "bad characters" are fragile; parameterisation is the real answer.
+
+**5. Don't leak errors.** Returning raw database errors to clients helps attackers map your schema. Log details server-side, return a generic error.
+
+<SqlInjectionLab />
+
+## Defense in depth
+
+No single control is enough, and the defenses reinforce each other. A summary of what stops what:
+
+| Attack | Core fix | Extra layers | Doesn't help on its own |
+|---|---|---|---|
+| CSRF | SameSite cookies plus CSRF tokens on state-changing requests | Origin checks, re-authentication, no state-changing GETs | CORS, HTTPS, HttpOnly |
+| XSS | Contextual output encoding, safe DOM APIs | CSP, HttpOnly cookies, HTML sanitiser, URL validation | CSRF tokens, input blocklists |
+| CORS misconfig | Strict origin allowlist, never reflect arbitrary origins with credentials | `Vary: Origin`, server-side auth on every request | Assuming CORS blocks non-browser clients |
+| SQL injection | Parameterised queries | Allowlisted identifiers, least-privilege DB user, generic errors | Escaping by hand, blocklists |
+
+A useful interaction to remember: **XSS defeats CSRF defenses**. Script running on your origin can read the CSRF token and send same-site requests, so a site with an XSS hole is effectively open to forged actions too. Fix XSS first.
+
+## Cheat sheet
+
+- The same-origin policy blocks reading cross-origin responses, not sending requests.
+- CSRF makes a logged-in browser send a forged state-changing request; the attacker never sees the response.
+- Stop CSRF with SameSite cookies, unpredictable CSRF tokens, Origin checks and no side effects on GET.
+- XSS runs attacker script on your origin; stored hits every viewer, reflected needs a crafted link, DOM-based lives in client JS.
+- Stop XSS with contextual output encoding, textContent over innerHTML, a sanitiser for rich text, CSP and HttpOnly cookies.
+- CORS relaxes the same-origin policy for reading responses; it is enforced only by browsers and doesn't stop CSRF.
+- Never reflect arbitrary origins with Access-Control-Allow-Credentials: true.
+- SQL injection happens when input becomes part of the query text; the textbook example is ' OR '1'='1.
+- Use parameterised queries always; allowlist identifiers like sort columns; give the app a least-privilege DB user.
+- XSS undermines CSRF tokens, so fix XSS first; layer defenses rather than relying on one.

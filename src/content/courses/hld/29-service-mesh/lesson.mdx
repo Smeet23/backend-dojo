@@ -1,0 +1,246 @@
+import { HldSidecarStepper } from "@/components/widgets/HldSidecarStepper";
+
+## The problem a mesh solves
+
+Once a system has more than a handful of microservices, every service-to-service call needs the same set of things:
+
+- **Discovery**: where are the healthy instances of the payments service right now?
+- **Load balancing** across those instances.
+- **Timeouts and retries**, so one slow dependency doesn't hang the caller.
+- **Circuit breaking**, so a failing dependency isn't hammered.
+- **Encryption and identity**: is this caller really the orders service, and is the traffic encrypted?
+- **Authorization**: is the orders service allowed to call this endpoint?
+- **Observability**: request rates, error rates, latency and traces for every hop.
+
+The traditional answer is a **shared library** in each service (think of the old Netflix stack: a client library for discovery, another for load balancing, another for circuit breaking). That works when every team uses the same language and upgrades in lockstep. In practice:
+
+- You need a separate, equally good library for Java, Go, Python and Node.
+- Upgrading a retry policy or TLS config means rebuilding and redeploying every service.
+- Each team configures timeouts slightly differently, and nobody has a consistent picture of the network.
+
+A **service mesh** moves all of that out of application code and into a dedicated infrastructure layer that sits on the network path between services. The application makes a plain HTTP or gRPC call to `http://payments`; the mesh handles everything else.
+
+<Callout kind="remember">
+A service mesh is an infrastructure layer for **east-west traffic** (service to service inside your platform). An API gateway handles **north-south traffic** (outside clients coming in). They overlap a little, but they solve different problems.
+</Callout>
+
+## The sidecar proxy
+
+The classic mesh design puts a small proxy **next to every service instance**. In Kubernetes, the proxy runs as an extra container in the same pod; this is the **sidecar** pattern. The most common sidecar proxy is **Envoy**; Linkerd uses its own lightweight proxy written in Rust.
+
+The sidecar intercepts every packet in and out of the application container. Usually this is done with `iptables` rules (or eBPF) injected when the pod starts, so the application doesn't need to know the proxy exists. It still thinks it is talking directly to `payments:8080`.
+
+A call from orders to payments now looks like this:
+
+```text
+orders app ──▶ orders sidecar ══ mTLS ══▶ payments sidecar ──▶ payments app
+  (plain HTTP on localhost)       (encrypted, load-balanced,        (plain HTTP on localhost)
+                                    retried, measured)
+```
+
+Each hop does a different job:
+
+1. **The orders app** makes an ordinary request to `payments`.
+2. **The orders sidecar** (outbound side) picks a healthy payments instance, applies the timeout and retry policy, opens or reuses an mTLS connection, and records metrics and a trace span.
+3. **The payments sidecar** (inbound side) terminates mTLS, checks the caller's identity against authorization policy, applies rate limits, records its own metrics, and forwards to the app on localhost.
+4. **The payments app** handles the request and replies along the same path.
+
+Because the traffic between sidecars and apps stays inside the pod over localhost, it never crosses the network unencrypted.
+
+<HldSidecarStepper />
+
+### Sidecarless meshes
+
+Sidecars have real costs (more on that below), so newer designs move the proxy elsewhere:
+
+- **Istio ambient mode** runs a per-node proxy (`ztunnel`) for mTLS and basic L4 policy, and optional **waypoint proxies** per namespace or service for L7 features like retries and header routing.
+- **Cilium service mesh** uses eBPF in the kernel for L4 and a per-node Envoy for L7.
+
+The concepts in this lesson are the same either way; only where the proxy runs changes.
+
+## Data plane and control plane
+
+Every mesh has two halves, and keeping them straight is the most important idea in this lesson.
+
+| | Data plane | Control plane |
+|---|---|---|
+| **What it is** | All the proxies (sidecars or node proxies) | A central set of controllers |
+| **What it touches** | Every single request | Configuration, never requests |
+| **Job** | Route, load-balance, encrypt, retry, measure | Discover services, compute config, issue certificates, push policy to proxies |
+| **Example** | Envoy sidecars, Linkerd proxies | Istio's `istiod`, Linkerd's control plane |
+| **If it goes down** | Traffic stops for affected pods | Proxies keep running on last known config; you just can't change anything |
+
+The control plane watches the platform (for example, the Kubernetes API) to learn which services and pods exist. It turns your high-level rules ("send 10% of traffic to v2", "only orders may call payments") into low-level proxy config, and pushes that config to every proxy. Envoy receives it through a set of APIs called **xDS**.
+
+This split is why a mesh can be operated centrally: the platform team changes one policy object, the control plane pushes it out, and thousands of proxies pick it up within seconds, with no application redeploys.
+
+<Callout kind="tip">
+A good failure-mode answer: if the control plane dies, existing traffic keeps flowing on cached config, but new pods may not get config or certificates, and policy changes won't roll out. That is why control planes are run with several replicas.
+</Callout>
+
+## mTLS and service identity
+
+Normal TLS (what your browser does) authenticates only the **server**: you know you're talking to your bank, but the bank learns nothing about you from TLS. **Mutual TLS** authenticates **both sides**. Each side presents a certificate, and each side verifies the other's.
+
+Inside a mesh, that gives you two things for free:
+
+- **Encryption in transit** for every service-to-service call, even inside your own network. This matters because "the internal network is trusted" stops being true the moment one pod is compromised.
+- **Strong workload identity.** Each certificate encodes who the workload is, not just an IP address. Meshes commonly use the **SPIFFE** format, for example `spiffe://cluster.local/ns/shop/sa/orders`, derived from the Kubernetes service account.
+
+The control plane acts as a **certificate authority**: it issues each proxy a short-lived certificate (often valid for hours) and rotates it automatically. Nobody manages certificates by hand, and a stolen certificate is useless soon after.
+
+Identity enables **authorization policy** based on who is calling rather than where from:
+
+```yaml
+# Istio: only the orders service account may call payments, and only POST /charge
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: payments-allow-orders
+  namespace: shop
+spec:
+  selector:
+    matchLabels: { app: payments }
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals: ["cluster.local/ns/shop/sa/orders"]
+      to:
+        - operation:
+            methods: ["POST"]
+            paths: ["/charge"]
+```
+
+This is the foundation of **zero-trust networking**: every call is authenticated and authorized, regardless of which network it came from.
+
+## Traffic management
+
+Because every request goes through a proxy that understands HTTP and gRPC, the mesh can make routing decisions at **layer 7**, not just by IP and port.
+
+### Canary releases and traffic splitting
+
+Send a fixed percentage of traffic to a new version and watch its error rate before shifting more:
+
+```yaml
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: payments
+spec:
+  hosts: ["payments"]
+  http:
+    - route:
+        - destination: { host: payments, subset: v1 }
+          weight: 90
+        - destination: { host: payments, subset: v2 }
+          weight: 10
+```
+
+### Header-based routing
+
+Route requests with `x-user-group: beta` (or a specific test user ID) to v2, and everyone else to v1. This lets you test in production with real dependencies and no risk to normal users.
+
+### Traffic mirroring
+
+Copy live traffic to a new version and **discard its responses**. You see how v2 behaves on real load without affecting anyone. Careful: mirrored requests that write data (send emails, charge cards) will really do so unless the new version is pointed at safe dependencies.
+
+### Smarter load balancing
+
+Proxies can balance by **least requests** or latency rather than round robin, and since HTTP/2 and gRPC multiplex many requests over one long-lived connection, L7 balancing is the only way to spread those requests evenly. A plain L4 balancer would pin every request on that connection to one backend.
+
+### Fault injection
+
+Deliberately add delays or errors for a percentage of requests to test how callers cope. This is chaos engineering without touching application code.
+
+## Retries, timeouts and circuit breaking
+
+These are the resilience features teams most often adopt a mesh for, and also the easiest to misconfigure.
+
+**Timeouts.** Every call should have one. The mesh can enforce a per-route timeout so a hung dependency fails fast instead of tying up the caller's threads.
+
+**Retries.** The proxy can retry failed requests automatically, ideally to a different instance. Rules that keep retries safe:
+
+- Retry only **idempotent** operations, or operations protected by an idempotency key. Retrying a non-idempotent `POST /charge` can charge a customer twice.
+- Retry only on errors that are likely transient: connection failures, `503`, sometimes `502`/`504`. Don't retry `400` or `404`.
+- Use **backoff with jitter** and a **retry budget** (for example, retries may add at most 20% extra load). Linkerd builds in retry budgets for exactly this reason.
+
+**Retry amplification** is the classic trap. If the gateway retries 3 times, orders retries 3 times, and payments retries its database 3 times, one user request can become 27 attempts at the bottom of the stack during an incident. Retry at one layer, not every layer.
+
+**Circuit breaking and outlier detection.** The proxy tracks errors per upstream instance. An instance returning many `5xx` errors is **ejected** from the load-balancing pool for a while. Connection and pending-request limits cap how much traffic can queue for a struggling service, so the caller fails fast instead of piling on.
+
+<Callout kind="warn">
+A mesh makes retries a config change, which also makes it easy to add retries everywhere. Always ask: is this call idempotent, and is anyone above or below me already retrying?
+</Callout>
+
+## Observability
+
+Since every request passes through a proxy, the mesh can emit **uniform telemetry for every service**, whatever language it's written in:
+
+- **Metrics**: the "golden signals" per service and per route, meaning request rate, error rate and latency percentiles, exported to Prometheus and shown in Grafana or Kiali.
+- **Distributed traces**: each proxy creates spans for the hops it handles. One caveat that interviewers like: the proxy **cannot** link an incoming request to the outgoing calls the app makes as a result. The application must **propagate trace headers** (such as W3C `traceparent`) from inbound to outbound requests, or every hop shows up as a disconnected trace.
+- **Access logs** for every call, with source and destination identity.
+- **A service graph**: who actually calls whom, discovered from real traffic, which is often surprising.
+
+This is often the first concrete win teams see: a consistent dashboard for every service on day one, without asking each team to instrument their code.
+
+## Istio and Linkerd
+
+The two best-known meshes take different philosophies:
+
+| | Istio | Linkerd |
+|---|---|---|
+| **Data plane** | Envoy sidecars, or ambient mode (ztunnel plus waypoint proxies) | Linkerd's own Rust micro-proxy |
+| **Control plane** | `istiod` (discovery, config, certificates in one binary) | Small set of Linkerd control-plane components |
+| **Feature set** | Very broad: rich routing, ingress and egress gateways, extensibility (Wasm), VM support | Focused: mTLS, retries with budgets, timeouts, load balancing, metrics |
+| **Complexity** | Higher; many custom resources to learn | Lower; designed to be simple to install and run |
+| **Resource overhead** | Higher per sidecar (Envoy is a general-purpose proxy) | Lower per proxy |
+| **Typical fit** | Large platforms needing fine-grained traffic control | Teams wanting mTLS and observability with minimal fuss |
+
+Other options include **Consul** (from HashiCorp, works across Kubernetes and VMs), **Cilium** (eBPF-based) and managed offerings from cloud providers.
+
+## Costs and when not to use one
+
+A mesh is not free, and "should we add a mesh?" is a common interview follow-up.
+
+**Latency.** Each request crosses two extra proxies (outbound and inbound). That's typically around a millisecond or less added at the median per hop, but it adds up along deep call chains and shows up more at the tail.
+
+**Resources.** A sidecar per pod means hundreds or thousands of extra containers, each using memory and CPU. In large clusters this can be a meaningful share of the bill. Sidecarless modes exist largely to cut this.
+
+**Operational complexity.** The mesh is now critical infrastructure. Someone must upgrade it, understand its custom resources, and debug it. When something breaks, you now ask "is it my app, the proxy, the config the control plane pushed, or certificate rotation?"
+
+**Debugging gets harder at first.** A `503` might come from the app or from the proxy's circuit breaker; you need to learn to read proxy logs and flags.
+
+**Lifecycle quirks.** Sidecars must start before the app and shut down after it, or startup calls and graceful shutdown fail. Jobs that run to completion need special handling so the sidecar exits too.
+
+### When a mesh is worth it
+
+- Many services (dozens or more), owned by many teams, in several languages.
+- A requirement for **mTLS everywhere** or zero-trust (common in finance, healthcare, regulated industries).
+- A need for consistent canary releases, traffic shifting and per-service telemetry.
+- A platform team with the time to run it.
+
+### When to skip it
+
+- A monolith or a handful of services. A good HTTP client library with timeouts and retries is enough.
+- A small team with no platform engineers.
+- Very latency-sensitive paths where every sub-millisecond counts.
+- You only need one feature. If all you want is mTLS, your cloud's network policies or a lighter tool may cover it; if all you need is edge routing, an API gateway does that.
+
+<Callout kind="remember">
+The honest answer is: a mesh trades **per-request overhead and operational complexity** for **consistency across many services**. The more services and teams you have, the better that trade becomes.
+</Callout>
+
+## Cheat sheet
+
+- A service mesh moves discovery, load balancing, retries, mTLS and telemetry out of app code into proxies.
+- Mesh traffic is east-west (service to service); an API gateway handles north-south (client to platform).
+- A sidecar proxy runs next to each instance and transparently intercepts its traffic.
+- The data plane (proxies) handles every request; the control plane only computes and pushes config and certificates.
+- If the control plane fails, proxies keep serving on their last config, but changes and new certs stall.
+- mTLS authenticates both sides and gives each workload a strong identity used for authorization policy.
+- L7 traffic management enables canaries, header routing, mirroring and per-request load balancing for gRPC.
+- Retry only idempotent calls, on transient errors, with a budget, at one layer, to avoid retry amplification.
+- Proxies emit uniform metrics, but apps must still propagate trace headers for connected traces.
+- Istio is feature-rich and heavier; Linkerd is focused and lighter; ambient and eBPF meshes drop the sidecar.
+- Skip a mesh for a few services or a small team; adopt it when many teams need consistent security and traffic control.

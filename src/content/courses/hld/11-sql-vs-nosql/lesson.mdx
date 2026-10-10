@@ -1,0 +1,235 @@
+## The real question
+
+"SQL or NoSQL?" sounds like a question about query languages. It isn't. It is a question about **data models**, **guarantees** and **how the system scales**:
+
+- What shape is the data, and how is it related?
+- Which queries must be fast, and are they known in advance?
+- Which guarantees does the business need: multi-row transactions, strong consistency, or just "eventually right"?
+- How big will it get, and is the load mostly reads, mostly writes, or both?
+
+"NoSQL" is also a loose label. It covers four very different families (key-value, document, wide-column and graph), which have less in common with each other than some of them have with relational databases. So the useful skill is not picking a side; it is matching a workload to a data model.
+
+## Relational databases
+
+A relational database (PostgreSQL, MySQL, SQL Server, Oracle) stores data in **tables** of rows and columns. Each table has a fixed **schema**: column names and types, plus constraints. Relationships are expressed with **keys**: a foreign key in one table refers to the primary key of another.
+
+```sql
+CREATE TABLE customers (
+  id     BIGSERIAL PRIMARY KEY,
+  email  TEXT UNIQUE NOT NULL,
+  name   TEXT NOT NULL
+);
+
+CREATE TABLE orders (
+  id           BIGSERIAL PRIMARY KEY,
+  customer_id  BIGINT NOT NULL REFERENCES customers(id),
+  total_cents  INTEGER NOT NULL CHECK (total_cents >= 0),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### Schema and normalization
+
+Relational design favours **normalization**: store each fact once. The customer's email lives only in `customers`, not copied into every order. Updating it means changing one row, and it can never be inconsistent between two places.
+
+The schema is enforced on every write (**schema on write**). The database rejects an order with a negative total or a `customer_id` that doesn't exist. That is valuable: invalid data never gets in, no matter which service or script writes it.
+
+The cost is that changing the shape of data means a **migration** (`ALTER TABLE`), which on very large tables needs care to avoid long locks.
+
+### Joins and ad hoc queries
+
+Because data is normalized, answering a question often means **joining** tables back together:
+
+```sql
+SELECT c.name, COUNT(*) AS orders, SUM(o.total_cents) AS spend
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE o.created_at > now() - interval '30 days'
+GROUP BY c.name
+ORDER BY spend DESC
+LIMIT 10;
+```
+
+SQL's great strength is that you can ask **questions nobody planned for** when the schema was designed. The query planner figures out how to answer them using indexes. For analytics, reporting, admin tools and evolving products, that flexibility is worth a lot.
+
+### Transactions and ACID
+
+Relational databases give you **transactions** with **ACID** guarantees:
+
+| Letter | Meaning | Example |
+|---|---|---|
+| **Atomicity** | All statements in the transaction happen, or none do | Debit one account and credit another; never just one |
+| **Consistency** | Constraints hold before and after | No order points to a missing customer |
+| **Isolation** | Concurrent transactions don't see each other's half-done work | Two people booking the last seat can't both succeed |
+| **Durability** | Once committed, it survives crashes | The write-ahead log is flushed before "OK" |
+
+When a business rule spans several rows or tables (money, inventory, bookings), ACID transactions turn a hard distributed-correctness problem into a few lines of code.
+
+## Why NoSQL appeared
+
+In the mid-2000s, web companies hit workloads that classic single-server relational databases struggled with:
+
+- **Scale beyond one machine.** Billions of rows and hundreds of thousands of writes per second. Relational databases scale **vertically** well, and with read replicas, but sharding writes across many machines was manual and painful, and cross-shard joins and transactions largely disappear once you do it.
+- **Availability over consistency.** For a shopping cart or a feed, staying up during a network partition mattered more than perfect consistency.
+- **Flexible, nested, fast-changing data.** Product catalogues where every category has different attributes; user-generated content; event payloads from many sources.
+- **Simple access patterns.** Many workloads are "get this thing by id" millions of times a second. A full SQL engine is overhead there.
+
+The response was a family of databases that **give up some relational features** (joins, multi-row transactions, a fixed schema, or strong consistency) in exchange for horizontal scale, availability or a better-fitting data model. Since then the line has blurred: many NoSQL stores added transactions and SQL-like languages, and distributed SQL databases (Spanner, CockroachDB, YugabyteDB) scale horizontally while keeping ACID.
+
+## Key-value stores
+
+The simplest model: a giant dictionary. You `get`, `put` and `delete` by key; the value is opaque to the database.
+
+- **Examples:** Redis, Memcached (in memory); DynamoDB, Riak, etcd (persistent and distributed).
+- **Strengths:** extremely fast, trivially partitioned by key, predictable latency at huge scale.
+- **Weaknesses:** you can only look things up by key. "Find all sessions for user 42" requires you to have designed a key for it.
+- **Good for:** caches, sessions, feature flags, rate-limit counters, shopping carts, leaderboards (Redis sorted sets).
+
+```text
+SET session:9f2c  '{"userId":42,"exp":1767225600}'  EX 3600
+GET session:9f2c
+```
+
+## Document stores
+
+Each record is a **document**, usually JSON or a binary form of it, that can contain nested objects and arrays. Documents in the same collection need not have the same fields.
+
+```json
+{
+  "_id": "prod_812",
+  "name": "Trail running shoe",
+  "price": { "amount": 129, "currency": "EUR" },
+  "sizes": [40, 41, 42, 43],
+  "attributes": { "drop_mm": 6, "waterproof": true },
+  "reviews_summary": { "count": 214, "avg": 4.6 }
+}
+```
+
+- **Examples:** MongoDB, Couchbase, Firestore, and Postgres's JSONB columns.
+- **Strengths:** a whole entity is read in **one lookup** with no joins, which suits the "load this object and render it" pattern. Flexible schema suits heterogeneous data. Fields inside documents can be indexed and queried.
+- **Weaknesses:** relationships between documents are weak. You either **embed** related data (duplicating it, so updates must touch many documents) or **reference** it (and do joins in application code). Cross-document transactions exist in modern versions but are more limited and costlier than in relational systems.
+- **Good for:** product catalogues, content management, user profiles, configuration, any aggregate that is mostly read and written as a whole.
+
+The key design rule: **model documents around how the app reads them.** If a blog post page always shows the post with its tags and author name, embed tags and a copy of the author name; reference the full author profile.
+
+## Wide-column stores
+
+Data is organized into rows identified by a **partition key**, and within a partition, rows are **sorted by a clustering key**. Each row can have many columns, and different rows can have different columns. Think of it as a distributed, sorted map of maps.
+
+```sql
+-- Cassandra CQL
+CREATE TABLE messages_by_chat (
+  chat_id     uuid,
+  sent_at     timeuuid,
+  sender_id   uuid,
+  body        text,
+  PRIMARY KEY ((chat_id), sent_at)
+) WITH CLUSTERING ORDER BY (sent_at DESC);
+
+SELECT * FROM messages_by_chat WHERE chat_id = ? LIMIT 50;
+```
+
+- **Examples:** Apache Cassandra, ScyllaDB, HBase, Google Bigtable.
+- **Strengths:** huge write throughput (LSM-tree storage), linear horizontal scaling, multi-datacentre replication, and very fast range reads **within one partition** (the last 50 messages of a chat, a device's readings for the last hour).
+- **Weaknesses:** you **design tables per query**. There are no joins, and querying by anything other than the partition key is slow or not allowed. If you need the same data by two access patterns, you write it to two tables (denormalization by design).
+- **Good for:** time series, event logs, messaging history, IoT telemetry, activity feeds: write-heavy data with known access patterns.
+
+## Graph databases
+
+Data is stored as **nodes** (entities) and **edges** (relationships), both with properties. The database is optimized to **traverse relationships**: following an edge is a pointer hop rather than an index lookup and join.
+
+```text
+// Cypher (Neo4j): friends-of-friends who like the same band, not yet friends
+MATCH (me:User {id: 42})-[:FRIEND]->()-[:FRIEND]->(fof:User),
+      (me)-[:LIKES]->(b:Band)<-[:LIKES]-(fof)
+WHERE NOT (me)-[:FRIEND]->(fof) AND fof <> me
+RETURN fof.name, count(b) AS shared ORDER BY shared DESC LIMIT 10;
+```
+
+- **Examples:** Neo4j, Amazon Neptune, JanusGraph.
+- **Strengths:** multi-hop queries ("friends of friends", "accounts linked to this card through any number of devices") that would need many self-joins in SQL and get slower with each hop.
+- **Weaknesses:** harder to shard (graphs don't partition cleanly), smaller ecosystem, not suited to bulk aggregate analytics.
+- **Good for:** social graphs, recommendations, fraud rings, knowledge graphs, network and dependency mapping.
+
+## ACID vs BASE
+
+Many distributed NoSQL systems describe their guarantees as **BASE**, a deliberate contrast with ACID:
+
+- **Basically Available**: the system answers requests even during failures, possibly with stale or partial data.
+- **Soft state**: replicas may hold different values at a given moment.
+- **Eventually consistent**: if writes stop, replicas converge.
+
+| | ACID | BASE |
+|---|---|---|
+| Priority | Correctness of every transaction | Availability and scale |
+| Consistency | Strong, immediate | Eventual (often tunable) |
+| Behaviour during partitions | May refuse requests | Keeps serving, reconciles later |
+| Multi-record updates | Atomic transactions | Often single-record atomicity only |
+| Typical use | Payments, inventory, bookings | Feeds, carts, likes, telemetry |
+
+This is a spectrum, not a binary. DynamoDB and MongoDB offer transactions and strongly consistent reads at extra cost; Cassandra offers lightweight transactions for single-partition compare-and-set; Postgres can run with asynchronous replicas that serve slightly stale reads. Ask what guarantee a specific operation needs.
+
+<Callout kind="remember">
+"NoSQL means no transactions" and "SQL can't scale" are both outdated. Pick on data model, access patterns and the guarantee each operation needs, not on slogans.
+</Callout>
+
+## Scaling
+
+| | Relational | Most NoSQL |
+|---|---|---|
+| Default scaling | **Vertical** (bigger machine) plus read replicas | **Horizontal** (more machines), built in |
+| Partitioning | Manual sharding or a distributed SQL engine | Automatic by partition key |
+| Cross-partition joins and transactions | Lost or expensive once sharded | Not offered, or limited |
+| Practical ceiling on one node | Very high: a large Postgres box handles many TB and tens of thousands of transactions per second | Not the bottleneck; add nodes |
+
+Two points are often missed. First, a single well-tuned relational database goes **much further** than people assume; most products never outgrow one primary plus replicas. Second, horizontal scale in NoSQL is not free: it depends on choosing a **good partition key**. A key that concentrates traffic (all writes for "today", or one celebrity's id) creates a **hot partition**, and adding machines won't help.
+
+## Schema on write vs schema on read
+
+- **Schema on write** (relational): the database validates structure on every insert. Bad data is rejected at the door, and every reader can rely on the shape.
+- **Schema on read** (document and many NoSQL stores): the database accepts any shape; the **application** interprets it when reading. Changing structure needs no migration, but old documents keep their old shape, so code must handle every version that was ever written.
+
+A flexible schema doesn't remove the schema; it moves it into application code. Teams often add validation back (MongoDB's JSON Schema validators, typed models in the app) once a product matures.
+
+## How to choose
+
+Walk through these questions in order:
+
+1. **Are there invariants that span multiple records** (money moves, stock counts, unique bookings)? Lean **relational** (or distributed SQL).
+2. **Do you need ad hoc queries, reporting or many-to-many relationships**? Lean **relational**.
+3. **Is access almost always by a single key**, at very high rate? **Key-value**.
+4. **Is each entity read and written as a self-contained, nested object with varied fields**? **Document**.
+5. **Is it write-heavy, append-mostly data read by key and time range**, at a scale beyond one node? **Wide-column**.
+6. **Are the important queries multi-hop traversals of relationships**? **Graph**.
+7. **How big, really?** Run the estimate. If it fits one relational primary with headroom, the operational simplicity of one database usually wins.
+
+Examples:
+
+| System | Good fit | Why |
+|---|---|---|
+| Bank ledger, payments | PostgreSQL / distributed SQL | Multi-row atomic transfers, strong consistency, audits |
+| E-commerce orders and inventory | Relational | Transactions across order, stock and payment rows |
+| Product catalogue | Document store (or Postgres JSONB) | Varied attributes per category; read as a whole |
+| Sessions, caching, rate limits | Redis (key-value) | Key lookups, TTLs, sub-millisecond latency |
+| Chat message history | Cassandra / ScyllaDB (wide-column) | Huge write volume; read latest N by chat id |
+| IoT sensor data | Wide-column or a time-series DB | Append-only, time-range reads per device |
+| Social graph, fraud detection | Graph DB | Multi-hop relationship queries |
+| URL shortener mappings | Key-value | One lookup by code, enormous volume |
+
+### Polyglot persistence
+
+Real systems usually use **several stores**, each for what it does best. An e-commerce site might keep orders in Postgres, the catalogue in a document store, carts and sessions in Redis, clickstream in Cassandra, and search in Elasticsearch. The cost is operational: more systems to run, and data to keep in sync between them (usually through change-data-capture or events). Add a new store only when a workload clearly needs it.
+
+## Cheat sheet
+
+- The choice is about data model, access patterns, guarantees and scale, not the query language.
+- Relational: fixed schema, normalization, joins, ad hoc queries, ACID transactions.
+- Key-value: fastest and simplest; only lookups by key.
+- Document: nested, flexible records read as a whole; model around how the app reads.
+- Wide-column: partition key plus sorted clustering key; one table per query; huge write throughput.
+- Graph: nodes and edges; fast multi-hop traversals; harder to shard.
+- ACID favours correctness; BASE favours availability with eventual consistency; most stores now sit in between.
+- Relational scales up and out with replicas; NoSQL scales out by partition key, and a bad key makes hot partitions.
+- Flexible schema moves validation into application code; it doesn't remove it.
+- Money, inventory and bookings default to relational; feeds, logs and sessions often fit NoSQL.
+- Many systems use several stores (polyglot persistence); add one only when a workload demands it.

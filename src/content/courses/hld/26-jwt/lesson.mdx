@@ -1,0 +1,247 @@
+import { HldJwtDecoder } from "@/components/widgets/HldJwtDecoder";
+
+## Why tokens
+
+With classic **server-side sessions**, login creates a session record (in memory, Redis or a database) and gives the browser a random session id in a cookie. Every request looks the id up. That works well, but every API server needs access to the session store, and every request costs a lookup.
+
+A **self-contained token** flips this. The server puts the facts it needs (user id, roles, expiry) **into the token itself** and signs it. Any server holding the verification key can check the signature and trust the contents without a lookup. That suits:
+
+- Many stateless API servers and microservices behind a gateway.
+- APIs called by mobile apps and third parties, where cookies are awkward.
+- Identity federation: an identity provider vouches for a user to many independent apps (OpenID Connect ID tokens are JWTs).
+
+**JSON Web Token (JWT)**, RFC 7519, pronounced "jot", is the standard format for such tokens.
+
+## Structure
+
+A JWT is three base64url-encoded parts joined by dots:
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyXzQyIiwicm9sZSI6Im1lbWJlciIsImV4cCI6MTc2MDAwMDkwMH0.4Hb0iWkH0q1bKq9Sg5Pq0yJ8m8X1lKcWb2D9d2R2f3E
+└────────────── header ─────────────┘ └─────────────────────────── payload ───────────────────────────┘ └──────────────── signature ───────────────┘
+```
+
+### Header
+
+Describes how the token is signed:
+
+```json
+{ "alg": "RS256", "typ": "JWT", "kid": "2026-09-key-1" }
+```
+
+- `alg`: the signing algorithm.
+- `typ`: the media type, usually `JWT` (or more specific ones like `at+jwt` for OAuth access tokens).
+- `kid`: key id, telling the verifier which of several public keys to use. Essential for key rotation.
+
+### Payload
+
+The **claims**: statements about the subject.
+
+```json
+{
+  "iss": "https://auth.shop.example",
+  "sub": "user_42",
+  "aud": "orders-api",
+  "iat": 1760000000,
+  "exp": 1760000900,
+  "role": "member"
+}
+```
+
+### Signature
+
+```
+signature = Sign(key, base64url(header) + "." + base64url(payload))
+```
+
+The signature covers the exact encoded header and payload bytes. Change one character of either and verification fails.
+
+## Base64url and why it is not encryption
+
+**Base64url** is base64 with two URL-safe substitutions (`-` instead of `+`, `_` instead of `/`) and the trailing `=` padding dropped, so a token can sit in a URL, header or cookie without escaping.
+
+It's an **encoding**, not encryption. Anyone holding a JWT can decode the header and payload instantly, no key needed:
+
+```bash
+echo 'eyJzdWIiOiJ1c2VyXzQyIiwicm9sZSI6Im1lbWJlciJ9' | base64 -d
+# {"sub":"user_42","role":"member"}
+```
+
+So:
+
+- **Never put secrets in a JWT**: no passwords, API keys, card numbers, or personal data you wouldn't show the user.
+- The signature gives **integrity** (nobody can change the claims undetected) and **authenticity** (it came from the key holder). It gives **no confidentiality**.
+- If you truly need hidden contents, use **JWE** (JSON Web Encryption), a separate format with five parts. The signed format is technically **JWS**; when people say "JWT" they almost always mean JWS.
+
+<HldJwtDecoder />
+
+## Signing algorithms
+
+### HS256
+
+**HS256** is HMAC with SHA-256: a **symmetric** keyed hash. The same secret signs and verifies.
+
+- Simple and fast.
+- Every service that verifies tokens must hold the secret, which means every one of them can also **mint** tokens. One leaked copy compromises the whole system.
+- The secret must be long and random (at least 256 bits). A short or dictionary secret can be brute-forced offline from any single token.
+
+Fits a monolith, or one service that both issues and checks its own tokens.
+
+### RS256 and ES256
+
+**RS256** is RSA signature with SHA-256; **ES256** is ECDSA on P-256 (smaller, faster signatures); **EdDSA** (Ed25519) is also gaining support. All are **asymmetric**:
+
+- The auth server signs with its **private key**, which never leaves it.
+- APIs verify with the **public key**, usually fetched from a **JWKS** endpoint (`/.well-known/jwks.json`) and cached, selected by `kid`.
+- A compromised API server can verify tokens but **cannot forge** them.
+
+Fits microservices, third parties and any identity provider.
+
+| | HS256 | RS256 / ES256 |
+|---|---|---|
+| Key type | One shared secret | Private key signs, public key verifies |
+| Who can mint tokens | Anyone with the secret | Only the auth server |
+| Key distribution | Secret copied to every verifier | Public keys published via JWKS |
+| Rotation | Coordinated secret swap | Publish new key with new kid, then retire old |
+| Speed and size | Fastest, small signature | Slower; RSA signatures are 256 bytes, ECDSA 64 |
+| Use for | Single service | Multi-service, third-party, identity providers |
+
+## Claims
+
+**Registered claims** (short names to keep tokens small):
+
+| Claim | Meaning | Check |
+|---|---|---|
+| `iss` | Issuer: who created the token | Must equal your trusted issuer |
+| `sub` | Subject: who it's about (user id) | Use as the identity |
+| `aud` | Audience: who it's for | Must include **your** service |
+| `exp` | Expiry, seconds since epoch | Reject if now is past it |
+| `nbf` | Not before | Reject if now is before it |
+| `iat` | Issued at | Informational; can bound token age |
+| `jti` | Unique token id | Used for revocation lists and replay detection |
+
+**Public** claims are standardized names registered with IANA (`email`, `name`, `scope`), and **private** claims are whatever your system agrees on (`role`, `tenant_id`).
+
+Keep the payload small: a JWT travels on **every request**, and large ones (huge permission lists) bloat headers past proxy limits. Put a role or scope in the token and look up fine-grained permissions server-side if needed.
+
+## Validating a token
+
+Every API that accepts a JWT must do **all** of these, in roughly this order:
+
+1. **Parse** the three parts; reject anything malformed.
+2. **Check the algorithm against an allowlist you configured** (for example only `RS256`). Never let the token's own header choose.
+3. **Pick the key**: look up `kid` in your trusted JWKS (refreshing the cache if unknown, with rate limiting). Reject unknown keys.
+4. **Verify the signature** over the exact received header and payload bytes.
+5. **Check `exp` and `nbf`** against the current time, with a small clock-skew leeway (30 to 60 seconds).
+6. **Check `iss`** equals the expected issuer.
+7. **Check `aud`** includes this service.
+8. **Check `typ`** if your issuer distinguishes token types (so an ID token can't be used as an access token).
+9. **Then** apply your authorization: does `sub` with this `role` or `scope` have permission for this resource?
+
+```ts
+import { createRemoteJWKSet, jwtVerify } from "jose";
+
+const JWKS = createRemoteJWKSet(new URL("https://auth.shop.example/.well-known/jwks.json"));
+
+const { payload } = await jwtVerify(token, JWKS, {
+  algorithms: ["RS256"],                  // allowlist
+  issuer: "https://auth.shop.example",
+  audience: "orders-api",
+  clockTolerance: 30,                     // seconds
+});
+// payload.sub is now trustworthy
+```
+
+Use a mature library; don't hand-roll verification.
+
+<Callout kind="warn">
+Decoding is not verifying. A function that "reads" a JWT (like `jwt.decode`) without checking the signature will happily accept a token anyone typed by hand.
+</Callout>
+
+## Expiry and refresh
+
+A JWT can't be "logged out" on the server by default: it stays valid until `exp`. So lifetime is your main safety lever.
+
+- **Access tokens: short**, typically 5 to 15 minutes. A stolen one is only useful briefly.
+- **Refresh tokens: long**, days to weeks, used only at the auth server's token endpoint to get new access tokens. Usually opaque and stored server-side, so they **can** be revoked.
+
+The flow:
+
+1. Login returns a short-lived access token and a refresh token.
+2. The client calls APIs with `Authorization: Bearer` and the access token.
+3. When it gets a 401 for expiry (or just before `exp`), it calls `POST /token` with the refresh token.
+4. The auth server checks the refresh token is still valid and not revoked, then issues a new access token (and, with **rotation**, a new refresh token, invalidating the old one).
+5. Logout or a security event revokes the refresh token, so the user is fully out within one access-token lifetime.
+
+If an old, rotated refresh token is ever presented again, someone copied it: revoke the whole chain.
+
+## Revocation strategies
+
+Statelessness is a JWT's strength and its weakness. When you must cut access **now** (stolen device, fired employee, password change), choose a strategy:
+
+| Strategy | How | Cost |
+|---|---|---|
+| **Short expiry** | Keep access tokens at minutes; revoke the refresh token | Access lasts until expiry |
+| **Denylist by jti** | Store revoked `jti` values (in Redis) until their `exp`; check on each request | One fast lookup per request; list stays small because entries expire |
+| **Token version per user** | Store `token_version` on the user; embed it in tokens; bump it to invalidate all of that user's tokens | Lookup per request (cacheable) |
+| **Issued-after cutoff** | Reject tokens with `iat` before the user's "revoked at" timestamp | Same as above |
+| **Key rotation** | Rotate the signing key | Logs out everyone; emergency only |
+| **Opaque tokens + introspection** | Don't use self-contained tokens where instant revocation is essential | Network call to the auth server per request (cache briefly) |
+
+Notice that most revocation options reintroduce some server-side state. That's normal. A common, balanced design is short-lived JWT access tokens, revocable refresh tokens, and a small Redis denylist for emergencies.
+
+## Storing tokens in the browser
+
+| Location | XSS can steal it? | CSRF risk? | Notes |
+|---|---|---|---|
+| `localStorage` / `sessionStorage` | Yes, any injected script reads it | No | Simple, but one XSS bug leaks tokens |
+| JS memory (a variable) | Harder, still possible while the page runs | No | Lost on reload; pair with a refresh cookie |
+| **HttpOnly, Secure, SameSite cookie** | No, JavaScript can't read it | Mitigated by SameSite (and CSRF tokens) | Recommended for browser apps |
+
+A strong pattern for web apps is the **backend-for-frontend (BFF)**: the browser holds only an HttpOnly session cookie to your own backend, which keeps the access and refresh tokens server-side and attaches them to API calls. Mobile apps store tokens in the OS keychain or keystore.
+
+## Common mistakes
+
+### Accepting alg none
+
+The spec allows `"alg": "none"` for unsigned tokens. Some early libraries trusted the header, so an attacker could take a valid token, change `role` to `admin`, set `alg` to `none`, delete the signature, and be accepted. Fix: **allowlist algorithms** in the verifier; never accept `none`.
+
+### Algorithm confusion
+
+A server expects RS256 and verifies with its RSA **public** key. An attacker forges a token with `"alg": "HS256"` and signs it using that public key (which is public) as the HMAC secret. A library that picks the algorithm from the header, and is handed the public key as "the key", runs HMAC with it and the signature matches. Fix: again, pin the algorithm, and use libraries that bind each key to one algorithm.
+
+### Other frequent errors
+
+- **Not checking `aud`**: a token issued for the reporting API is accepted by the payments API.
+- **Not checking `iss`**: tokens from a different tenant or a test environment are accepted.
+- **Trusting `kid` or `jku` blindly**: header fields that point to key URLs can steer you to an attacker's key. Only use keys from your configured JWKS.
+- **Weak HS256 secrets** cracked offline.
+- **Sensitive data in the payload**, forgetting it's only encoded.
+- **Very long-lived access tokens** with no revocation path.
+- **Putting tokens in URLs**, where they end up in logs, history and `Referer` headers.
+- **Using JWTs as server sessions** when a simple session cookie would do: if every request already hits one backend with a session store, plain sessions are simpler and revocable.
+
+## JWT vs server sessions
+
+| | Server session | JWT |
+|---|---|---|
+| State | Stored server-side | In the token |
+| Verification | Lookup per request | Signature check, no lookup |
+| Revocation | Delete the session: instant | Needs expiry, denylist or versioning |
+| Scaling across services | Shared session store | Any service with the public key |
+| Size on the wire | Small id | Hundreds of bytes to a few KB |
+| Best for | Single web app | Distributed APIs, third parties, federated identity |
+
+## Cheat sheet
+
+- A JWT is header.payload.signature, each part base64url-encoded.
+- Base64url is encoding, not encryption; anyone can read the claims.
+- The signature proves integrity and origin; it does not hide anything.
+- HS256 uses one shared secret (every verifier can mint); RS256 and ES256 sign privately and verify publicly.
+- Publish public keys via JWKS and rotate them with kid.
+- Validate: allowlisted alg, known key, signature, exp and nbf, iss, aud, then authorize.
+- Never accept alg none; never let the header choose the algorithm.
+- Short access tokens (minutes) plus revocable, rotating refresh tokens.
+- Revoke instantly with a jti denylist or a per-user token version.
+- In browsers prefer HttpOnly Secure SameSite cookies or a BFF over localStorage.
+- Keep payloads small and free of secrets.

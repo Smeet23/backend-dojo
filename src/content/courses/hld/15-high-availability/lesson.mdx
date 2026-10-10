@@ -1,0 +1,265 @@
+import { HldNinesCalculator } from "@/components/widgets/HldNinesCalculator";
+
+## What availability means
+
+**Availability** is the fraction of time a system is able to do its job for users. A system that answers correctly 99.9% of the time is "three nines" available.
+
+There are two common ways to measure it:
+
+- **Time-based:** `uptime / (uptime + downtime)`. Simple, but "up" is fuzzy: is a site that returns errors for 5% of users up or down?
+- **Request-based:** `successful requests / valid requests`. This matches user experience better and is what most SLOs use today. A partial outage that fails 5% of requests counts as 5% unavailable, not 0% or 100%.
+
+**High availability (HA)** means designing the system so that the failure of any single component doesn't take the service down, and so that failures are detected and recovered from quickly enough to meet a target.
+
+<Callout kind="remember">
+Things **will** fail: disks, servers, network links, whole data centres, deployments, and humans. High availability isn't about preventing failure. It's about **surviving it**.
+</Callout>
+
+## The nines
+
+### Downtime budgets
+
+Every extra nine cuts the allowed downtime by 10x:
+
+| Availability | Downtime per year | Per month (30 days) | Per day |
+|---|---|---|---|
+| 99% (two nines) | 3.65 days | 7.2 hours | 14.4 min |
+| 99.9% (three nines) | 8.77 hours | 43.2 min | 1.44 min |
+| 99.95% | 4.38 hours | 21.6 min | 43 s |
+| 99.99% (four nines) | 52.6 min | 4.32 min | 8.6 s |
+| 99.999% (five nines) | 5.26 min | 26 s | 0.86 s |
+
+The maths is just `(1 - availability) × period`. For 99.9% per month: `0.001 × 30 × 24 × 60 = 43.2 minutes`.
+
+Notice what four nines implies: **4 minutes a month**. A human can't even be paged, log in and diagnose a problem in that time. Above three nines, recovery must be **automatic**.
+
+### SLA, SLO and SLI
+
+- **SLI** (indicator): the measurement, such as "percentage of requests returning non-5xx in under 500 ms".
+- **SLO** (objective): your internal target for the SLI, such as 99.9% over 30 days.
+- **SLA** (agreement): a contract with customers, with penalties (usually credits) if broken. It's set looser than the SLO so you have a margin.
+
+The gap between 100% and the SLO is the **error budget**: the amount of failure you can "spend" on deployments, experiments and incidents before you must slow down and focus on reliability.
+
+### Series and parallel
+
+Availability composes in two ways, and this maths drives every redundancy decision.
+
+**In series** (a request needs A **and** B): multiply.
+
+```text
+LB 99.99% → App 99.9% → DB 99.9%
+total = 0.9999 × 0.999 × 0.999 ≈ 99.79%
+```
+
+Every component you add in a chain **lowers** the total. A system is never more available than its weakest required dependency.
+
+**In parallel** (a request needs A **or** B, either copy works): multiply the chances of failure.
+
+```text
+two app servers, each 99%
+both down = 0.01 × 0.01 = 0.0001
+total = 1 - 0.0001 = 99.99%
+```
+
+Two 99% servers in parallel give four nines, in theory. The catch is the word **independent**: if both servers share a power supply, a rack switch or a bad deployment, they fail together, and the maths breaks down. Real redundancy means removing **shared fate**.
+
+<HldNinesCalculator />
+
+## Redundancy
+
+Redundancy means having **more than one** of every component the system needs, so one can fail while another carries the load.
+
+### Eliminating single points of failure
+
+A **single point of failure (SPOF)** is any component whose failure takes the whole system down. Finding them is a matter of walking the request path and asking "what if this dies?" at every hop:
+
+| Component | SPOF version | Redundant version |
+|---|---|---|
+| DNS | One DNS provider | Managed DNS with anycast, or two providers |
+| Load balancer | One LB instance | LB pair with a floating IP, or a managed cloud LB |
+| App servers | One server | Several stateless servers behind the LB, in multiple AZs |
+| Database | One primary, no replica | Primary plus synchronous standby with automatic failover |
+| Cache | One Redis node | Redis with replicas and Sentinel or Cluster |
+| Message queue | One broker | Replicated cluster (Kafka with replication factor 3) |
+| Config or secrets | One config server | Replicated store, plus clients that cache the last good config |
+| People and process | One person who knows how to deploy | Runbooks, automation, on-call rotation |
+
+Hidden SPOFs are the dangerous ones: a single NAT gateway, one TLS certificate about to expire, one third-party payment provider, one region's identity service that every login depends on.
+
+### Stateless versus stateful
+
+**Stateless** components (web and app servers that keep no local data between requests) are easy to make redundant: run N copies and let the load balancer spread traffic. If one dies, the others carry on. This is why session data is moved to Redis or a database, or into a signed token.
+
+**Stateful** components (databases, queues, caches) are hard because the **data** must survive too. Redundancy for them means **replication**, and that raises consistency questions: what happens to writes the primary accepted but hadn't copied to the replica when it died?
+
+### N+1 and N+2
+
+If you need N servers to handle peak load, run at least **N+1**, so losing one doesn't overload the rest. Run **N+2** if you want to survive a failure **during** a deployment or maintenance, when one node is already out. With three availability zones, plan so that **any two zones can carry the full load**: each zone runs at about 67% of its capacity in normal times.
+
+## Active-active and active-passive
+
+### Active-passive
+
+One node (the **primary**, or active) handles all traffic. A **standby** (passive) receives replicated data and waits. When the primary fails, the standby is **promoted**.
+
+- **Hot standby:** running, fully synced, ready to take over in seconds.
+- **Warm standby:** running but may need to catch up or scale up; minutes.
+- **Cold standby:** resources must be started and data restored from backup; hours.
+
+Active-passive is the usual pattern for relational databases (a Postgres primary with a streaming replica, Amazon RDS Multi-AZ). It's simpler, because only one node accepts writes, so there are no write conflicts. The cost: the standby's capacity sits idle, and failover takes time.
+
+### Active-active
+
+All nodes serve traffic at the same time. If one fails, the others absorb its share.
+
+- **No failover delay** for stateless tiers: the load balancer just stops sending to the dead node.
+- **Full use of capacity**, but you must keep enough headroom to absorb a failed node's load.
+- For **stateful** active-active (writes accepted in two places), you need conflict handling: last-writer-wins, CRDTs, or partitioning data so each record has one home. This is hard, and why most databases are run active-passive.
+
+| | Active-passive | Active-active |
+|---|---|---|
+| Traffic | Only the primary | All nodes |
+| Failover time | Seconds to minutes | Near zero (for stateless tiers) |
+| Idle capacity | The standby | None, but headroom is needed |
+| Write conflicts | None | Must be designed for |
+| Typical use | Databases, legacy apps | Web tiers, CDNs, multi-region read paths |
+
+## Failover
+
+Failover is the process of moving traffic from a failed component to a healthy one. It has three parts: **detect**, **decide**, **switch**.
+
+### Detection with health checks
+
+Health checks are how a load balancer or orchestrator knows what's alive:
+
+- **Liveness:** "is the process running at all?" If not, restart it.
+- **Readiness:** "can it serve traffic right now?" If not, stop routing to it (but don't kill it; it may be warming up or temporarily overloaded).
+- **Deep checks** test dependencies (can it reach the database?). Use them carefully: if the database blips, every app server fails its check at once, and the load balancer removes **all** of them, turning a partial problem into a total outage.
+
+Typical load balancer settings: check every 5–10 seconds, mark unhealthy after 2–3 consecutive failures, healthy again after 2–3 successes. These thresholds trade **detection speed** against **flapping** (nodes bouncing in and out on one slow response).
+
+```yaml
+health_check:
+  path: /healthz
+  interval: 5s
+  timeout: 2s
+  unhealthy_threshold: 3   # ~15 s to detect a dead node
+  healthy_threshold: 2
+```
+
+A **heartbeat** is the same idea in reverse: nodes regularly announce "I'm alive" to a coordinator, and silence beyond a timeout means presumed dead.
+
+### Deciding, and split brain
+
+The hard part of failover for stateful systems is that **a node that looks dead may not be**. It may just be cut off by a network partition. If the standby promotes itself while the old primary is still alive and accepting writes, you have **two primaries** (split brain), and their data diverges.
+
+Defences:
+
+- **Quorum.** Decisions are made by a majority of an odd-sized group (3 or 5 nodes, using Raft or Paxos, or tools like etcd, ZooKeeper, Redis Sentinel or Patroni). A minority side of a partition can't promote anyone.
+- **Fencing.** The old primary is cut off before the new one takes over: its storage access is revoked, it's powered off (STONITH, "shoot the other node in the head"), or writes carry a **fencing token** that storage rejects if it's stale.
+
+### Switching traffic
+
+Once a new primary is chosen, clients must find it:
+
+- **Virtual or floating IP** moved to the new node (fast, within one network).
+- **DNS update** to point at the new node (simple, but cached by clients; keep TTLs short, like 30–60 seconds).
+- **Service discovery** (Consul, Kubernetes services) that clients query.
+- **Proxy layer** that already knows the topology (PgBouncer, ProxySQL, a cloud database endpoint).
+
+## Multi-AZ and multi-region
+
+### Availability zones
+
+A cloud **region** (such as `ap-south-1`, Mumbai) contains several **availability zones (AZs)**: physically separate data centres with independent power, cooling and networking, connected by low-latency links (around 1–2 ms).
+
+A **multi-AZ** design spreads every tier across at least two, preferably three, AZs:
+
+```text
+                    Region: ap-south-1
+        ┌──────────────┬──────────────┬──────────────┐
+        │    AZ a      │    AZ b      │    AZ c      │
+LB ───► │ app × 3      │ app × 3      │ app × 3      │
+        │ DB primary   │ DB standby   │ DB replica   │
+        └──────────────┴──────────────┴──────────────┘
+```
+
+Because the zones are close, the database can replicate **synchronously** to a standby in another AZ, so failover loses no committed data. Multi-AZ survives a data-centre failure and is the baseline for any production system.
+
+### Regions
+
+A whole region can fail too: a regional control-plane bug, a major network event, a natural disaster. **Multi-region** protects against that, but it's much harder:
+
+- Regions are far apart (tens to hundreds of milliseconds), so replication is usually **asynchronous**. A regional failover may lose the last few seconds of writes.
+- **Active-passive multi-region:** a secondary region with replicated data and some running capacity; traffic shifts by DNS or a global load balancer when the primary region fails.
+- **Active-active multi-region:** users are served from the nearest region, and data is either partitioned by region (a user's data has one home region) or replicated with conflict resolution.
+- Global routing uses **GeoDNS**, **latency-based DNS** or **anycast** (one IP announced from many places).
+
+Multi-region costs real money and complexity, so choose it when the business genuinely needs to survive a regional outage, or when users are spread across the world and latency matters.
+
+## RTO and RPO
+
+Two numbers define what "recovered" means:
+
+- **RTO (Recovery Time Objective):** how long the service can be down. "Back within 15 minutes."
+- **RPO (Recovery Point Objective):** how much data you can afford to lose, measured in time. "At most the last 1 minute of writes."
+
+They drive the architecture and the cost:
+
+| Strategy | Typical RTO | Typical RPO | Cost |
+|---|---|---|---|
+| Backup and restore | Hours | Hours (since last backup) | Low |
+| Pilot light (data replicated, minimal compute) | Tens of minutes | Seconds to minutes | Medium |
+| Warm standby (scaled-down full stack) | Minutes | Seconds | Higher |
+| Active-active multi-site | Near zero | Near zero to seconds | Highest |
+
+RPO is set by **replication**: synchronous replication gives an RPO of zero (no committed write is lost) at the cost of write latency; asynchronous replication gives an RPO equal to the replication lag. RTO is set by **detection plus failover plus warm-up time**.
+
+<Callout kind="warn">
+Backups you have never restored are not backups. Test restores regularly, and run failover drills (game days, chaos experiments) so the failover path is known to work before you need it.
+</Callout>
+
+## Graceful degradation
+
+Not every failure needs to be all-or-nothing. A well-designed system **keeps its core working** while optional parts fail.
+
+On an e-commerce product page, the core is "show the product and let me buy it". Recommendations, reviews, recently-viewed items and personalised banners are nice-to-haves. If the recommendation service is down, render the page without that section rather than returning an error.
+
+Techniques that make this work:
+
+- **Timeouts on every remote call.** A slow dependency is worse than a dead one: it ties up threads until the caller dies too.
+- **Circuit breakers.** After repeated failures, stop calling a dependency for a while and return a fallback immediately, giving it room to recover.
+- **Fallbacks.** Cached or default data (yesterday's bestsellers instead of personalised picks).
+- **Bulkheads.** Separate thread pools or connection pools per dependency, so one slow service can't exhaust the resources the others need.
+- **Load shedding.** When overloaded, reject low-priority work early (with `503` or `429`) to keep high-priority work fast.
+- **Read-only mode.** If the primary database is down, keep serving reads from replicas and show "changes are temporarily disabled".
+- **Feature flags.** Switch off an expensive feature during an incident without a deploy.
+
+### Retries and cascades
+
+Retries help with transient errors but can **amplify** an outage: if every layer retries 3 times, a request through 4 layers can generate 81 attempts at the bottom. Use **exponential backoff with jitter**, a **retry budget** (for example, retries may add at most 10% extra load), and retry only at one layer where possible.
+
+## Deployments and humans
+
+Many outages are self-inflicted: a bad config push or deployment. HA designs include safe change management:
+
+- **Rolling** or **blue-green** deployments, so some healthy capacity always remains.
+- **Canary releases** to 1–5% of traffic first, with automatic rollback on error spikes.
+- **Fast rollback** as a single, practised action.
+- **Separate failure domains** for deployment: don't push a change to every region at once.
+
+## Cheat sheet
+
+- Availability is good time over total time, or more usefully, good requests over valid requests.
+- Each extra nine is 10x less downtime: 99.9% is about 43 minutes a month; 99.99% is about 4.3.
+- In series, multiply availabilities (the total drops); in parallel, multiply failure chances (the total rises).
+- Parallel redundancy only helps if failures are independent: remove shared fate.
+- Find SPOFs by walking the request path and asking what happens if each hop dies.
+- Stateless tiers scale out easily; stateful tiers need replication and failover.
+- Active-passive is simple and conflict-free but has failover time; active-active has none but needs headroom and conflict handling.
+- Use liveness and readiness checks; tune thresholds to balance detection speed and flapping.
+- Prevent split brain with quorum and fencing.
+- Multi-AZ is the production baseline; multi-region protects against regional loss at a higher cost.
+- RTO is how long you can be down; RPO is how much data you can lose. Synchronous replication gives RPO zero.
+- Degrade gracefully: timeouts, circuit breakers, fallbacks, bulkheads, load shedding and read-only mode.

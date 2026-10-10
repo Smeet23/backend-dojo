@@ -1,0 +1,225 @@
+import { HldBulkheadPools } from "@/components/widgets/HldBulkheadPools";
+
+## The idea behind bulkheads
+
+A ship's hull is divided into watertight compartments called **bulkheads**. If the hull is breached, water floods one compartment, and the ship stays afloat. Without them, one hole sinks the whole ship.
+
+The **bulkhead pattern** applies the same idea to software: **partition a service's resources so that a failure in one part can only exhaust that part's share**, and the rest keeps working.
+
+The resources in question are anything finite that requests consume while they wait:
+
+- worker **threads** (or goroutines, or event-loop concurrency)
+- **connection pools** to databases and HTTP downstreams
+- **memory** and queue slots
+- whole **instances** or clusters
+
+## The failure it prevents
+
+Consider a product page service. Each request calls three downstreams:
+
+| Dependency | Normal latency | Importance |
+|---|---|---|
+| Pricing | 20 ms | Critical: no price, no page |
+| Inventory | 30 ms | Critical |
+| Recommendations | 50 ms | Nice to have |
+
+The service runs a single pool of 200 worker threads shared by all calls. One afternoon, recommendations gets into trouble and starts hanging: calls don't fail, they just don't return.
+
+Follow the threads:
+
+1. Every page request that reaches the recommendations call blocks a thread.
+2. With a 30-second default timeout, each blocked thread is gone for 30 seconds.
+3. At 100 requests per second, all 200 threads are blocked within about two seconds.
+4. Now requests that only need pricing and inventory, both perfectly healthy, can't get a thread. They queue, then time out.
+5. The product page service is down. Its callers (the gateway, the mobile BFF) now block on *it*, and the failure spreads upward.
+
+The root problem: **a slow dependency is worse than a dead one**. A dead dependency fails fast and releases the thread. A slow one holds resources hostage. And when those resources are shared, a non-critical feature takes down critical ones.
+
+<Callout kind="remember">
+Resource exhaustion, not the original error, is what turns a local failure into a cascading one. Bulkheads cap how much of your capacity any one dependency can hold hostage.
+</Callout>
+
+<HldBulkheadPools />
+
+## Kinds of bulkhead
+
+### Thread-pool isolation
+
+Give each dependency its **own bounded thread pool** (with a small, bounded queue). The request thread hands the call to that pool and waits for the result with a timeout.
+
+```text
+request threads (200)
+   ├── pricing pool         (20 threads, queue 10)
+   ├── inventory pool       (20 threads, queue 10)
+   └── recommendations pool (10 threads, queue 0)
+```
+
+If recommendations hangs, its 10 threads fill up, further recommendation calls are rejected immediately, and the request thread can render the page without recommendations. Pricing and inventory are untouched.
+
+Pros:
+
+- **Strong isolation**, including from calls that ignore timeouts: the caller's thread can stop waiting even if the pool thread is stuck.
+- The caller can **time out independently** of the underlying client library.
+
+Cons:
+
+- **Overhead**: extra threads, context switches and a hand-off per call.
+- Doesn't fit async or event-loop runtimes (Node.js, reactive Java, Go's goroutines), where there's no thread per call to isolate.
+
+This is the model **Netflix Hystrix** made famous (Hystrix is now in maintenance mode; its ideas live on in **Resilience4j**, which offers `ThreadPoolBulkhead`).
+
+### Semaphore isolation
+
+Instead of a separate pool, keep a **counter of in-flight calls** per dependency. Acquire a permit before calling, release it after. If no permit is available (or none frees up within a short wait), reject immediately.
+
+```ts
+class Bulkhead {
+  private inFlight = 0;
+  constructor(private readonly max: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.inFlight >= this.max) throw new BulkheadFullError();
+    this.inFlight++;
+    try {
+      return await fn();
+    } finally {
+      this.inFlight--;
+    }
+  }
+}
+
+const recsBulkhead = new Bulkhead(10);
+const recs = await recsBulkhead.run(() => recsClient.get(productId, { timeoutMs: 300 }));
+```
+
+Pros: **cheap**, works naturally with async code, no extra threads.
+
+Cons: the call runs on the caller's own thread or task, so the semaphore alone can't abandon a hung call. **You must pair it with a timeout** on the call itself, or permits leak for as long as the call hangs.
+
+| | Thread-pool bulkhead | Semaphore bulkhead |
+|---|---|---|
+| Mechanism | Dedicated pool per dependency | Permit counter per dependency |
+| Overhead | Threads, queues, context switches | Almost none |
+| Caller can walk away from a hung call | Yes | Only with a separate timeout |
+| Fits async / reactive / Go | Poorly | Well |
+| Resilience4j class | `ThreadPoolBulkhead` | `Bulkhead` (semaphore) |
+
+### Connection-pool isolation
+
+Connection pools are bulkheads too, whether you think of them that way or not. Give each downstream its own HTTP connection pool with a maximum size, and separate **database pools** for workloads with different profiles:
+
+- An **OLTP pool** for user-facing queries (small, fast).
+- A **reporting pool** for slow analytics queries, with a lower maximum.
+
+A runaway report can then exhaust only the reporting pool, not the connections the checkout path needs. The same goes for read replicas versus the primary.
+
+### Isolation at the infrastructure level
+
+Bulkheads also exist above a single process:
+
+- **Separate deployments per workload.** Run the same service as two deployments: one for interactive API traffic, one for batch jobs. A batch spike can't starve user traffic.
+- **Per-tenant isolation.** Put very large or noisy customers on dedicated instances, or partition tenants into **cells** (cell-based architecture). A bad tenant only affects its cell.
+- **Shuffle sharding.** Assign each customer to a small random combination of instances (say 2 out of 8). Two customers rarely share the exact same combination, so one customer's poison requests can only take down their own shard, and almost every other customer still has a healthy instance. AWS uses this technique widely.
+- **Availability zones and regions** are bulkheads against physical failures.
+- **Kubernetes resource requests and limits** are bulkheads between pods on the same node: one pod's memory leak can't starve its neighbours.
+
+## Sizing a bulkhead
+
+Too small and you reject requests under normal load. Too big and the bulkhead doesn't contain anything. Start from **Little's Law**:
+
+```text
+concurrency needed = peak request rate × latency
+```
+
+For pricing at a peak of 400 calls per second and a p99 latency of 40 ms:
+
+```text
+400 × 0.04 s = 16 concurrent calls
+```
+
+Add headroom, say 25 to 50%, and you get a pool of around 20 to 24. Then sanity-check:
+
+- **Sum of pools vs total resources.** The bulkheads together shouldn't exceed what the service (and the downstream) can actually handle. It's fine for them to add up to *less*: spare capacity stays available for other work.
+- **Use p99, not average latency.** Pools sized on averages run out during normal tail spikes.
+- **Downstream capacity.** If the inventory database can serve 50 connections across all clients, and you run 10 instances, each instance's pool must be well under 5 to 10 connections, not 50.
+- **Queue length.** Keep queues small or zero. A big queue in front of a bulkhead just moves the waiting somewhere else and adds latency. Fast rejection is the point.
+
+Then **measure**: track pool utilisation, rejections and queue wait time per bulkhead, and adjust. Rejections during normal traffic mean the pool is too small; never touching more than 10% of a pool means it can be smaller.
+
+<Callout kind="tip">
+Weight sizing by importance. Critical dependencies get generous pools. Optional ones get just enough for normal traffic, so when they misbehave they're cut off quickly.
+</Callout>
+
+## Combining with timeouts and circuit breakers
+
+A bulkhead on its own limits the blast radius but doesn't make things fast. It's one of three patterns that work as a set:
+
+| Pattern | Question it answers | Without it |
+|---|---|---|
+| **Timeout** | How long will I wait for one call? | A hung call holds a resource forever |
+| **Bulkhead** | How many resources can one dependency hold at once? | One dependency can take all of them |
+| **Circuit breaker** | Should I even try calling right now? | You keep paying for calls that will fail |
+
+How they interact:
+
+- **Timeouts make bulkheads drain.** A semaphore bulkhead with no timeout fills up and stays full. With a 300 ms timeout, each permit is held for at most 300 ms, so a pool of 10 can still process about 33 calls per second even when every call fails.
+- **Bulkheads cap the damage while a breaker decides.** A breaker needs some failures to trip. During that window, the bulkhead stops those failing calls from consuming everything.
+- **Breakers relieve the bulkhead.** Once open, the breaker rejects calls before they ever take a permit, so the pool is free and the downstream gets a rest.
+- **Bulkhead rejections are a signal.** A full bulkhead means the dependency is slow or traffic exceeds its share. Count rejections in your metrics and decide whether they should count as failures for the breaker.
+
+A typical order of decorators around an outgoing call (Resilience4j applies them in a similar layered order):
+
+```text
+retry
+  └─ circuit breaker
+       └─ bulkhead
+            └─ timeout
+                 └─ the actual call
+```
+
+Read it from the inside out: each attempt is bounded by a timeout; at most N attempts are in flight (bulkhead); the breaker stops attempts when the dependency is clearly failing; the retry wraps everything, so a retried attempt goes through the breaker and bulkhead again rather than bypassing them.
+
+```java
+Supplier<Recs> call = () -> recsClient.fetch(productId);
+
+Supplier<Recs> decorated = Decorators.ofSupplier(call)
+    .withBulkhead(Bulkhead.of("recs", BulkheadConfig.custom()
+        .maxConcurrentCalls(10)
+        .maxWaitDuration(Duration.ZERO)
+        .build()))
+    .withCircuitBreaker(CircuitBreaker.ofDefaults("recs"))
+    .withFallback(List.of(BulkheadFullException.class, CallNotPermittedException.class),
+                  e -> Recs.empty())
+    .decorate();
+```
+
+### Fallbacks
+
+When a bulkhead rejects, the user shouldn't see an error if the feature is optional. Decide per dependency:
+
+- **Recommendations full**: render the page without them, or with a cached "popular items" list.
+- **Pricing full**: this is critical, so fail the request clearly (or serve a cached price only if the business accepts it).
+
+## When bulkheads aren't worth it
+
+Isolation costs capacity: resources reserved for one dependency sit idle while another is busy. With many small pools you can reject requests even though the service as a whole has spare threads. Bulkheads pay off when:
+
+- a service has **several dependencies of different importance or reliability**,
+- one dependency is **known to be flaky or slow** (third-party APIs especially),
+- or workloads of very **different cost** share resources (interactive vs batch).
+
+For a service with a single downstream, a timeout and a global concurrency limit usually do the job.
+
+## Cheat sheet
+
+- Bulkheads partition resources so one failure can only exhaust its own compartment.
+- Slow dependencies are more dangerous than dead ones because they hold resources.
+- Thread-pool bulkheads isolate strongly and let the caller walk away, at the cost of threads and hand-offs.
+- Semaphore bulkheads are cheap and async-friendly, but need a timeout on every call.
+- Separate connection pools per downstream and per workload (OLTP vs reporting).
+- Infrastructure bulkheads: separate deployments, cells, shuffle sharding, zones, pod limits.
+- Size pools with Little's Law using p99 latency and peak rate, plus headroom.
+- Keep bulkhead queues small or zero; fast rejection is the point.
+- Respect the downstream's total capacity across all instances when sizing.
+- Timeouts drain bulkheads, bulkheads contain damage, circuit breakers stop the calls.
+- Always define a fallback for optional dependencies when the bulkhead is full.

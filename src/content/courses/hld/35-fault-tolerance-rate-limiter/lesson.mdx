@@ -1,0 +1,216 @@
+import { HldLoadShedSim } from "@/components/widgets/HldLoadShedSim";
+
+## Rate limiting as a resilience tool
+
+Rate limiting is usually introduced as an API-product feature: "free tier gets 100 requests per minute". That's **quota enforcement**, and it's about fairness and billing.
+
+This lesson is about the other job: **protecting a service from overload so it keeps working**. Here the question isn't "has this customer used their allowance?" but "can I take on this request right now without making things worse for everyone?" The algorithms (token bucket, sliding window and friends) are the same building blocks; what changes is *where* you apply them, *what* you limit, and *what you do* with the requests you turn away.
+
+| | Quota limiting | Protective limiting |
+|---|---|---|
+| Goal | Fairness, pricing, abuse prevention | Keep the service alive and fast under overload |
+| Keyed by | API key, user, tenant | The service or a dependency as a whole (plus per-tenant fairness) |
+| Limit set from | Business plan | Measured capacity |
+| Static or dynamic | Mostly static | Often adaptive |
+| Typical response | 429 with quota headers | 429 or 503, fast, with Retry-After |
+
+## How overload kills a service
+
+To see why protection matters, look at what happens when more work arrives than a server can do.
+
+A server has finite **concurrency**: worker threads, connection-pool slots, CPU cores, memory. When requests arrive faster than they complete, they wait in **queues** (the accept backlog, a thread-pool queue, the event loop). By **Little's Law**, the number of requests in the system equals arrival rate times time spent in it. If arrivals exceed capacity, the queue, and therefore latency, grows without bound.
+
+Then things get worse than linear:
+
+1. **Latency climbs past client timeouts.** Clients give up after, say, 1 second. The server doesn't know, and keeps working on requests nobody is waiting for. CPU is spent producing responses that are thrown away.
+2. **Goodput collapses.** Throughput (requests completed) may stay high, but **goodput** (requests completed *in time to be useful*) drops toward zero.
+3. **Resources thrash.** Big queues mean more memory, more garbage collection, more context switching and lock contention, so real capacity actually *drops* under overload.
+4. **Clients retry.** Each timed-out request comes back as a retry, adding load exactly when the server is weakest.
+5. **Failure cascades.** Upstream callers wait on the slow service, exhaust their own threads and connections, and slow down too. One overloaded service takes its callers down with it.
+
+This is why an overloaded system often doesn't recover even after the original spike passes: queues and retries keep it saturated. It's sometimes called a **metastable failure**, a bad state that sustains itself.
+
+<Callout kind="remember">
+A server that is at capacity should **reject extra work quickly and cheaply**, not accept it and do it slowly. A fast "no" lets the client retry elsewhere or degrade gracefully. A slow "yes" that times out wastes everyone's resources.
+</Callout>
+
+<HldLoadShedSim />
+
+## Server-side protection
+
+### Admission control at the front door
+
+The first line of defence is a limit on how much work the service accepts, set a little **below** measured capacity. Requests over the limit are rejected immediately with **429 Too Many Requests** (the caller is sending too much) or **503 Service Unavailable** (the server is overloaded), ideally with a `Retry-After` header.
+
+```http
+HTTP/1.1 503 Service Unavailable
+Retry-After: 2
+Content-Type: application/json
+
+{"error":"overloaded","retryable":true}
+```
+
+The rejection must be **cheap**. If turning a request away requires parsing the body, authenticating against a database and loading the user's profile, you haven't saved much. Reject as early as possible: at the load balancer or API gateway, or as the very first middleware.
+
+### Concurrency limits beat rate limits
+
+A rate limit ("100 requests per second") assumes every request costs the same. They don't: a search with a broad filter may cost 50 times a simple lookup, and the same request costs more when a downstream is slow.
+
+A **concurrency limit** ("at most 64 requests in flight") tracks the resource that actually runs out. If requests get slower, fewer complete per second and the limit automatically admits fewer per second too. Little's Law again: in-flight = rate times latency, so capping in-flight work caps the rate in proportion to how expensive work currently is.
+
+```ts
+const MAX_IN_FLIGHT = 64;
+let inFlight = 0;
+
+app.use((req, res, next) => {
+  if (inFlight >= MAX_IN_FLIGHT) {
+    res.set("Retry-After", "1").status(503).json({ error: "overloaded" });
+    return;
+  }
+  inFlight++;
+  res.on("close", () => inFlight--);
+  next();
+});
+```
+
+### Bound every queue
+
+Some queueing smooths out bursts, which is good. Unbounded queueing turns overload into unbounded latency. Give every queue a maximum length and, better, a maximum **wait time**. A request that has already waited longer than the client's timeout should be dropped, not processed.
+
+Two refinements used in large systems:
+
+- **Deadline propagation.** The caller sends its deadline along (gRPC does this natively; with HTTP you can pass a header such as a timeout budget). The server skips work whose deadline has already passed, and passes the remaining budget to its own downstream calls.
+- **Adaptive LIFO.** Under overload, serve the **newest** queued requests first. The oldest ones have probably timed out already; the newest still have a client waiting. Facebook described using this, combined with CoDel-style queue timeouts, for exactly this reason.
+
+## Load shedding
+
+**Load shedding** means deliberately dropping some work so the rest succeeds. Admission limits are the simplest form; good load shedding is **selective**.
+
+### Prioritise by importance
+
+Not all requests are equal. In an e-commerce site under pressure:
+
+| Priority | Examples | Under overload |
+|---|---|---|
+| Critical | Checkout, payment, login | Serve as long as at all possible |
+| Important | Product page, cart | Serve, maybe in degraded form |
+| Deferrable | Recommendations, reviews widget | Shed early, show a fallback |
+| Background | Analytics beacons, prefetch, batch jobs | Shed first |
+
+Requests are tagged with a priority (from the route, a header set by the gateway, or the caller's identity), and the service sheds from the lowest tier upward as utilisation rises. Google's SRE practice describes request **criticality** levels propagated along the call chain for this purpose, so a backend knows that a request is part of a user-facing checkout rather than a batch job.
+
+```ts
+const SHED_AT: Record<Priority, number> = {
+  background: 0.6,  // shed when 60% of slots are busy
+  deferrable: 0.75,
+  important: 0.9,
+  critical: 1.0,    // only when completely full
+};
+
+function admit(priority: Priority): boolean {
+  return inFlight / MAX_IN_FLIGHT < SHED_AT[priority];
+}
+```
+
+### Shed fairly between tenants
+
+A single noisy tenant can consume all the capacity. Combine a global protective limit with **per-tenant** limits or fair queueing, so overload from one customer is shed from that customer first.
+
+### Degrade instead of dropping
+
+Shedding doesn't always mean an error. A service under pressure can return **cheaper answers**: cached or slightly stale data, fewer search results, no personalisation, static recommendations. The user still gets something useful, at a fraction of the cost.
+
+### Where to shed
+
+Shed as early in the request path as possible. Dropping at the edge (CDN, gateway, load balancer) is cheapest; dropping after five services have each done some work wastes all of it. But the edge knows least about actual backend health, so in practice you shed at several layers: a coarse limit at the gateway, precise concurrency limits in each service.
+
+## Adaptive concurrency limits
+
+A fixed limit has two problems. Set it too high and it doesn't protect you; set it too low and you reject traffic you could have served. And the right value keeps changing: new code, a slower database, a noisy neighbour, more instances.
+
+**Adaptive concurrency limits** discover the limit continuously, borrowing ideas from **TCP congestion control**:
+
+- Measure latency (often a minimum or baseline round-trip time, compared with the current one).
+- While latency stays near baseline, the service isn't queueing, so **raise** the limit a little (additive increase).
+- When latency rises or requests fail, queueing has started, so **cut** the limit (multiplicative decrease).
+
+Algorithms you'll see named: **AIMD**, **Vegas** and **Gradient** (from Netflix's `concurrency-limits` library), and Envoy's **adaptive concurrency filter**, which samples a minimum RTT and adjusts the limit with a gradient. The effect: the limit settles around the point where the service is fully used but not queueing, and follows it automatically as conditions change.
+
+<Callout kind="tip">
+Adaptive limiting needs a good signal. Latency of the service's own work is a better signal than CPU, because a service can be saturated on a lock, a pool or a downstream while CPU looks fine.
+</Callout>
+
+## Client-side protection
+
+Servers shouldn't be the only line of defence. Callers can avoid sending work that will obviously fail.
+
+### Client-side throttling
+
+The Google SRE book describes **adaptive throttling**: each client tracks, over the last couple of minutes, how many requests it sent and how many the backend **accepted**. When the backend starts rejecting, the client begins rejecting a proportion of new requests **locally** before they ever hit the network:
+
+```text
+reject_probability = max(0, (requests - K * accepts) / (requests + 1))
+```
+
+With `K = 2`, the client allows itself to send about twice as many requests as are being accepted. Once the backend recovers, accepts rise and local rejection fades out. This stops a struggling backend from spending its capacity on rejecting requests.
+
+### Limit outgoing concurrency per dependency
+
+A client that caps its own in-flight calls to each downstream (a semaphore or a dedicated pool) both protects that downstream and protects itself from tying up all its threads waiting on it. That's the **bulkhead** pattern, covered in its own lesson.
+
+### Server-side vs client-side
+
+| | Server-side limiting | Client-side throttling |
+|---|---|---|
+| Protects | The service, from all callers | The downstream, from this caller; and the caller itself |
+| Knows | Real current load | Only what its own responses suggest |
+| Cost of a rejection | A network round trip, some server CPU | Nothing on the network |
+| Trust | Works even with buggy or malicious clients | Only works if clients cooperate |
+
+You need both: server-side because you can't trust every client, client-side because it is far cheaper and reacts before the server is drowning.
+
+## How limits interact with retries
+
+Retries and rate limits pull in opposite directions. A limiter rejects work to reduce load; a naive retry policy turns every rejection into more load.
+
+Picture a service that receives 1,000 requests per second, and has capacity for 800. It rejects 200. If every client retries immediately up to 3 times, those 200 rejections become up to 600 extra requests, so the service now sees roughly 1,600 offered requests and rejects even more. The limiter is doing its job, but the system spends its capacity saying "no".
+
+Rules that keep the two cooperating:
+
+- **Signal clearly.** Use 429 or 503 with `Retry-After`, and distinguish "overloaded, try later" from "invalid request, never retry".
+- **Respect Retry-After and back off with jitter** on the client.
+- **Retry budgets.** Cap retries to a fraction of normal traffic (for example, retries may add at most 10% on top of first attempts), so retries can't multiply load during an outage.
+- **Retry at one layer only.** If the gateway, the service and the client library all retry 3 times, one user action can turn into 27 calls at the bottom.
+- **Don't retry into the same overloaded instance** when another is available; and don't retry at all if the whole service says it's overloaded and the request is low priority.
+
+The next lessons on retries and circuit breakers go deeper on each of these.
+
+## Putting it together
+
+A realistic layered setup for a service under variable load:
+
+| Layer | Mechanism | Purpose |
+|---|---|---|
+| Edge / gateway | Per-tenant quotas, coarse global limit, bot filtering | Stop abuse and obvious floods cheaply |
+| Service entry | Adaptive concurrency limit, priority-based shedding, bounded queues with timeouts | Keep the service near full use without queueing |
+| Inside the service | Deadline checks, degraded responses | Avoid wasted work, keep users served |
+| Outgoing calls | Per-dependency concurrency caps, client throttling, retry budgets, circuit breakers | Don't overload downstreams, don't get dragged down by them |
+| Platform | Autoscaling | Add capacity, which takes minutes; shedding covers the gap until it arrives |
+
+<Callout kind="warn">
+Autoscaling is not overload protection. New instances take tens of seconds to minutes to come up and warm. Load shedding has to keep the service alive until they arrive, and autoscaling on a metric that collapses under overload (like successful requests) can even scale the wrong way.
+</Callout>
+
+## Cheat sheet
+
+- Protective rate limiting keeps a service alive under overload; quota limiting enforces fairness and pricing.
+- Overload grows queues, pushes latency past client timeouts and collapses goodput.
+- A fast, cheap rejection (429/503 with Retry-After) beats a slow success that times out.
+- Concurrency limits track the real bottleneck better than requests-per-second limits.
+- Bound every queue by length and wait time; drop requests whose deadline has passed.
+- Load shedding drops the least important work first: background, then deferrable, then important.
+- Degrade (cached, cheaper answers) before you drop.
+- Adaptive concurrency limits raise the limit while latency is flat and cut it when queueing starts.
+- Client-side throttling rejects locally when the backend's accept rate falls.
+- Retries fight limiters: use backoff, jitter, retry budgets, Retry-After and a single retry layer.
+- Autoscaling adds capacity slowly; shedding protects the service until it arrives.

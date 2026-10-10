@@ -1,0 +1,259 @@
+import { HldTwoPhaseCommitSim } from "@/components/widgets/HldTwoPhaseCommitSim";
+
+## The problem
+
+A customer places an order on a shop built from microservices. One business action touches three services, each with its own database:
+
+1. **Order service**: create the order.
+2. **Payment service**: charge the card (or debit a wallet).
+3. **Inventory service**: reserve the item.
+
+The business rule is all-or-nothing. If the item is out of stock, the customer must not be charged. If the charge fails, stock must not stay reserved. Inside one database this is trivial:
+
+```sql
+BEGIN;
+INSERT INTO orders ...;
+UPDATE wallets SET balance = balance - 499 WHERE user_id = 7;
+UPDATE stock SET reserved = reserved + 1 WHERE sku = 'MUG-01';
+COMMIT;
+```
+
+The database's own transaction gives you **ACID**: atomicity (all or nothing), consistency (constraints hold), isolation (others don't see half-done work) and durability (committed means it survives a crash). The moment those three rows live in three databases owned by three services, no single engine can wrap them in one `BEGIN ... COMMIT`. A **distributed transaction** is any mechanism that tries to give you all-or-nothing behaviour across those boundaries.
+
+## Why it is hard
+
+Everything that makes distributed systems difficult shows up here at once:
+
+- **Partial failure.** The payment service committed; the inventory service crashed before committing. Each node only knows its own state.
+- **Unreliable network.** A request times out. Did the other side do the work and the reply got lost, or did the request never arrive? You can't tell the two apart.
+- **No shared clock or lock manager.** Each database locks its own rows; nobody sees the whole picture.
+- **Independent crashes and restarts.** A node may come back minutes later and must figure out what it was in the middle of.
+
+There are two broad families of answers:
+
+| Family | Idea | Examples |
+|---|---|---|
+| **Atomic commit protocols** | Make every participant commit or abort **together**, holding locks until the decision | Two-phase commit, three-phase commit, XA |
+| **Sagas** | Let each step commit **locally** right away; if a later step fails, run **compensating** actions to undo earlier ones | Orchestrated and choreographed sagas |
+
+Atomic commit gives you real atomicity and isolation at the price of blocking and tight coupling. Sagas keep services independent and available at the price of temporary inconsistency.
+
+## Two-phase commit
+
+**Two-phase commit (2PC)** introduces a **coordinator** (often the service that started the transaction, or a transaction manager) and treats every database involved as a **participant**.
+
+### Phase one, prepare
+
+1. The coordinator sends `PREPARE` to every participant.
+2. Each participant does all the work for its part (writes rows, checks constraints, acquires locks), **writes a prepare record to its durable log**, and replies:
+   - `YES` (also called "vote commit"): "I have done everything needed and **promise** I can commit, even if I crash and restart."
+   - `NO`: "I can't" (constraint violation, out of stock, timeout).
+
+After voting YES a participant is **in doubt**: it may no longer decide on its own. It must hold its locks and wait for the coordinator's verdict.
+
+### Phase two, commit or abort
+
+3. The coordinator collects votes.
+   - All `YES`: it writes `COMMIT` to **its own durable log** (this write is the moment the transaction is decided) and sends `COMMIT` to everyone.
+   - Any `NO`, or a participant that doesn't answer in time: it logs `ABORT` and sends `ABORT` to everyone.
+4. Each participant applies the decision, releases its locks and replies `ACK`.
+5. Once all ACKs arrive, the coordinator can forget the transaction.
+
+```
+Coordinator          Order DB        Payment DB      Inventory DB
+    |---PREPARE-------->|                |                |
+    |---PREPARE------------------------->|                |
+    |---PREPARE------------------------------------------>|
+    |<--YES-------------|                |                |
+    |<--YES------------------------------|                |
+    |<--YES-----------------------------------------------|
+ [log COMMIT]
+    |---COMMIT--------->|                |                |
+    |---COMMIT-------------------------->|                |
+    |---COMMIT------------------------------------------->|
+    |<--ACK (x3)--------|----------------|----------------|
+```
+
+### Why the promise matters
+
+The prepare record is what makes 2PC atomic. A participant that voted YES and then crashed reads its log on restart, sees "prepared, no decision", and **asks the coordinator** what happened instead of guessing. Likewise, the coordinator retries `COMMIT` forever until every participant acknowledges, because once it has logged COMMIT the decision is final; there is no going back.
+
+### The blocking problem
+
+2PC's famous weakness is the **coordinator crash after prepare**:
+
+- All participants voted YES. They hold row locks.
+- The coordinator crashes before sending (or logging) the decision.
+- No participant can commit (maybe someone else voted NO). No participant can abort (maybe the coordinator logged COMMIT and another participant already committed).
+
+So they **wait**, holding locks, until the coordinator recovers. Meanwhile every other transaction touching those rows queues behind them. That is why 2PC is called a **blocking** protocol: one node's failure can freeze progress on others.
+
+Other costs:
+
+- **Latency.** At least two round trips plus several forced disk writes (fsyncs) per transaction.
+- **Throughput.** Locks are held across network round trips, so contention rises sharply.
+- **Availability.** The transaction can only commit if **every** participant and the coordinator are up. With five participants each at 99.9%, the whole thing is closer to 99.5%.
+- **Coupling.** Every participant must speak the protocol (the X/Open **XA** standard, or the database's own `PREPARE TRANSACTION`). Most message brokers and many NoSQL stores and third-party APIs don't.
+
+<HldTwoPhaseCommitSim />
+
+### Where 2PC is used
+
+2PC is alive and well **inside** a single system that controls every participant: distributed SQL databases (Spanner, CockroachDB, YugabyteDB) commit cross-shard transactions with 2PC variants, and they remove the blocking problem by making the coordinator's state itself replicated through Paxos or Raft, so a coordinator crash just elects a new one that knows the decision. Postgres exposes `PREPARE TRANSACTION` / `COMMIT PREPARED` for external managers. Across independently owned microservices, 2PC is generally avoided.
+
+## Three-phase commit
+
+**Three-phase commit (3PC)** tries to remove the blocking by inserting an extra phase between voting and committing:
+
+1. **CanCommit**: the coordinator asks "can you commit?" Participants vote YES or NO without locking much yet.
+2. **PreCommit**: if all said YES, the coordinator sends `PRE-COMMIT`. Participants prepare, take locks and ACK. Everyone now knows that **everyone voted YES**.
+3. **DoCommit**: the coordinator sends `COMMIT`; participants commit.
+
+The key idea: in 2PC, a prepared participant can't tell whether others voted YES. In 3PC, a participant that has received PRE-COMMIT knows the decision will be commit. So if the coordinator dies, the participants can talk among themselves (or elect a new coordinator) and use **timeouts** to finish:
+
+- If any surviving participant has PRE-COMMIT, they can safely commit.
+- If none has it, nobody can have committed, so they can safely abort.
+
+### Why 3PC is rarely used
+
+3PC is non-blocking only under assumptions that don't hold on real networks: **bounded message delays and no network partitions**. If the network splits, one side may time out and commit while the other times out and aborts, which breaks atomicity outright. It also adds another round trip. In practice, systems that need non-blocking atomic commit use **2PC with a replicated coordinator** (consensus) instead of 3PC.
+
+| | 2PC | 3PC |
+|---|---|---|
+| Round trips | 2 | 3 |
+| Coordinator crash after prepare | Participants block | Participants can finish by timeout |
+| Safe under network partitions | Yes (blocks, but stays consistent) | No (can split-brain) |
+| Real-world use | Databases, XA, distributed SQL | Mostly academic |
+
+## The SAGA pattern
+
+A **saga** breaks the big transaction into a sequence of **local transactions**, one per service. Each one commits in its own database immediately and then triggers the next. If step k fails, the saga runs **compensating transactions** for steps k minus 1 back to 1, in reverse order.
+
+For the order example:
+
+| Step | Local transaction | Compensation |
+|---|---|---|
+| 1 | Order service: create order with status PENDING | Mark order CANCELLED |
+| 2 | Payment service: charge 4.99 | Refund 4.99 |
+| 3 | Inventory service: reserve MUG-01 | Release the reservation |
+| 4 | Order service: mark order CONFIRMED | (last step, nothing after it to fail) |
+
+If step 3 fails (out of stock), the saga refunds the payment and cancels the order. The customer briefly had a charge and a pending order; then both were reversed.
+
+### Compensations are not rollbacks
+
+A database rollback makes it as if the change never happened. A compensation is a **new business action** that semantically undoes an earlier one, and the earlier one was **visible** in between:
+
+- You can't un-send an email. The compensation is a second email ("your order was cancelled").
+- A refund is not the same as never charging: it shows on the statement and may take days.
+- Compensations must be **idempotent** and **retryable**: if the refund call times out, you retry until it succeeds. A compensation that can fail permanently leaves the system stuck, so design it to always eventually succeed (or escalate to a human).
+
+It helps to classify steps:
+
+- **Compensatable** steps can be undone (reserve stock, create a pending order).
+- The **pivot** step is the point of no return (for example, the payment capture). Once it succeeds, the saga must go forward.
+- **Retryable** steps come after the pivot and are guaranteed to eventually succeed with retries (send confirmation, update search index).
+
+Ordering steps as "compensatable, then pivot, then retryable" keeps compensations rare and simple.
+
+### Orchestration
+
+In an **orchestrated** saga a central **orchestrator** (a dedicated service or a workflow engine such as Temporal, AWS Step Functions or Camunda) tells each service what to do, waits for the reply, and decides the next step or the compensations.
+
+```
+Orchestrator: CreateOrder  → Order svc     → OK
+Orchestrator: Charge       → Payment svc   → OK
+Orchestrator: Reserve      → Inventory svc → OUT_OF_STOCK
+Orchestrator: Refund       → Payment svc   → OK   (compensate step 2)
+Orchestrator: CancelOrder  → Order svc     → OK   (compensate step 1)
+```
+
+The orchestrator persists the saga's state (which steps are done) so it can resume after a crash.
+
+### Choreography
+
+In a **choreographed** saga there's no central brain. Each service listens for events and reacts:
+
+```
+Order svc     publishes OrderCreated
+Payment svc   hears OrderCreated   → charges → publishes PaymentCompleted
+Inventory svc hears PaymentCompleted → out of stock → publishes StockReservationFailed
+Payment svc   hears StockReservationFailed → refunds → publishes PaymentRefunded
+Order svc     hears StockReservationFailed → cancels order
+```
+
+### Orchestration vs choreography
+
+| | Orchestration | Choreography |
+|---|---|---|
+| Control flow | In one place, easy to read | Spread across services' event handlers |
+| Coupling | Services know the orchestrator's commands | Services only know events |
+| Visibility and debugging | Saga state is in one store | Must reconstruct from events and traces |
+| Adding a step | Change the orchestrator | Add a listener; risk of hidden cycles |
+| Single point of failure | Orchestrator (make it durable and replicated) | None central |
+| Best for | Many steps, complex branching, business-critical flows | Few steps, simple linear flows |
+
+A common rule of thumb: choreography for two or three steps, orchestration once the flow has branches, timeouts and many compensations.
+
+### Making sagas reliable
+
+Sagas trade locks for **messages**, so message reliability becomes the whole game:
+
+- **Transactional outbox.** A service must commit its local change **and** publish its event atomically. Writing the event to an `outbox` table in the same local transaction, then relaying it to the broker, avoids "DB committed but event lost" (the dual-write problem).
+- **Idempotent consumers.** Brokers deliver at least once, so every handler must tolerate duplicates (dedupe on a message id or make the operation naturally idempotent).
+- **Timeouts.** A step that never answers must eventually be treated as failed (and compensated) or retried.
+
+### Isolation anomalies
+
+Sagas give up the **I** in ACID. Between steps, other requests can see intermediate state:
+
+- **Dirty reads**: another user sees an order as PENDING that will be cancelled.
+- **Lost updates**: two sagas both read stock as 1 and both proceed.
+
+Countermeasures are design-level:
+
+- **Semantic locks**: mark records with a pending state (`status = PENDING`) that other operations respect.
+- **Commutative updates**: use increments and decrements rather than read-then-write absolute values.
+- **Reread values** before acting, or use version numbers for optimistic checks.
+- **Reorder steps** so the step most likely to fail runs first, before anything hard to undo.
+
+<Callout kind="remember">
+2PC buys atomicity and isolation by **holding locks across the network** and blocking on coordinator failure. Sagas buy availability and loose coupling by **committing early and compensating later**, which means users can observe intermediate states.
+</Callout>
+
+## Choosing an approach
+
+| Concern | 2PC | 3PC | Saga |
+|---|---|---|---|
+| Atomicity | Strong | Strong (without partitions) | Eventual, via compensations |
+| Isolation | Yes, locks held | Yes | No, intermediate states visible |
+| Blocking on coordinator failure | Yes | No (under timing assumptions) | No |
+| Latency | High, locks across round trips | Higher | Each step is a fast local commit |
+| Availability | Needs all participants up | Needs all up | Steps can be retried later |
+| Works across heterogeneous services and APIs | Rarely | Rarely | Yes |
+| Typical home | Inside a database or tightly controlled cluster | Textbooks | Microservices, long-running business flows |
+
+Questions to ask in a design discussion:
+
+1. **Can the boundary be redrawn** so the data that must change together lives in one service and one database? A single local transaction beats any distributed protocol.
+2. If not, **do you need isolation**, or is a brief intermediate state acceptable? If acceptable, use a saga.
+3. Is the flow **long-running** (minutes to days: bookings, approvals, shipping)? Holding locks that long is impossible; use a saga.
+4. Do all participants live in **one distributed database** that already does 2PC with consensus? Then just use its transactions.
+
+<Callout kind="tip">
+In interviews, "use a saga with an orchestrator, outbox for events, idempotent handlers and explicit compensations" is the expected answer for cross-service business flows like orders, bookings and payments. Mention 2PC's blocking problem to show why you didn't choose it.
+</Callout>
+
+## Cheat sheet
+
+- A distributed transaction needs all-or-nothing across databases no single engine controls.
+- 2PC: prepare (vote, log, hold locks), then commit or abort from the coordinator's logged decision.
+- A YES vote is a durable promise; the participant is in doubt until told the outcome.
+- Coordinator crash after prepare blocks participants with locks held.
+- 3PC adds pre-commit so participants can finish by timeout, but breaks under network partitions.
+- Real systems make 2PC non-blocking by replicating the coordinator with Raft or Paxos.
+- Saga: sequence of local commits with compensations run in reverse on failure.
+- Compensations are new business actions, must be idempotent and retryable.
+- Orchestration centralises flow and state; choreography reacts to events with no central brain.
+- Sagas lose isolation; use pending states, commutative updates and step ordering.
+- Use the outbox pattern and idempotent consumers to make saga messaging reliable.
