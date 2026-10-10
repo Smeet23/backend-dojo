@@ -101,6 +101,8 @@ h3[id] {
   padding: 0.05rem 0.3rem;
   font-weight: 500;
   font-size: 0.875em;
+  /* Long identifiers and URLs must wrap on phones instead of widening the page. */
+  overflow-wrap: anywhere;
 }
 
 .lesson pre {

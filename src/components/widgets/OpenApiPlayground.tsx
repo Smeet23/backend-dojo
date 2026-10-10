@@ -97,12 +97,12 @@ export function OpenApiPlayground() {
       </div>
 
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
-        <div>
+        <div className="min-w-0">
           <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted">openapi.yaml (excerpt)</p>
           <pre className="overflow-x-auto rounded-lg bg-surface-2 p-3 font-mono text-[0.72rem] leading-5">{specYaml(field)}</pre>
         </div>
 
-        <div>
+        <div className="min-w-0">
           <div className="mb-2 flex flex-wrap gap-2">
             <Pill active={tab === "server"} onClick={() => setTab("server")}>Send a request</Pill>
             <Pill active={tab === "client"} onClick={() => setTab("client")}>Generated client</Pill>
