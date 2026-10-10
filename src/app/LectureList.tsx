@@ -35,7 +35,7 @@ export function LectureList() {
               : "bg-surface-2 text-muted";
           const body = (
             <div className="flex items-start gap-3">
-              <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-surface-2 font-mono text-sm font-semibold">
+              <span className="mt-0.5 flex h-8 min-w-8 shrink-0 items-center justify-center rounded-full bg-surface-2 px-1.5 font-mono text-sm font-semibold">
                 {l.id}
               </span>
               <div className="min-w-0 flex-1">

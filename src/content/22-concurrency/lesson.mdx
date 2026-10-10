@@ -1,0 +1,390 @@
+import { ConcurrencyTimeline } from "@/components/widgets/ConcurrencyTimeline";
+import { RaceConditionLab } from "@/components/widgets/RaceConditionLab";
+
+## Why a server must juggle requests
+
+A web server that could handle only **one request at a time** would be useless. While it served one user, the next thousand would wait or get a "server busy" error. Every backend therefore needs a way to work on many requests at once.
+
+Languages and runtimes offer this in very different clothes: threads in Java and Python, `async`/`await` in Node.js and Python, goroutines in Go, virtual threads in modern Java. This lesson builds the **mental model underneath all of them**: what actually happens on the CPU when your server "does many things at once". With it, you can predict how a server behaves under load, debug slowdowns and choose the right tool for a job.
+
+## The idle CPU problem
+
+Follow a typical request through a notes API: the request is parsed and routed, the handler runs, and the repository layer sends a query to the database. Then the server **waits** for the answer.
+
+How long? It depends on where the database is:
+
+| Database location | Round trip for a simple query |
+|---|---|
+| Same machine or local network | About 1–2 ms |
+| Same region, different availability zone | Roughly 1–5 ms, more under load |
+| A different, distant region | 70–150 ms |
+
+Now ask the key question: **what is the CPU doing during that wait?** If the server runs one request at a time, line by line, the answer is **nothing**. It sits idle until the database's reply arrives.
+
+Put numbers on it. A modern CPU core executes on the order of **billions of instructions per second**, or millions per millisecond. A 100 ms wait is hundreds of millions of instructions not executed.
+
+A realistic endpoint makes three to five database queries plus a call or two to Redis or an external API. Say five network calls at about 50 ms each: **250 ms of waiting**, against perhaps **10 ms of actual computation**. Run that one request at a time and the CPU is idle about **95%** of the time.
+
+That waiting is **IO**: **input/output**, any interaction with something outside the CPU and memory. Network calls, database queries, reading and writing files, writing logs to stdout. In a typical backend, most of a request's lifetime is IO.
+
+**Concurrency** is the mechanism that puts the CPU to work on something else while one task waits for IO.
+
+## Concurrency vs parallelism
+
+The two words are often used interchangeably. They mean different things.
+
+**Parallelism** is executing several things **at the same instant**. It needs hardware: one CPU core executes one instruction stream at a time, so running two things in parallel needs at least two cores.
+
+**Concurrency** is **structuring** a program so that several tasks can be in progress at once: each can be started, paused and resumed, and their steps interleave. It works even on a **single core**. At any instant only one task runs, but none of them has to wait for another to finish completely.
+
+<Callout kind="remember">
+Concurrency is about **dealing with** many things at once. Parallelism is about **doing** many things at once.
+</Callout>
+
+### A single-core timeline
+
+Two requests, A and B, arrive together at a server with one core.
+
+```text
+time (ms)  0     5          20             40     50     60
+core       [ A ][     B      ][   (idle)    ]      [ A  ][ B ]
+A          cpu  |---------- waiting for DB ---------|cpu → respond
+B          wait | cpu       |------ waiting for DB ------|  cpu → respond
+```
+
+1. A uses the CPU for 5 ms (parse, validate, build the query), sends its query, and starts waiting.
+2. As soon as A no longer needs the CPU, the **scheduler** gives it to B. B does 15 ms of work, sends its own query, and waits.
+3. A's result arrives around 40 ms. A is now **ready**, but it doesn't run instantly: it runs when the scheduler next gives it the CPU.
+4. A finishes and responds; then B does.
+
+From the outside, both requests were "in progress" at once. Zoom in on any millisecond and only one was running. That's concurrency: no CPU time was wasted on waiting, even with one core. Give the server a second core and A and B could run their CPU work at the same moment: that's parallelism.
+
+## IO-bound vs CPU-bound
+
+| | IO-bound | CPU-bound |
+|---|---|---|
+| Time spent on | **Waiting** for something external | **Computing**: executing instructions |
+| Examples | Database queries, HTTP calls to other services, file reads, sending email, logging | Image and video processing, password hashing, encryption, compression, large JSON parsing, ML inference |
+| What helps | **Concurrency**: do other work while waiting | **Parallelism**: spread the work over more cores |
+
+Some everyday CPU work is so small you never notice it: parsing a 2 KB JSON body or validating a few fields takes microseconds. Other CPU work is substantial: hashing a password with bcrypt deliberately takes tens of milliseconds, and resizing a photo can take hundreds.
+
+**Most backends are IO-bound.** Whether the machine has one core or sixteen, the bottleneck is usually waiting on databases and other services. Real systems need both (concurrency for the IO, parallelism for the occasional heavy computation), but backend work leans heavily toward concurrency.
+
+<ConcurrencyTimeline />
+
+Try it: with IO-bound requests, going concurrent on **one core** cuts the total time dramatically, and a second core adds little. With CPU-bound requests, concurrency on one core barely helps, because there's no waiting to overlap; only the second core makes a real difference.
+
+## Threads
+
+Under all the different language features, there are really only **two** mechanisms for doing many things at once: **threads** and **event loops**. Goroutines, `async`/`await` and virtual threads are all built on one or both.
+
+A **thread** is an independent line of execution managed by the **operating system**. When the OS creates one, it gives it:
+
+- a **stack**, which tracks the chain of function calls (`main` called `handleRequest` called `getUser`) and their local variables, and
+- saved **CPU state**, including the **instruction pointer** (where in the code the thread currently is), so it can be paused and resumed exactly where it left off.
+
+### Scheduling and blocking
+
+The OS **scheduler** decides which thread runs on each core. Each running thread gets a **time slice** (typically a few milliseconds). When the slice ends, the scheduler pauses the thread, saves its state, and switches to another. This is **preemptive** scheduling: threads are interrupted whether they're finished or not.
+
+When a thread makes a **blocking** call, such as reading from a database socket:
+
+1. The thread asks the OS for the data, and the OS marks it **blocked**.
+2. The scheduler runs a different thread on that core.
+3. When the data arrives, the OS marks the first thread **runnable**. It runs again when the scheduler next picks it, not necessarily immediately.
+
+This is how a thread-based server stays productive during IO: each request has its own thread, and while one is blocked, others run.
+
+### Shared memory
+
+Every running program is a **process**, and processes are isolated from each other: one can't read another's memory. **Threads within one process share memory**: the heap, global variables, anything allocated dynamically. If one thread builds an object, another can read it through a reference.
+
+That makes communication between threads fast (no copying, no serialization), and it makes threads dangerous: two threads changing the same data at once is the root of most concurrency bugs, as you'll see below.
+
+On a multi-core machine, threads of one process genuinely run **in parallel**, one per core at any moment. That's why threads are the classic tool for CPU-bound work.
+
+<Callout kind="warn">
+In CPython, the Global Interpreter Lock (GIL) lets only one thread execute Python code at a time, so threads help with IO but not with CPU-bound Python code. For CPU-heavy work, Python uses multiple processes (or a free-threaded build of recent Python versions). In Node.js, CPU-heavy work goes to worker threads.
+</Callout>
+
+### What threads cost
+
+Threads are powerful but heavy:
+
+- **Memory**: each thread reserves a stack. On Linux the default reservation is commonly 8 MB of virtual address space; only the pages actually touched use physical memory, but thousands of threads still add up to real memory and kernel bookkeeping.
+- **Creation**: making a thread is a system call into the kernel, which sets up the stack and registers it with the scheduler. It costs microseconds, which is a lot compared with a function call.
+- **Context switching**, usually the biggest cost: saving one thread's registers, updating the scheduler's bookkeeping, and restoring another's. Each switch takes on the order of **1–10 microseconds**, plus the indirect cost of cold CPU caches. With thousands of threads on a few cores, a noticeable share of CPU time goes into juggling instead of working.
+
+This is why **one OS thread per request** struggles at high concurrency. Real thread-based servers use a **thread pool** of fixed size: requests beyond the pool size wait in a queue for a free thread.
+
+## The event loop
+
+The other mechanism takes the opposite approach: **one thread** handles many tasks by never waiting.
+
+When a task needs IO, it doesn't block. It starts the operation, tells the event loop "**resume me when the result arrives**", and **hands control back**. The loop moves on to other work. The loop runs forever:
+
+1. Ask the OS which pending IO operations have completed.
+2. Queue the tasks waiting on them.
+3. Run their continuations (callbacks), one at a time.
+4. Repeat.
+
+The language can't watch thousands of sockets efficiently by itself. It relies on OS facilities for IO readiness: **epoll** on Linux, **kqueue** on macOS and BSD, and **IOCP** on Windows. Node.js does this through its **libuv** library, which also uses a small thread pool behind the scenes for operations the OS can't do asynchronously, such as many file system calls.
+
+Why is this efficient for IO? Adding threads doesn't make waiting faster; it only adds stacks and context switches. An event loop has **one thread, no context switches between tasks, and no per-task stack**, so it can keep tens of thousands of connections in flight cheaply.
+
+### Never block the loop
+
+The trade-off is strict: **while one callback runs, nothing else does.** Any long synchronous computation freezes every other request on that loop.
+
+```ts
+app.post("/avatar", async (req, res) => {
+  const resized = resizeImageSync(req.body.image); // 300 ms of pure CPU
+  // ...every other request on this server waited those 300 ms
+  res.json({ ok: true });
+});
+```
+
+For a typical SaaS backend this is rarely a problem, because handlers do little CPU work between IO calls. When you do need heavy computation, move it off the loop: a worker thread, a separate service, or a background job.
+
+<Callout kind="remember">
+Golden rule of event-loop runtimes: **never block the event loop.** Any CPU-heavy synchronous work stalls every request on that process.
+</Callout>
+
+### From callbacks to async and await
+
+Early Node.js expressed "resume me later" with **callbacks**:
+
+```js
+function handleRequest(req, res) {
+  db.query("SELECT * FROM users WHERE id = ?", [req.userId], (err, user) => {
+    if (err) return sendError(res, err);
+    sendResponse(res, user);
+  });
+}
+```
+
+Each further IO step nested another callback inside the last, producing deeply indented "callback hell". **Promises** flattened that, and **`async`/`await`** made it read like ordinary sequential code:
+
+```js
+async function handleRequest(req, res) {
+  const user = await db.query("SELECT * FROM users WHERE id = ?", [req.userId]);
+  sendResponse(res, user);
+}
+```
+
+`async`/`await` is **syntactic sugar** over the same mechanism. Everything after an `await`, to the end of the function, is effectively the callback that runs when the awaited operation completes. Every `await` means: "**pause here and give the loop back; resume me when this is done.**"
+
+## Two requests under each model
+
+Walk the same two requests, A (`SELECT` from `users`) and B (`SELECT` from `orders`), through both models.
+
+**Threads:**
+
+1. Thread 1 takes request A, parses and validates it, borrows a database connection from the pool, sends the query and calls `read()` on the socket. The call **blocks**.
+2. The OS switches the core to thread 2, which handles B the same way and also blocks.
+3. If another request arrives and the pool has a free thread, it runs; if not, the request waits.
+4. A's response arrives at the network card. The OS wakes thread 1, which turns the rows into objects, serializes them to JSON, writes the HTTP response, and goes back to the pool.
+
+```python
+def handle_request(request):
+    user = db.query("SELECT * FROM users WHERE id = %s", request.user_id)  # blocks this thread
+    return user  # resumes here when the database answers
+```
+
+The code reads as perfectly sequential. The blocking and the thread switches are invisible, but they happen.
+
+**Event loop:**
+
+1. The loop takes request A, parses it, sends the query, **registers a continuation** and returns to the loop. No response is sent yet.
+2. It takes request B the same way.
+3. It keeps cycling, asking the OS (via epoll or kqueue) which sockets have data, and doing other work in between.
+4. The OS reports that B's socket is readable first, so the loop runs B's continuation and responds. Later it does the same for A.
+
+The steps and results are nearly identical. The difference is **how pausing and resuming happen**: threads use heavyweight OS machinery (saved registers, separate stacks, kernel scheduling), while the event loop uses lightweight continuations inside one thread.
+
+| | OS threads | Event loop |
+|---|---|---|
+| How a task pauses | Blocks; the OS switches threads | Returns to the loop with a continuation |
+| Cost per waiting task | A thread with its own stack | A small object holding the continuation |
+| Parallel CPU work | Yes, across cores | No, one thread (run several processes to use more cores) |
+| Main hazard | Data races on shared memory | Blocking the loop |
+
+## Goroutines and virtual threads
+
+Go takes a third path. Its **goroutines** look like threads to the programmer (write blocking-style code, run thousands at once) but are managed by the **Go runtime**, not the operating system. The general idea is often called **virtual threads** or green threads; Java's virtual threads use the same approach.
+
+Starting one is just the `go` keyword:
+
+```go
+go sendWelcomeEmail(user) // runs concurrently in a new goroutine
+```
+
+Go's standard `net/http` server starts a goroutine for each incoming connection (and for each request stream with HTTP/2), then runs your handler in it. With OS threads that would be reckless; with goroutines it's cheap, because each starts with a stack of just a few kilobytes that grows only as needed.
+
+```go
+func handler(w http.ResponseWriter, r *http.Request) {
+    var name string
+    err := db.QueryRow("SELECT name FROM users WHERE id = $1", id).Scan(&name) // goroutine parks here
+    // meanwhile this OS thread runs other goroutines
+    // ...resume, then write the response
+}
+```
+
+### The Go scheduler
+
+Go maps many goroutines onto a few OS threads (an **M:N** model):
+
+- Underneath are **OS threads**. The number running Go code at once is set by `GOMAXPROCS`, which defaults to the number of available CPU cores.
+- Each of those threads has a **run queue** of goroutines. The runtime scheduler picks goroutines from these queues, and idle threads steal work from busy ones.
+- When a goroutine waits on the network, the runtime **parks** it and runs another goroutine on the same OS thread. Under the hood, Go's network poller uses epoll or kqueue, just like an event loop.
+
+Switching goroutines happens in user space and only saves a few registers, so it's far cheaper than an OS context switch. A Go server can comfortably hold hundreds of thousands of goroutines.
+
+The result: Go gets the event loop's efficiency for IO **and** real parallelism across cores for CPU work, while you write plain sequential-looking code. It's the threading model with an extra layer: the Go scheduler stands in for the OS scheduler, and goroutines stand in for threads.
+
+## Async functions as state machines
+
+Why does `await` only work inside an `async` function? Because marking a function `async` tells the compiler or runtime to transform it into a **state machine** that can stop and restart at each `await`.
+
+```js
+async function fetchUserData(userId) {
+  const user = await db.getUser(userId);       // pause point 1
+  const orders = await db.getOrders(user.id);  // pause point 2
+  return { user, orders };
+}
+```
+
+Conceptually, that becomes:
+
+```js
+function fetchUserData(userId) {
+  let state = 0;
+  let user, orders;
+
+  function step() {
+    switch (state) {
+      case 0:
+        state = 1;
+        return db.getUser(userId).then((r) => { user = r; return step(); });
+      case 1:
+        state = 2;
+        return db.getOrders(user.id).then((r) => { orders = r; return step(); });
+      case 2:
+        return { user, orders };
+    }
+  }
+  return step();
+}
+```
+
+Each `await` is a **state transition**. The local variables that must survive a pause (`user`, `orders`) are stored with the state machine instead of on a thread's stack, which is why paused async functions are so cheap. Between transitions the function isn't running at all, so the event loop is free to run others. Engines differ in the details (Rust and C# generate state machines at compile time; JavaScript engines use resumable coroutines), but the model holds.
+
+It also explains why blocking the loop is fatal: the next state only runs when the loop is free to run it.
+
+## Race conditions
+
+Concurrency brings one big class of bugs, and almost all of them have the same root cause: **shared mutable state**. When two tasks read and modify the same data and their steps interleave, the result depends on timing. That's a **race condition**.
+
+### The lost update
+
+Two threads each run `counter++` on a shared counter that starts at 0. It looks like one operation, but the CPU does three:
+
+1. **Read** the counter into a register.
+2. **Add** 1 to the register.
+3. **Write** the register back.
+
+| Step | Thread A | Thread B | counter |
+|---|---|---|---|
+| 1 | read (0) | | 0 |
+| 2 | | read (0) | 0 |
+| 3 | add, register = 1 | | 0 |
+| 4 | | add, register = 1 | 0 |
+| 5 | write 1 | | 1 |
+| 6 | | write 1 | **1** |
+
+Two increments, final value 1. B's write overwrote A's. This is the **lost update**.
+
+### Async code races too
+
+A common belief is that single-threaded JavaScript with `async`/`await` can't have race conditions. It can, wherever an `await` separates a **check** from an **act**:
+
+```js
+let balance = 100;
+
+async function withdraw(amount) {
+  if (balance >= amount) {           // check
+    await payments.charge(amount);   // yields to the event loop
+    balance -= amount;               // act
+  }
+}
+
+withdraw(100);
+withdraw(100);
+```
+
+1. The first call checks `100 >= 100`, passes, and yields at the `await`.
+2. The second call runs. The balance is still 100, so its check passes too, and it yields.
+3. The first call resumes: the balance becomes 0.
+4. The second call resumes, on a check that is now stale: the balance becomes **-100**.
+
+No two lines ran simultaneously, yet the interleaving broke the invariant.
+
+<RaceConditionLab />
+
+### Fixing races
+
+- **Locks (mutexes)** make a section of code run by **one task at a time**. A task acquires the lock before the critical section and releases it after; others wait.
+
+  ```python
+  import threading
+
+  lock = threading.Lock()
+  counter = 0
+
+  def increment():
+      global counter
+      with lock:  # only one thread inside at a time
+          counter += 1
+  ```
+
+- **Atomic operations** do read-modify-write as one indivisible step, for example atomic counters in Go's `sync/atomic` or Java's `AtomicInteger`.
+- **Message passing** avoids sharing in the first place. In Go, one goroutine owns the value and others send it messages over a **channel**: "don't communicate by sharing memory; share memory by communicating".
+- **Let the database do it.** A backend usually runs several processes on several machines, so an in-memory lock only protects one process. For shared data like balances, make the check and the act a single database operation:
+
+  ```sql
+  UPDATE accounts
+  SET balance = balance - 100
+  WHERE id = 42 AND balance >= 100;
+  -- 0 rows updated means insufficient funds
+  ```
+
+  or lock the row inside a transaction with `SELECT ... FOR UPDATE`.
+
+<Callout kind="tip">
+Whenever you see "read a value, `await` something, then write based on what you read", ask what happens if another request runs in that gap.
+</Callout>
+
+## Choosing a model
+
+| Workload | Examples | Good fit |
+|---|---|---|
+| **IO-bound, high concurrency** | Web servers, API gateways, services that call other services | Event loops with `async`/`await`, goroutines, Java virtual threads |
+| **CPU-bound** | Image and video processing, hashing, compression, number crunching | Parallelism: threads or processes across cores, worker threads, separate services |
+
+Concurrency keeps the CPU productive while tasks wait on IO. Parallelism uses several cores to do more computation at the same instant. Most backend work leans toward concurrency, with occasional CPU-heavy pieces that deserve their own parallel workers. If you can tell which kind of work you're looking at, you can pick the right tool.
+
+For deeper reading on threads, scheduling and locks, *Operating Systems: Three Easy Pieces* is a free and excellent textbook.
+
+## Cheat sheet
+
+- Without concurrency, a typical API server's CPU sits idle most of the time, waiting on IO.
+- **Concurrency** = dealing with many tasks by interleaving them (works on one core). **Parallelism** = doing many at the same instant (needs several cores).
+- **IO-bound** work (DB, network, files) benefits from concurrency. **CPU-bound** work (hashing, image processing) needs parallelism.
+- **OS threads**: own stack, preemptively scheduled; blocking IO parks the thread. Costs: memory, creation, context switches.
+- **Event loop**: one thread, non-blocking IO via epoll/kqueue, continuations. Never block the loop.
+- `async`/`await` is sugar over callbacks; each `await` is a pause point in a **state machine**.
+- **Goroutines** and virtual threads: cheap runtime-managed tasks multiplexed M:N onto OS threads (`GOMAXPROCS` = cores).
+- Threads share memory within a process, which makes **race conditions** possible: `counter++` is read, add, write.
+- Single-threaded async code still races when an `await` separates a check from an act.
+- Fix races with **locks**, atomics, message passing (channels), or a single conditional database update.

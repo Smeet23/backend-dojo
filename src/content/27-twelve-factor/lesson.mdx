@@ -1,0 +1,436 @@
+import { TwelveFactorAudit } from "@/components/widgets/TwelveFactorAudit";
+import { ReleaseLedger } from "@/components/widgets/ReleaseLedger";
+
+## What the twelve factors are
+
+Many habits in this course, such as reading config from environment variables, binding a port, writing logs to stdout, keeping processes stateless and surviving being killed at any moment, come from one short document: **The Twelve-Factor App**.
+
+It is twelve rules, published in 2011 by Heroku, one of the first cloud platforms. The best way to read it is as **a contract between your application and the platform that runs it**. It lists what must be true about your app so that **any machine, any platform and any new teammate** can run, scale and update it without surprises.
+
+Today almost every deployment platform assumes this contract, whether or not it says so: Heroku, Docker, Kubernetes, Render, Railway, Fly.io, Google Cloud Run, AWS App Runner, Vercel, Netlify. Many rules have become so normal that people follow them without knowing where they came from. That's a sign of success. When your app already behaves the way platforms expect, every platform is easy; when it doesn't, you spend your time fighting them.
+
+### What is in scope
+
+The factors apply to **apps that run as a service**: web apps, APIs, workers, anything reached over a network, in any language with any database or queue. They don't apply to desktop or mobile apps.
+
+They also have a narrow focus: the **interface between app and platform**. They aren't a list of everything good in software. DRY, KISS and clean architecture aren't factors, and neither is how to operate Kubernetes or split a system into microservices.
+
+## Why they were written
+
+### Deploying in 2011
+
+Heroku was a **PaaS** (Platform as a Service): you hand over your code and the platform builds it, configures it, connects it to a database and puts it on the internet. Running thousands of apps in many languages gave Heroku's engineers a unique view of what made apps easy or painful to deploy, scale and keep alive. Co-founder **Adam Wiggins** wrote those patterns up and published them at 12factor.net.
+
+The alternative they were reacting to looked like this. You rented a server, or used a machine in the office. You installed the operating system by hand, then the language runtime, then the database and system libraries. You copied the app over FTP and edited config files on the server over SSH.
+
+Every server became a **snowflake**: unique, hand-built and impossible to reproduce exactly. Even with a written runbook, repeating the steps by hand always went wrong somewhere. A new developer needed days to get the app running locally, and it still didn't match production, which is where "works on my machine" comes from. Deployments were events that froze other work.
+
+### Software erosion
+
+The document gives a name to a slow failure mode: **software erosion**. The app gradually stops working even though nobody touched the code:
+
+- the operating system is patched or the distribution upgraded
+- another app on the same server updates a shared library and breaks yours
+- the person who set up the server leaves, taking undocumented manual changes with them
+
+The twelve factors are, at heart, **defences against erosion**. Each one removes a way the environment can silently change underneath your code.
+
+### The document today
+
+The text stayed essentially frozen for years (its footer showed a last update in 2017) while containers, Kubernetes, serverless and managed cloud services took over. In November 2024 Heroku, by then owned by Salesforce, **open-sourced** the manifesto: it moved to a neutral organisation with a governance model and maintainers from other cloud companies, announced at KubeCon. A community revision is being written in the open. It keeps the twelve names and one-line mottos but rewrites each factor as a list of principles, separating the timeless ideas from 2011-specific details. At the time of writing the published site still shows the classic text.
+
+For each factor below you'll get what it means, the problem it solved, and how well it has aged.
+
+## I. Codebase
+
+> One codebase tracked in revision control, many deploys.
+
+### Tracked in revision control
+
+Today this sounds obvious: everything lives in Git on GitHub, GitLab or Bitbucket. In 2011 plenty of production apps were a folder on someone's laptop or a zip called `final_v2_really_final.zip` passed around by email. Writing it down was necessary.
+
+### Many deploys
+
+The interesting half is **many deploys**. A **deploy** is one running instance of the app: production, staging, your laptop, perhaps a preview deploy per pull request. They all come from **the same codebase**. What makes them differ is never the code itself; it's **config** (production talks to a managed database, your laptop to a Postgres container) and **which commit** each one runs.
+
+| Deploy | Running commit |
+|---|---|
+| Repository main branch | 100 |
+| Production, deployed Friday | 97 |
+| Staging, testing tomorrow's release | 99 |
+| Your laptop | 100 plus two unpushed commits |
+
+On release day, staging moves to 100, then production moves to 100. Nothing about the deploys changed except the commit they run. The test: **you should be able to describe every environment as "the same codebase at commit X, with this config".** If you can't, something is drifting.
+
+### Boundaries
+
+- **Several codebases means several apps**, a distributed system. Each app should follow the factors on its own.
+- **Two apps sharing code by copy-paste is a violation.** Shared code should become a **library**, versioned and pulled in through the dependency manager (Factor II).
+
+### Monorepos are fine
+
+People sometimes read this factor as "monorepos are an anti-pattern". They aren't. The rule is a **one-to-one relationship between a codebase and an app**. A monorepo that builds five apps holds five codebases that happen to share a repository, and each can be twelve-factor on its own. What's banned is the reverse: **one app living in two places**, or the same code copied between apps.
+
+## II. Dependencies
+
+> Explicitly declare and isolate dependencies.
+
+### Declare
+
+Keep a file in the repository that lists **completely and accurately** every library the app needs: a **manifest**. Modern ecosystems add a **lockfile** that pins exact versions.
+
+| Ecosystem | Manifest | Lockfile |
+|---|---|---|
+| Node.js | `package.json` | `package-lock.json`, `pnpm-lock.yaml` |
+| Go | `go.mod` | `go.sum` |
+| Python | `pyproject.toml` or `requirements.txt` | depends on the tool, e.g. `uv.lock`, `poetry.lock` |
+| Ruby | `Gemfile` | `Gemfile.lock` |
+
+Without a manifest, onboarding means reading every import, guessing versions and fighting conflicts for days. With one, a single command installs everything. The lockfile makes it stronger still: the manifest says "any 4.x", while the lockfile pins **the exact version of every library, including transitive dependencies**, so a fresh install a year later gets byte-for-byte the same set.
+
+### Isolate
+
+Declaring isn't enough; **nothing may leak in from the machine**. A classic Python failure: `requirements.txt` asks for `requests` 2.x, but the app runs on the system Python, where some other tool installed 1.x. Python finds the system copy first, so the manifest was decoration. Declaring without isolating breaks somewhere; isolating without declaring means nobody can reproduce your setup. The 2011 tools were `bundle exec` for Ruby and `virtualenv` for Python.
+
+The rule covers **system tools** too. Say your notes app makes thumbnails by shelling out to ImageMagick. On a Mac with Homebrew you have ImageMagick 7, whose command is `magick`. On the Ubuntu server, apt installed ImageMagick 6, whose command is `convert` with different defaults. Same code, two different programs, and a major version apart. Never rely on whatever happens to be installed; declare and ship the tool with the app.
+
+### Aged well
+
+**Containers largely solved this factor.** A Docker image freezes not only your libraries but the operating system layer, the system tools and the language runtime. It's declaration and isolation taken as far as they go.
+
+## III. Config
+
+> Store config in the environment.
+
+This is one of the most quoted factors and one of the most argued about.
+
+### What counts as config
+
+**Config is anything likely to differ between deploys:**
+
+- the database URL (a local container vs a managed database reached over a private network)
+- the email provider (a sandbox in development vs the real account)
+- object storage (local MinIO vs Amazon S3)
+- the Redis address, feature toggles, external API keys
+
+Things that *don't* vary per deploy, such as your route table or how modules are wired together, are code, not config.
+
+A sharp test for whether config has leaked into code: **could you open-source your repository right now without exposing a single credential?** Not *would* you, but *could* you. If the answer is no, config is living in code.
+
+### Why environment variables
+
+1. **Easy to change per deploy** without editing any file.
+2. **Hard to commit by accident.** Credentials leak from repositories every day; env vars don't live in the repo.
+3. **A standard at operating-system level.** They work identically for Go, Node, Python, Rust or a shell script.
+
+The alternatives in 2011 were framework-specific files like Java `.properties` or Rails' `config/database.yml`, each with its own format, and sooner or later someone committed one with real passwords in it.
+
+A good pattern is to load all config into **one typed structure at startup**, read from env vars with a common prefix:
+
+```ts
+const config = {
+  port: Number(process.env.NOTES_PORT ?? 8080),
+  databaseUrl: required("NOTES_DATABASE_URL"),
+  redisUrl: required("NOTES_REDIS_URL"),
+  smtpHost: required("NOTES_SMTP_HOST"),
+};
+```
+
+Look at any real project's history and you'll see config **values** change often (new integrations, tuned timeouts, moved hosts) while the code that reads them barely changes. Things that change at different rates shouldn't live in the same place.
+
+### Avoid named environments
+
+The original text warns against grouping config into named bundles like `config/staging.rb` and `config/production.rb`. It doesn't scale. Soon someone needs "staging, but with a different database" for a feature branch, and every new combination means more code. Instead, keep env vars **granular and independent**. You compose a new deploy by **setting values**, not by picking a mode name. The community revision keeps this rule.
+
+### Secrets are the exception
+
+Env vars are fine for a database hostname. For the database *password*, there's a well-known objection, most famously made in 2017 by Diogo Mónica, then security lead at Docker: **the environment leaks.**
+
+- **Child processes inherit the whole environment**, so every command you spawn gets every secret.
+- **Crash reporters and debug pages** often dump all environment variables.
+- On Linux, a process's environment is readable under `/proc` by anyone with enough access, and assorted tools log it.
+
+The stronger pattern is a **secret manager** such as HashiCorp Vault, AWS Secrets Manager or Parameter Store. The app fetches secrets **at boot**, keeps them **in memory**, and the manager handles **rotation** and **audit logs**.
+
+<Callout kind="remember">
+**Separating config from code is non-negotiable.** Env vars are the right default for non-secret config. For secrets, a platform's secret feature that injects env vars is acceptable for a small team and vastly better than committing them; as the team and stakes grow, move to a secret manager.
+</Callout>
+
+## IV. Backing services
+
+> Treat backing services as attached resources.
+
+A **backing service** is anything the app talks to **over the network**: Postgres, Redis, a queue, an SMTP server, S3, a payment provider.
+
+The rule is that your code makes **no distinction between services you run and services someone else runs**. Each is an **attached resource**, reached through a **resource handle** (a URL plus credentials) that lives in config. Swapping the local Postgres container for Amazon RDS, Neon or Supabase should require **changing one env var and zero lines of code**.
+
+A Postgres handle shows how much one string carries:
+
+```text
+postgres://notes_app:s3cret@db.internal:5432/notes
+└scheme┘   └─credentials─┘  └──host───┘ └port┘└db─┘
+```
+
+The scheme says which protocol to speak, then come the credentials, host, port (5432 is Postgres' default) and database name: everything needed to attach.
+
+### Aged very well
+
+In 2011, "the database is someone else's computer, reached by URL" was an unusual stance; most apps ran their database on the same machine as the web server. Today a single box running both is considered a scaling anti-pattern, and managed everything is normal: managed Postgres, managed Redis, S3 for files, an email API instead of your own mail server. This factor was close to a prediction.
+
+## V. Build, release, run
+
+> Strictly separate build and run stages.
+
+### The three stages
+
+| Stage | Input | Output |
+|---|---|---|
+| **Build** | Code at a specific commit, plus its dependencies | A **build**: a Go binary, a Node app with `node_modules`, or most commonly a container image. **Contains no config** |
+| **Release** | A build plus **one deploy's config** | A **release**. The same build with production config is a production release; with staging config, a staging release |
+| **Run** | A release | Running processes |
+
+Deployments start from **commits in version control**, not from files copied over FTP.
+
+### Benefit one, instant rollbacks
+
+Builds are **immutable**, and releases form an **append-only ledger**: each gets a unique ID (an incrementing number or a timestamp) and is never modified after it's created.
+
+| Release | What happened |
+|---|---|
+| 100 | Build of commit 97 with the current config |
+| 101 | The database password was rotated: same build, new config |
+| 102 | New pull requests merged: new build, same config |
+
+Shortly after release 102 goes out, the error dashboard fills with 5xx responses and users complain. Rather than debugging live in production, you **run release 101 again**, and it's live within seconds. Then you investigate 102 calmly. That only works because **release 101 still means exactly what it meant two hours ago**: the same build with the same config. Heroku releases, image tags and Kubernetes rollout history all rely on this.
+
+<ReleaseLedger />
+
+### Benefit two, no editing production
+
+Code can only enter at the build stage, so there's **no path from a running server back into the build**. That kills the snowflake habit of "SSH in, hot-patch a file, reload", which made production and the repository quietly disagree.
+
+The community revision makes one change: immutability, implied in 2011, becomes an explicit principle. **Every release is a unique, immutable snapshot.**
+
+## VI. Processes
+
+> Execute the app as one or more stateless processes.
+
+Processes **remember nothing between requests** and **share nothing** with each other: no shared memory, no shared local disk. Anything that must persist goes to a **stateful backing service** (Factor IV). Assume any request may be handled by any process, and any process may vanish at any moment.
+
+### What is allowed
+
+Memory and local disk are fine as a **scratchpad for a single unit of work**. Downloading an upload to a temp file, resizing it and writing the result to S3 is perfectly fine, because nothing later expects that temp file to exist. The problem only starts when **a future request or another process depends on something staying there.**
+
+### Sticky sessions break the rule
+
+Suppose login sessions live in process memory. With one instance, it works. Scale to three instances behind a load balancer and users get logged out at random: they log in on instance 1, and their next request lands on instance 2, which has never heard of them.
+
+The tempting workaround is **sticky sessions**, where the load balancer pins each user to one instance. The twelve-factor text calls this a violation, and the reasons are practical:
+
+- kill or lose an instance and **every user on it is logged out**
+- add an instance under load and it **receives none of the existing users**
+- you have three instances, but no longer get the benefit of three interchangeable instances
+
+The fix is to treat sessions as the state they are and store them in **Redis or Postgres**.
+
+### When the feature is the state
+
+Real-time connections are the reasonable exception. A WebSocket *is* state held in one process's memory: only the instance holding the socket can push to that user. You still keep everything else stateless and use something like pub/sub to route messages to the right instance. The pragmatic view: statelessness is the default everywhere, and you bend it only when the feature itself is a long-lived connection.
+
+<Callout kind="tip">
+A useful test: **if you can't kill any process at any moment without a user losing data, you have state where it doesn't belong.**
+</Callout>
+
+### Halfway recap
+
+So far: the code lives in **one repository**; dependencies are **declared and isolated**; everything that differs between deploys is in **config**; backing services are **attached by handle**; code reaches production through **build, release, run**; and it runs as **disposable, forgetful processes**.
+
+## VII. Port binding
+
+> Export services via port binding.
+
+In 2011, PHP was everywhere, and a PHP app didn't run itself: **Apache** ran, and loaded PHP as a module. A Java app was a WAR file dropped into **Tomcat**'s folder. The web server was the program and your app was its guest, so the server's version and configuration became part of your app's environment. That's erosion again.
+
+The factor says the app must be **self-contained**: it **brings its own HTTP server as a library** (declared under Factor II) and **exports itself by binding a port** and listening.
+
+```ts
+const port = Number(process.env.PORT ?? 8080);
+server.listen(port, () => console.log(`listening on ${port}`));
+```
+
+In development you hit `localhost:8080`; in production a routing layer or reverse proxy forwards the public hostname to that port. A nice consequence: **any app can become a backing service for another**. Your database, cache and the notes API all bind ports; in production you simply swap handles to point at someone else's port.
+
+### What changed, serverless
+
+A function on AWS Lambda doesn't bind a port: the platform **invokes a function you export**. The 2011 text assumed long-running, port-bound servers would be the only model. The community revision keeps "port binding" in the title but generalises it: the app is self-contained and **exposes its service through a declared interface**, which covers both servers and functions.
+
+## VIII. Concurrency
+
+> Scale out via the process model.
+
+In 2011, scaling depended on the runtime. Java ran one big JVM process that reserved a lot of memory and multiplexed work across threads. PHP did the opposite, with Apache spawning small processes on demand. The factor proposes one model for everything, borrowed from Unix daemons: **the process is the unit of scale**, and you design for many processes from the start.
+
+### Process types
+
+Different work runs as different **process types**:
+
+- **web** handles HTTP requests
+- **worker** handles background jobs such as video encoding or image resizing
+- **clock** or **scheduler** triggers timed work, like a digest email at midnight
+
+Each type **scales independently** by running more copies of itself.
+
+Here's why that matters, using a food-delivery app where each web or worker process needs about 500 MB:
+
+| Lunchtime need: 10 web, 2 workers | Memory |
+|---|---|
+| One combined process type (each copy carries web and worker, about 1 GB), so 10 copies | about 10 GB, half of it idle worker capacity |
+| Separate types: 10 web plus 2 workers | about 6 GB |
+
+At night the shape flips: few orders, but lots of batch jobs, so maybe 5 web and 20 workers. Only separate process types let you follow the load.
+
+The declared mix of types and counts, such as `web=10 worker=2`, is called the **process formation**. A Heroku-style **Procfile** declares the types; in Kubernetes each type is a Deployment with its own `replicas` count.
+
+```text
+web: ./notes-api serve
+worker: ./notes-api work
+clock: ./notes-api schedule
+```
+
+### Threads and daemons
+
+- **Threads aren't forbidden.** JVM threads, goroutines and Node's event loop all handle concurrency inside a process. But one machine can only grow so far, while share-nothing processes scale across machines, so the **process** is what you scale.
+- A twelve-factor app **never daemonises itself and never writes PID files**. It runs in the foreground, and the platform (Kubernetes, systemd, a process manager) starts, restarts and stops it.
+
+### Aged by adoption
+
+Most of the internet now runs on orchestrators: you declare a formation and the platform maintains it. The factor isn't outdated; it was **adopted so thoroughly** that it's invisible, unless you deploy straight onto a VM with systemd, where it's still your job.
+
+## IX. Disposability
+
+> Maximise robustness with fast startup and graceful shutdown.
+
+Processes should be **disposable**: they can be started or stopped at a moment's notice, and nothing bad happens either way. The platform does this constantly. Autoscaling starts processes; every deploy kills old ones and starts new ones; orchestrators move processes between machines whenever they like. Five deploys a week across ten instances is fifty stops and fifty starts before any autoscaling. **A process dying isn't an incident; it's part of the release cycle.**
+
+### Fast startup
+
+If a process takes 60 seconds to boot, a rolling deploy of ten instances takes about ten minutes, and the autoscaler is a minute late for every traffic spike. At 2 seconds, neither matters. Aim for **a few seconds**.
+
+### Graceful shutdown
+
+A careless shutdown fails every in-flight request on every deploy. The platform sends **SIGTERM** first and gives the process a grace period (often about 30 seconds):
+
+- A **web process** should **stop accepting new requests, finish the in-flight ones, then exit**.
+- A **worker** should **return its current job to the queue** rather than drop it.
+
+```ts
+process.on("SIGTERM", async () => {
+  server.close();          // stop accepting, let in-flight requests finish
+  await worker.requeueCurrentJob();
+  await db.end();          // close the connection pool
+  process.exit(0);
+});
+```
+
+Returning a job to the queue is only safe if jobs are **re-entrant**: an interrupted job leaves no half-done state, so running it again is safe. You get that by wrapping the work in a **transaction** or by making it **idempotent** (it detects work already done and skips it).
+
+### Sudden death
+
+SIGTERM is the polite case. A hardware failure or an **out-of-memory kill** comes with no warning at all, so design for a process dying mid-instruction. The original text points to **crash-only design**: if the system recovers correctly from crashes, you barely need a separate shutdown path, because **the crash path is the shutdown path**.
+
+## X. Dev/prod parity
+
+> Keep development, staging and production as similar as possible.
+
+The document names three gaps between development and production:
+
+| Gap | Traditional app | Twelve-factor app |
+|---|---|---|
+| **Time** | Code written today reaches production weeks later, bundled with everyone else's changes | Deployed within hours |
+| **Personnel** | Developers write it, ops deploy it, someone else sees the errors | The people who write the code deploy it and watch its logs |
+| **Tools** | Different stack locally (a laptop OS, lighter services) than on Linux in production | Environments as similar as possible |
+
+Close all three and continuous deployment becomes routine. CI/CD and DevOps culture largely closed the time and personnel gaps. **The tools gap is the one that persists.**
+
+### The SQLite trap
+
+A common shortcut is SQLite locally and Postgres in production, made easy by ORMs such as Prisma, Drizzle, GORM or SQLAlchemy that hide the difference. Here's one way it bites. In Postgres, `LIKE` is **case-sensitive** (`ILIKE` is the insensitive version). In SQLite, `LIKE` is **case-insensitive for ASCII letters by default**. The note search you built and tested locally finds "Groceries" when someone types "groceries"; in production it doesn't.
+
+The dangerous part: **no error, no warning, no log**. Just different behaviour.
+
+<Callout kind="warn">
+Use the **same kind of backing services** (database, cache, queue) in development, staging and production. Starting a Postgres or Redis container is one command; the shortcut isn't worth it.
+</Callout>
+
+### Managed services and parity
+
+Containers briefly made local and production almost identical. Then teams moved to proprietary managed services such as DynamoDB that can't truly run on a laptop. Emulators like LocalStack mimic the documented behaviour, but they aren't the real implementation, so some gap remains. That's not a reason to avoid managed services, which bring real scaling and operational benefits. It's a **conscious trade-off**: accept the parity gap when the benefit is worth it, and cover it with tests against the real service in staging.
+
+## XI. Logs
+
+> Treat logs as event streams.
+
+Traditionally a log was a file. This factor reframes it: the file was only ever one place to put the log. **A log is a time-ordered stream of events** that flows for as long as the app runs, with no fixed beginning or end.
+
+So the app **should not route or store its own logs**: no log file paths, no log rotation logic. It writes each event, **unbuffered, to stdout**, and the execution environment captures the stream and decides where it goes.
+
+```json
+{"ts":"2026-03-02T10:15:04Z","level":"info","msg":"note created","noteId":"n_81","userId":"u_7","ms":12}
+```
+
+### Why stdout
+
+1. **Routing logs is a deployment concern, not an app concern.** The app shouldn't change per environment. In 2011 stdout went to syslog; today it goes to Loki, Datadog or CloudWatch. Same app, different plumbing.
+2. **Streams compose; files don't.**
+   - On your laptop, you watch the stream live in the terminal.
+   - In a container, the runtime captures it, tags it with which container produced it, and hands it to a collector.
+   - In production, the platform **merges every instance's stream into one time-ordered stream**, so you reason about *when* something happened instead of hunting through files on each instance.
+
+### What it leaves out
+
+Modern **observability** means logs, **metrics and traces**. The 2011 text mentions only logs because metrics and tracing weren't common practice yet. Treat them as additions that follow the same spirit (emit, and let the platform collect), not as something the factor forbids.
+
+## XII. Admin processes
+
+> Run admin and management tasks as one-off processes.
+
+A **one-off process** runs once, alongside the long-running processes, and then exits. Typical examples are a **database migration** or a script that fixes bad data in production.
+
+The rule: run it in an **identical environment** to the app's regular processes, with the **same codebase at the same commit**, the **same config** and the **same dependency isolation**. The script ships with the code it belongs to.
+
+Why so strict? The old habit was to SSH into the production server and type an `UPDATE` or `DELETE` by hand. No code review, no record of what ran, no logs, and production drifted away from what the code and docs said. A committed script run as a one-off process is reviewed, repeatable and visible.
+
+```bash
+# Same image, same config as the web process, then it exits
+docker run --rm --env-file /etc/notes/release-102.env notes-api:release-102 ./notes-api migrate
+```
+
+**Database migrations** are the canonical example: they live in the repository, ship with the release, and run as a one-off step before the new version starts serving.
+
+## The factors together
+
+Picture the notes app running on a single Linux server under a process manager that reads a Procfile:
+
+1. The process manager starts the **formation** from the Procfile (Factor VIII).
+2. The web process checks the database schema, starts its background job runner, then **binds its assigned port** (VII), with every log line going to **stdout** (XI).
+3. In another terminal, a **one-off** auto-archive job runs from the same code and the same config, then exits (XII).
+4. Press Ctrl+C: the connection pool closes, the job runner waits for in-flight jobs to finish, and the process exits cleanly (IX).
+
+Now test yourself. Each finding below, from an app you've just inherited, breaks exactly one factor.
+
+<TwelveFactorAudit />
+
+## Cheat sheet
+
+- The twelve factors are a 2011 contract between an app and its platform, written to stop snowflake servers and software erosion.
+- I Codebase: one repo per app, many deploys that differ only by commit and config; share code via libraries, not copy-paste; monorepos are fine.
+- II Dependencies: declare them (manifest plus lockfile) and isolate them, including system tools; container images do both.
+- III Config: anything that varies per deploy goes in granular env vars, never named environment bundles; secrets go in a secret manager.
+- IV Backing services: every database, cache, queue or API is attached by a URL handle in config and swappable without code changes.
+- V Build, release, run: build is code plus dependencies, release is build plus config, releases are immutable so rollback is instant.
+- VI Processes: stateless and share-nothing; sticky sessions are a violation; store sessions in Redis or Postgres.
+- VII Port binding: the app brings its own HTTP server and binds a port; serverless generalises this to a declared interface.
+- VIII Concurrency: scale by running more processes of each type (web, worker, clock); never daemonise or write PID files.
+- IX Disposability: boot in seconds, drain on SIGTERM, requeue jobs, make jobs re-entrant and survive sudden death.
+- X Dev/prod parity: close the time, personnel and tools gaps; never SQLite locally with Postgres in production.
+- XI and XII: logs are unbuffered stdout streams the platform routes; admin tasks run as one-off processes from the same code and config.

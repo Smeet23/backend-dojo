@@ -1,0 +1,697 @@
+import { DockerLayerCache } from "@/components/widgets/DockerLayerCache";
+import { DeployStrategySim } from "@/components/widgets/DeployStrategySim";
+import { ErrorBudgetMeter } from "@/components/widgets/ErrorBudgetMeter";
+
+## Why DevOps exists
+
+Everything you've built so far probably runs on one machine and answers on `localhost`. Nobody else can reach it. This lesson covers the journey from **a commit on your laptop** to **a service running on the internet that stays up while you change it every day**. That journey, and the practices around it, is what people call **DevOps**: development plus operations.
+
+The goal here is a mental model. You won't master Kubernetes or Terraform from one lesson, but you'll know what each piece does, why it exists, and where it fits, so docs and job descriptions stop sounding like noise.
+
+### Dev versus ops
+
+For a long time, software companies had two separate teams with opposite incentives:
+
+| | Development team | Operations team |
+|---|---|---|
+| Job | Write code, ship features | Run servers, deploy, monitor, answer alerts |
+| Judged by | How fast features reach users | How rarely production goes down |
+| Wants | As many deploys as possible | As few deploys as possible, since every change is a risk |
+
+When production broke, developers blamed the infrastructure and ops blamed the code. The usual compromise was a release every week or two, with a stressful "release day" where everyone coordinated a long manual procedure.
+
+### The fix is small, boring deploys
+
+DevOps is a set of practices that removes the conflict instead of refereeing it:
+
+- **Infrastructure written as code** instead of servers configured by hand.
+- **One shared version control system** for application code and infrastructure configuration.
+- **One command to build and one to deploy**, not a checklist.
+- **Feature flags**: turn features on or off from a central place (a database row, a config service) without redeploying.
+- **Shared observability**: developers see the same logs, metrics and alerts as operators, so they can watch how their code behaves in production.
+
+The common thread: make deploying **small, cheap and boring**. When a deploy is one merge that takes minutes, nobody hesitates to do it several times a day.
+
+## Measuring delivery with DORA
+
+The DORA research program surveyed tens of thousands of teams over many years and settled on four metrics:
+
+| Kind | Metric | Example |
+|---|---|---|
+| Speed | **Change lead time** | Merged at 9:00, live for users at 11:00: two hours |
+| Speed | **Deployment frequency** | How often you deploy to production |
+| Stability | **Change failure rate** | 4 of 100 deploys caused a problem: 4% |
+| Stability | **Failed deployment recovery time** | How long it takes to recover when a deploy goes wrong |
+
+In the 2024 report, the top group (roughly a fifth of teams) deployed on demand, had lead times under a day, a failure rate around 5% and recovered in under an hour. The bottom group deployed every one to six months, failed around 40% of the time and took about a week to recover.
+
+The striking finding is that **speed and stability are not a trade-off**. The teams that deploy most often are also the most stable. Why?
+
+- A monthly release bundles hundreds of commits from a dozen people. When it breaks (and some will), finding the guilty change can take a day, and the fix ships in another big, risky release.
+- A per-commit deploy contains **one change from one person**, written hours ago. If it breaks, the cause is obvious and the author still remembers the code, so the fix is quick.
+
+<Callout kind="remember">
+Make deployments as small and as frequent as you can. Smaller changes are easier to review, easier to debug and easier to roll back.
+</Callout>
+
+## Continuous integration
+
+**Continuous integration (CI)** means every developer merges their work into one shared branch **at least once a day**, and every merge is checked by an **automated build that runs the test suite**.
+
+People often say "CI" when they mean the server that runs the tests (GitHub Actions, GitLab CI, Jenkins). Strictly, CI is the **practice** of integrating often; the server just enforces the checks. A CI server can't make anyone merge daily.
+
+Why daily? Two engineers working three weeks on separate long-lived branches drift apart, and merging becomes hours of conflict resolution where neither remembers why the other changed things. With daily merges, the drift is a day of fresh work and conflicts take minutes.
+
+### Trunk-based development
+
+Two branching models dominate:
+
+| Model | Shape | Fits |
+|---|---|---|
+| **Git Flow** | `develop`, `release/*`, `hotfix/*` and `main` for finished releases | Software shipped as installed versions (desktop, mobile, on-premise) where you support v2 while building v3 |
+| **Trunk-based** | One `main` plus short-lived branches (a day or two), deleted after merge; releases come from `main` | Web apps and backends, where only one version (the latest) runs in production |
+
+Even Git Flow's author later recommended that teams continuously delivering web apps use something simpler. For a backend, trunk-based is the default.
+
+What about a feature that takes three weeks? Merge it in small pieces every day or two anyway, deploy them, and keep the unfinished feature **behind a feature flag** so users can't reach it until it's ready. Merging and releasing become separate decisions.
+
+## Reproducible builds
+
+A **build** turns source code into something runnable: it compiles, downloads dependencies, and packages everything into an **artifact** (a binary, a bundle, a container image).
+
+A good build is **reproducible**: it doesn't depend on whatever happens to be installed on the machine running it. It declares the exact compiler and dependency versions, so the same source produces the same output every time, on any machine.
+
+The **lock file** is what makes that possible:
+
+- **Go**: pin the Go version and commit `go.sum`.
+- **Node**: commit `package-lock.json` and install with `npm ci`, which installs exactly what the lock file says (unlike `npm install`, which may update it).
+- Python, Rust and others have equivalents (`poetry.lock`, `uv.lock`, `Cargo.lock`).
+
+Also **stamp the commit hash into the artifact** at build time, so a running process can tell you exactly which code it's running.
+
+## The deployment pipeline
+
+Build plus test plus release forms a **deployment pipeline**: a sequence of stages every change passes through, the last of which puts it in production.
+
+Order the stages from **cheapest and fastest** to **slowest and most expensive**:
+
+1. **Compile and unit tests** (a few minutes). If anything fails, stop immediately and tell the developer.
+2. **Integration tests** against real databases and services, deploy to a **staging** environment, maybe a manual check.
+3. **Release to production.**
+
+Fast feedback first means most broken changes are rejected in minutes, before they waste time on the expensive stages.
+
+### GitHub Actions in five words
+
+| Term | Meaning |
+|---|---|
+| **Workflow** | A YAML file in `.github/workflows/` that says when to run and what to run |
+| **Event** | The trigger: push, pull request, schedule, manual click |
+| **Job** | A group of steps that run on one machine. Jobs run in parallel unless one `needs` another |
+| **Runner** | The machine: a fresh VM from GitHub that's thrown away after the job, or your own self-hosted one |
+| **Step** | One command or reusable action inside a job |
+
+Because runners start empty every time, every job starts by **checking out** the code and installing tools (or restoring them from a cache).
+
+```yaml
+name: ci
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.23.4" }
+      - run: go test ./...
+  build:
+    needs: test            # waits for test to pass
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: go build -ldflags "-X main.commit=${{ github.sha }}" -o notes-api
+      - uses: actions/upload-artifact@v4
+        with: { name: notes-api, path: notes-api }
+```
+
+### Cloud credentials with OIDC
+
+At some point the pipeline must touch your cloud account: push an image, update a cluster. GitHub and AWS are different companies, so the pipeline needs credentials.
+
+The old way is to paste a long-lived access key into **repository secrets**. It's stored encrypted and masked in logs, but every job and third-party action in the workflow can read it, and if it leaks it works **from anywhere until someone rotates it**.
+
+The better way is **OIDC (OpenID Connect)**:
+
+1. When a job starts, GitHub's identity provider issues a **short-lived signed token** describing the job: "repository acme/notes, branch main, workflow deploy".
+2. You've configured AWS (or GCP, Azure) to trust tokens signed by GitHub **only if** those claims match your repository and branch.
+3. AWS verifies the signature and claims and hands back **temporary credentials** that expire shortly after the job ends.
+
+No permanent cloud credentials are stored anywhere, and a token stolen from a fork or another branch is useless.
+
+### Versioning a service
+
+Libraries use **semantic versioning** (`MAJOR.MINOR.PATCH`) because the version is a message to their users: patch for fixes, minor for new compatible features, major for breaking changes.
+
+A **deployed service** is different. Its users are HTTP clients who never see a deployment version (API versioning like `/v2/notes` is a separate concern). The deployment version is for **you**, and the most useful version is the **commit hash** of `main`, sometimes plus a build number. Use it as:
+
+- the stamp inside the artifact,
+- the **container image tag**,
+- a field on a health or info endpoint, so after a deploy you can confirm production runs the commit you expect.
+
+## Why containers
+
+"It works on my machine." You copy a Go binary to the server and it crashes because the server has an older system library, a different certificate bundle, or no time-zone database. Or you developed against Node 22 and the server has Node 18.
+
+The fix is to **ship the environment with the code**: not a whole operating system, but the runtime, libraries, files and exact versions your process needs, packaged as one unit that behaves the same on your laptop, a data-centre server or a cheap VPS. That unit is a **container**: a process with **its own filesystem** that sees only a small slice of the machine.
+
+## Containers vs virtual machines
+
+A container is **not** a small virtual machine.
+
+| | Virtual machine | Container |
+|---|---|---|
+| What it is | Virtualized hardware running a complete guest OS | An ordinary process on the host |
+| Kernel | Its own kernel | **Shares the host's kernel** |
+| Isolation | Very strong | Lighter, provided by kernel features |
+| Cost | Gigabytes of RAM, its own disk, slow boot | Megabytes, starts in milliseconds |
+| Visible from the host | No, just one VM process | Yes, it appears in the host's `ps` |
+
+The **kernel** is the core of the operating system: it manages processes, memory, files and the network. What makes a process a container is **special treatment from the host kernel**: the illusion of its own machine (its own process IDs, hostname, root filesystem and network interfaces) plus **limits** on how much memory and CPU it can use.
+
+Three Linux kernel features provide that: **namespaces**, **control groups** and **layered filesystems**.
+
+## Namespaces
+
+A **namespace** wraps a global resource of the machine so that a group of processes sees its own private copy of it. Namespaces control **what a process can see**.
+
+| Namespace | Isolates |
+|---|---|
+| PID | Process IDs. Inside, your process sees itself as PID 1 and sees only its children |
+| UTS | Hostname |
+| Mount | The table of mounted filesystems |
+| Network | Interfaces, ports, routing tables, so two containers can both listen on port 80 |
+| IPC | Shared memory and message queues |
+| User | User and group IDs, so "root" inside can map to an unprivileged user outside |
+| Cgroup | The view of the cgroup hierarchy |
+| Time | Certain system clocks |
+
+Only the kernel can create namespaces, so programs ask through three **system calls**:
+
+- `clone` creates a new process, with flags that place it in new namespaces.
+- `unshare` moves the calling process into new namespaces.
+- `setns` joins an existing namespace (this is how `docker exec` gets a shell "inside" a running container).
+
+Every container tool, from Docker to Kubernetes, is built on these three calls. You can write a toy container in about 70 lines of Go: the program calls `clone` with `CLONE_NEWUTS | CLONE_NEWPID | CLONE_NEWNS`, re-runs itself as a child, sets the hostname to `container`, uses `chroot` to make a folder containing an Ubuntu filesystem its root, mounts a fresh `/proc`, and starts a shell. Inside, `hostname` prints `container` and `ps` shows only a couple of processes. On the host, `pstree` shows that same shell as an ordinary process with an ordinary PID.
+
+## Control groups
+
+Namespaces limit what a process **sees**, not how much it **uses**. A container that can only see its own processes can still eat all the host's memory. **Control groups (cgroups)** enforce resource limits.
+
+A cgroup is just a **directory** under `/sys/fs/cgroup`. Creating a directory creates a group, and the kernel fills it with plain files:
+
+- Write to `memory.max`, `cpu.max` or `pids.max` to set a limit shared by every process in the group.
+- Write a PID into `cgroup.procs` to put that process in the group.
+
+```bash
+mkdir /sys/fs/cgroup/notes-api
+echo 536870912 > /sys/fs/cgroup/notes-api/memory.max   # 512 MB
+echo $PID      > /sys/fs/cgroup/notes-api/cgroup.procs
+```
+
+If a process in the group tries to go past `memory.max`, the kernel's **OOM killer** terminates it, and the kernel log says exactly why. When Kubernetes shows a container as `OOMKilled`, this is what happened: the memory limit in your pod spec was written into `memory.max`, and the process crossed it.
+
+## Layers and images
+
+A filesystem for a container might be 100 MB of Ubuntu files. Copying that for every container would be wasteful, so container filesystems are built from **layers**.
+
+A **layer** is a tarball of changes: these files added, these modified, these deleted. An **image** is a stack of layers. At runtime, Linux's **OverlayFS** stacks them into one view:
+
+- The image layers are **read-only lower directories**; the container gets one thin **writable upper directory**.
+- A **read** finds the file in the topmost layer that has it.
+- A **write** copies the file up into the writable layer and modifies it there (**copy-on-write**). The image layers never change.
+
+So ten containers from the same image share every image layer and each adds only a small writable layer. When a container is removed, its writable layer goes with it, which is why container filesystems are **disposable**: anything you need to keep belongs in a database, object storage or a mounted volume.
+
+### What is inside an image
+
+A **blob** is opaque binary data that only makes sense as a whole (a PDF, a video, a compressed tarball). An image is a few small documents plus layer blobs:
+
+| Piece | Contents |
+|---|---|
+| **Layer blobs** | Compressed tarballs, each identified by the SHA-256 hash of its bytes |
+| **Config** (JSON) | The ordered list of layers plus start settings: command, env vars, working directory, exposed ports |
+| **Manifest** (JSON) | Points to the config and each layer, with sizes and hashes |
+| **Digest** | The hash of the manifest: the image's true identity |
+
+Because everything is addressed by hash, two images that share a base layer share it **by hash**, and a registry or server stores it once. Change one line in a Dockerfile and only the layers from that line onward get new hashes. Tags like `node:22.11-slim` or `notes-api:3f9c2e1` are just movable names **pointing to a digest**.
+
+A good analogy: an image is like a **Git commit for a filesystem**: content-addressed, immutable, built on top of earlier snapshots.
+
+## Writing a good Dockerfile
+
+A **Dockerfile** is the recipe for the layers. Each instruction that changes the filesystem produces one layer:
+
+- `FROM` picks the base image.
+- `COPY` adds files.
+- `RUN` executes a command and captures the resulting changes.
+
+The builder **caches each layer** keyed by its instruction and inputs. On the next build it reuses layers from the top **until it reaches the first instruction whose inputs changed**, and **rebuilds everything after that**. So instruction order matters a lot.
+
+The classic mistake is copying the whole project before installing dependencies. Any code edit changes the `COPY . .` layer, which invalidates the dependency install after it, so every build reinstalls everything. Instead, copy only the dependency manifest, install, **then** copy the source:
+
+```dockerfile
+FROM node:22.11-slim
+WORKDIR /app
+COPY package.json package-lock.json ./   # changes rarely
+RUN npm ci                               # cached until dependencies change
+COPY . .                                 # changes many times a day
+RUN npm run build
+USER node
+CMD ["node", "dist/server.js"]
+```
+
+The same trick applies to `go.mod`, `requirements.txt`, `Cargo.toml` and friends. Code changes dozens of times a day while dependencies rarely do, so builds drop from a minute to seconds.
+
+<DockerLayerCache />
+
+### Multi-stage builds
+
+For compiled languages like Go and Rust, the compiler and build tools are needed to build but not to run. A **multi-stage build** uses one stage with the full toolchain to compile, then starts a fresh, tiny stage and copies **only the binary** across:
+
+```dockerfile
+FROM golang:1.23.4 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /notes-api
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /notes-api /notes-api
+USER nonroot
+ENTRYPOINT ["/notes-api"]
+```
+
+The final image contains your binary and almost nothing else: smaller downloads, fewer packages to patch, less for an attacker to use.
+
+## Registries
+
+A **registry** is where images live. You **push** after building and **pull** before running, because the machine that builds the image is usually not the one that runs it.
+
+A registry is simply an **HTTP server** with two kinds of objects:
+
+- **Blobs** (layers and configs), fetched **by digest**.
+- **Manifests**, fetched **by tag or digest**.
+
+On **push**, the client uploads only the blobs the registry doesn't already have (checked by hash), then the config, then the manifest. On **pull**, it fetches the manifest, reads the layer digests and downloads only the layers missing locally. That's why pulling a new version after a small code change takes seconds: only the top layer is new.
+
+Docker Hub, GitHub Container Registry and the AWS, GCP and Azure registries all work this way, and you can run your own registry as a container.
+
+## What docker run actually does
+
+Typing `docker run` passes through several programs:
+
+```text
+docker        the CLI, talks to the daemon over a socket
+  dockerd     the Docker daemon: API, builds, networks, volumes
+  containerd  image and container lifecycle: pulls layers, sets up the overlay mount
+  runc        reads a JSON container spec, makes the clone/unshare calls,
+              writes the cgroup files, switches root, execs your process, then exits
+  shim        a tiny process that stays behind as the container's parent
+```
+
+The shim exists so containers keep running even if containerd or dockerd restarts, and so something is there to collect the exit code.
+
+Why so many layers? The **Open Container Initiative (OCI)** standardizes three things: the **image format**, the **runtime spec** (how to tell a runtime to run a container), and the **distribution spec** (how registries serve images). Because of those standards, an image built with Docker runs on a Kubernetes cluster with no Docker installed: Kubernetes talks to containerd through the **Container Runtime Interface (CRI)**, and containerd uses runc. Underneath, runc makes the same namespace system calls as the 70-line toy.
+
+### A good production image
+
+| Property | Why |
+|---|---|
+| **Small** | Less to download per deploy, fewer packages that can have vulnerabilities |
+| **One process** | Just your service; no init system or cron inside. Restarts are the orchestrator's job |
+| **Non-root** | If your code is exploited, the attacker doesn't start as root |
+| **Pinned** | A specific base image version, never `latest`, so the build is the same next month |
+| **Scanned** | New vulnerabilities in base images and packages are published every week; a scanner matches your image's package list against them |
+
+### Buildpacks
+
+Platforms like Render, Railway and Heroku can deploy straight from a Git commit **without a Dockerfile**. **Buildpacks** (or Nixpacks) detect the language from files like `package.json`, `go.mod`, `requirements.txt` or `Cargo.toml` and build an image with a tuned recipe for that language. You get a sensible image without writing one.
+
+## Running on one machine
+
+Running a service on a single Linux server comes down to three things:
+
+1. A **process** that starts at boot and **restarts if it dies**.
+2. A **reverse proxy** on ports 80 and 443 that **terminates TLS** and forwards to your service's port.
+3. **Logs** going somewhere you can read them.
+
+On every mainstream Linux distribution, the first and third are handled by **systemd**, the init system. A unit file says what to run, as which user, and what to do when it exits:
+
+```ini
+[Unit]
+Description=Notes API
+After=docker.service
+
+[Service]
+User=deploy
+ExecStart=/usr/bin/docker run --rm --name notes-api -p 127.0.0.1:8080:8080 notes-api:3f9c2e1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The process's stdout goes to the **journal**; read it with `journalctl -u notes-api`. If the process crashes, systemd restarts it after the delay.
+
+A request's path to your code is: **DNS** resolves the domain to the server's IP, the **firewall** lets ports 80 and 443 through, the **reverse proxy** (Nginx or Caddy) handles TLS, and forwards to the **process**.
+
+### TLS with ACME
+
+Getting HTTPS certificates used to mean buying them and installing them by hand every year. Today it's an automated protocol, **ACME**, and **Let's Encrypt** is a free certificate authority that runs it at enormous scale:
+
+1. Your server's ACME client generates a key and asks for a certificate for `api.notes.dev`.
+2. The CA replies with a **challenge**: serve this random token at a specific URL on port 80, or publish it as a DNS TXT record.
+3. The client does so. The CA fetches the token from **several vantage points** on the internet and concludes you control the domain.
+4. The client sends a certificate signing request (CSR) and receives a certificate valid for **90 days**.
+
+Short lifetimes are deliberate: clients renew automatically (around day 60), so nobody has to remember, and a stolen key is only useful for weeks. **Caddy** has ACME built in; this is a complete config:
+
+```text
+api.notes.dev {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+## Many machines and immutable infrastructure
+
+As traffic grows you **scale horizontally**: more servers rather than a bigger one. Now every deploy has to build once, ship to three machines, start the new version, stop the old one, and do it with **zero downtime**.
+
+Tools like **Kamal** do this over SSH from your laptop or CI:
+
+1. SSH into each host and install Docker if it's missing.
+2. Log in to the registry, build the image and push it.
+3. On each host, pull the image and **start the new container alongside the old one**.
+4. Wait until it's **healthy**, by polling an unauthenticated `/health` endpoint that returns 200.
+5. Tell the reverse proxy to send traffic to the new container.
+6. Stop the old container.
+
+All of this still treats machines as **precious**: someone patches them, logs in to fix things, tweaks a config file. Over time each server becomes a **snowflake**: unique, undocumented, understood by one or two people. When those people leave, the knowledge leaves too.
+
+The cure is **immutable infrastructure**: a server is never modified after it starts, only **replaced**. If you have four instances, never SSH into one and change it; that instance now **drifts** from the others. Change the code or config in Git and redeploy, which replaces the instances. Containers made this cheap, because the thing you replace is an image, not a whole hand-built server. Everything that follows assumes servers are cheap and replaceable.
+
+## Kubernetes
+
+Now imagine 40 containers across 10 machines. Which container runs where? When a machine dies, who notices and moves its containers? Who adds copies when traffic doubles? Who replaces all 40 in a safe order on deploy? That's the job of an **orchestrator**, and the best known is **Kubernetes**, the open-source descendant of the system Google ran internally for years.
+
+### The declarative model
+
+You don't tell Kubernetes **what to do**. You describe the **desired state** ("three copies of this image, on this port, with this much memory") and Kubernetes works out the steps.
+
+The engine behind this is the **controller**: a loop that compares desired state with actual state and fixes the difference. You want three replicas and two are running, so it starts one. A machine dies and you're back to two, so it starts another. It never stops checking.
+
+### Architecture
+
+| Component | Role |
+|---|---|
+| **API server** | The front door for everything; the only component that talks to the store |
+| **etcd** | A distributed key-value store holding the cluster's desired and current state |
+| **Scheduler** | Picks a node for each new pod based on resources and constraints |
+| **Controller manager** | Runs the built-in control loops (replicas, nodes, endpoints...) |
+| **kubelet** (every node) | Asks the API server what should run on its node and runs it via the container runtime |
+| **kube-proxy** (every node) | Programs the node's networking so Service addresses reach the right pods |
+
+The first four make up the **control plane**; the **nodes** are the machines that run your workloads.
+
+### Core objects
+
+- **Pod**: one or more containers scheduled together on one node, sharing a network namespace (same IP, same `localhost`) and volumes. Usually it's just your container; the extra slot exists for **sidecars**, such as a log shipper reading the same files or a proxy on the same localhost. The pod is the unit that gets scheduled, gets an IP and gets killed. Each pod has its own IP, so many pods can listen on 8080. Pods are disposable: if a node dies, its pods are gone and replacements are created elsewhere. Never create pods by hand.
+- **Labels**: key-value tags like `app=notes-api` or `track=canary`, used to group and select objects.
+- **ReplicaSet**: a controller that keeps N identical pods running.
+- **Deployment**: owns ReplicaSets. When you change its pod template (for example a new image), it creates a new ReplicaSet and shifts the replica count across. **You write Deployments, not ReplicaSets.**
+- **Service**: a **stable virtual IP and DNS name** in front of all pods matching a label selector. Pods come and go and their IPs change; the Service name stays. Other services call `http://notes-api`.
+- **Ingress / Gateway API**: maps **hostname and path to a Service** for traffic from outside, by configuring a real load balancer. Gateway API is the newer, more expressive successor to Ingress.
+
+The full picture: domain, load balancer, Service, pods. On each deploy **only the pods change**; everything in front of them stays put.
+
+### Config and resources
+
+- **ConfigMap**: non-sensitive settings (feature toggles, URLs), mounted as env vars or files.
+- **Secret**: same shape, for credentials and API keys, exposed only to pods that explicitly reference it, and with tighter access control.
+- **Resource requests** are what the scheduler **reserves** for a container on a node.
+- **Resource limits** are **hard caps** enforced through cgroups: the memory limit becomes `memory.max`, the CPU limit becomes a quota in `cpu.max`. Exceed the memory limit and the container is `OOMKilled` and restarted.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notes-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: notes-api }
+  strategy:
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: notes-api }
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/acme/notes-api:3f9c2e1
+          ports: [{ containerPort: 8080 }]
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            httpGet: { path: /ready, port: 8080 }
+          livenessProbe:
+            httpGet: { path: /live, port: 8080 }
+```
+
+### Rolling updates
+
+When you change the image, the Deployment controller creates a new ReplicaSet and moves replicas over step by step, bounded by two settings:
+
+- **`maxSurge`**: how many pods **above** the desired count may exist during the rollout.
+- **`maxUnavailable`**: how many pods **below** the desired count are allowed.
+
+Both default to **25%**. With three replicas: add one new pod, wait until it's **ready**, remove one old pod, repeat until three new and zero old.
+
+Two safety nets are built in:
+
+1. A new pod gets **no traffic until it reports ready**. A broken image just stalls the rollout; the old pods keep serving.
+2. The old ReplicaSet is scaled to **zero, not deleted**, so `kubectl rollout undo` brings it straight back.
+
+During the rollout both versions serve real traffic for a while. That overlap is how zero downtime works, and it's also something your code must tolerate (more on that under deployment strategies).
+
+### Probes
+
+"Ready" is something **your code** reports, typically through an endpoint like `/ready`. A **probe** is a check the kubelet runs on a schedule: an HTTP GET, a TCP connect, or a command.
+
+| Probe | When it fails |
+|---|---|
+| **Readiness** | The pod is removed from the Service's endpoints (no traffic) and added back when it passes. Nothing restarts |
+| **Liveness** | After enough failures the kubelet **kills and restarts** the container |
+| **Startup** | Holds off the other two until a slow-starting process has finished booting |
+
+<Callout kind="warn">
+Never make a **liveness** probe check the database. If the database slows down, every pod's liveness check times out, the kubelet restarts perfectly healthy pods in a wave, and the reconnect storm makes the database even slower. Liveness asks only "is this process stuck?" Readiness asks "can this pod serve requests right now?"
+</Callout>
+
+### Scaling
+
+Scaling out is changing a number: set `replicas: 10` and the controller starts seven more. The **Horizontal Pod Autoscaler (HPA)** changes that number for you, usually based on average CPU across pods (memory or custom metrics are possible too), adding pods above a target and removing them below it, within a minimum and maximum you set.
+
+### Do you need Kubernetes
+
+Often, not yet. Kubernetes solves real problems for large fleets, but it brings a lot of moving parts. **Start small and add complexity when you've earned it**: one machine with systemd or Docker Compose, or a hosting platform; then several machines with a tool like Kamal once real traffic arrives; then an orchestrator when you genuinely have dozens of services and machines to manage.
+
+## Continuous delivery vs deployment
+
+Two similar names, two different things:
+
+| | Continuous **delivery** | Continuous **deployment** |
+|---|---|---|
+| Meaning | Every merged change passes the full pipeline, so `main` is **always deployable**; releasing is one button | No button. Every change that passes the pipeline **goes to production automatically** |
+| Nature | A technical property of your pipeline | A product or business decision |
+
+You can have continuous delivery and still choose to release weekly (customers want a changelog, or a compliance review must sign off). You can't have continuous deployment without continuous delivery underneath it.
+
+## Deployment strategies
+
+How do you swap v1 for v2 while users are using the app?
+
+| Strategy | How | Strength | Cost |
+|---|---|---|---|
+| **Recreate** | Stop all v1, then start all v2 | Simple; never two versions at once | A **downtime gap**: errors and blank pages while v2 boots |
+| **Rolling update** | Replace instances one or a few at a time, gated by readiness (the Kubernetes default) | Zero downtime, no extra environment | **v1 and v2 serve traffic at the same time**, so APIs and database schema must work with both |
+| **Blue-green** | Two full environments. Blue (v1) is live; deploy v2 to green, test it, then **switch the router** | Zero downtime, one version live at a time, **instant rollback** by switching back | **Double the infrastructure** while both exist |
+| **Canary** | Send a small share of traffic (say 10%) to v2, compare its error rate and latency with v1, then widen to 25, 50, 100% | Real traffic tests v2 while limiting the **blast radius** | Needs good metrics and someone (or something) watching |
+| **Progressive delivery** | An automated canary: a controller widens traffic on a schedule, checks metrics at each step, and **rolls back automatically** | Hands-off and safe | Needs tooling and trustworthy metrics |
+
+The colours in blue-green mean nothing; they're just names for "the one that's live" and "the one that isn't".
+
+<DeployStrategySim />
+
+## GitOps
+
+**GitOps** is a way of running deployments defined by four properties:
+
+1. The **desired state** of the whole system (Deployments, Services, ConfigMaps) is written **declaratively** in files.
+2. Those files live in **Git**, so every change is versioned, reviewed and reversible.
+3. An **agent inside the cluster pulls** the files and continuously applies them.
+4. Any **manual change** made directly in the cluster is **detected and reverted**, so Git stays the single source of truth.
+
+In practice, every deploy is a **pull request** that changes an image tag or digest, and **merging is the deploy**. The CI pipeline builds and pushes the image and opens the PR; it **never holds cluster credentials**, which removes a juicy target from your CI system. Argo CD and Flux are the popular agents, and they are themselves Kubernetes controllers.
+
+GitOps is a good middle ground between "a script SSHes into servers" and "people run kubectl by hand against production".
+
+### Environments
+
+**Environments** (development, staging, production) are where pipeline stages run. They should run the **same image with different configuration**.
+
+- A **preview environment** is created automatically for each pull request, so reviewers can click around the change instead of only reading code, and is destroyed when the PR is merged or closed.
+- **Promotion** means moving the **same artifact** from one environment to the next, often through a human approval gate. You never rebuild for production; you promote the exact image you tested.
+
+## Infrastructure as code
+
+Someone set up the cluster, the virtual machines, the load balancer, the DNS records and the firewall rules by clicking through a cloud console. Thought experiment: could you rebuild **exactly** the same infrastructure in a brand-new cloud account within an hour? Even with perfect notes from whoever built it, you'd probably miss something. Without notes, or without that person, an exact replica is close to impossible.
+
+**Infrastructure as code (IaC)** describes machines, networks, permissions and settings **in files** that are version-controlled and reviewed like any other code. A tool applies them to a cloud account and produces the same infrastructure every time.
+
+| Category | What it does | Tools |
+|---|---|---|
+| **Provisioning** | Creates cloud resources: networks, machines, databases, load balancers, DNS | Terraform, OpenTofu (the open-source fork created after Terraform's licence change) |
+| **Configuration management** | Installs and configures software on machines that already exist | Ansible |
+| **Image baking** | Builds machine images with everything preinstalled, ready at boot | Packer, plus cloud-init for first-boot scripts |
+
+Provisioning is the one to know. The Terraform workflow is: write resource blocks, run **`plan`** to see exactly what would change, review it, then **`apply`**. Terraform calls the cloud APIs for you.
+
+```hcl
+resource "aws_security_group" "api" {
+  name = "notes-api"
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+```
+
+### Terraform state
+
+When Terraform creates a resource, it records the mapping from your block to the real cloud resource ID in a **state file**. On the next run it reads the state, asks the cloud for current reality, compares it with your code and shows the difference as a plan.
+
+Three rules follow:
+
+1. **Don't lose the state.** Without it Terraform thinks nothing exists and plans to create everything again.
+2. **Keep it in one remote place with locking** (an S3 bucket with locking, Terraform Cloud and so on). Two people applying from different local copies will overwrite each other's changes.
+3. **Never commit it to Git.** State holds every attribute of every resource, including database passwords and keys. Store it encrypted with restricted access.
+
+### Drift
+
+**Drift** is when reality no longer matches the code. During a late-night debugging session, someone opens SSH (port 22) to the whole internet straight from the console. Terraform treats the code as the truth, so the next `plan` shows one change, "remove the port 22 rule", and `apply` closes it again. That's a feature: manual changes don't survive, and if a change is right, it belongs in code.
+
+## SLIs, SLOs and error budgets
+
+CI/CD, containers and IaC are internal machinery. Users only care about results: does it work, and is it fast? Three terms describe that:
+
+| Term | What it is | Example |
+|---|---|---|
+| **SLI** (indicator) | A **measurement** of something users care about | Percentage of requests that succeed; percentage answered within 300 ms |
+| **SLO** (objective) | A **target** for an SLI **over a time window** | 99.9% of requests succeed over the last 30 days |
+| **SLA** (agreement) | A **contract** with customers built on an SLO, with penalties | Below 99.9% in a month, customers get service credits |
+
+Each extra "nine" is a ten-times stronger promise:
+
+| Availability | Allowed downtime |
+|---|---|
+| 99.9% | about 43 minutes per month |
+| 99.99% | about 4.3 minutes per month (about 52 minutes per year) |
+
+An SLO of 99.9% means 0.1% failure is **allowed**, and teams treat that allowance as an **error budget**. It isn't permission to be sloppy; it's a measured amount of risk you can spend on deploys, migrations and experiments.
+
+- **Budget left:** ship as often as you like.
+- **Budget spent** (it's the 23rd and yesterday's outage used the month's 43 minutes): **freeze feature deploys** until the window resets and spend the effort on reliability.
+
+The error budget turns the old dev-versus-ops argument into a number both sides agreed on in advance.
+
+<ErrorBudgetMeter />
+
+## On-call and incidents
+
+When an SLI drops, someone has to look. That's the **on-call** engineer. A typical **rotation** with three engineers puts one on call each week, with a second as **backup** in case the first is unreachable. Being **paged** (the name comes from old pagers) now means an incident-management app pushing an urgent alert to your phone. Good paging depends on observability: noisy "CPU over 90%" alerts can go to a chat channel, but only serious, user-facing conditions should wake someone up.
+
+When things turn into a real outage (many errors, users locked out), clear roles help:
+
+| Role | Job |
+|---|---|
+| **Incident commander** | Holds the big picture: impact, symptoms, hypotheses, who is doing what. Does **not** fix things |
+| **Fixers** | Engineers actually investigating and changing things |
+| **Communicator** | Updates the public status page and internal stakeholders, so fixers aren't interrupted |
+
+An **incident document** records the timeline as it happens: what was seen, what was tried, what changed.
+
+<Callout kind="remember">
+The first goal is to **stop the damage**, not to find the root cause. Roll back the last deploy, turn off a feature flag, disable the broken feature: get back to how things were an hour ago. Then find the cause and ship a proper fix calmly.
+</Callout>
+
+### Postmortems
+
+Once things are stable and the cause is understood, the team publishes a **postmortem** built from the incident document:
+
+- a minute-by-minute **timeline** of symptoms, actions and their effects,
+- the **user impact** (how many users, for how long),
+- the **root cause**,
+- **follow-up actions** so it can't happen the same way again.
+
+Cloudflare's November 2025 outage is a well-known public example: a database permissions change made a query return duplicate rows, which doubled the size of a generated configuration file; the software consuming that file had a size limit, and it failed across the network. The published postmortem walks through the timeline, impact and fixes.
+
+Good postmortems are **blameless**. That's not about being nice. If the conclusion is "Priya ran the wrong command", you learn nothing about **why that command looked right** to a competent engineer at the time, so the trap stays armed for the next person. Blame systems and processes, never individuals.
+
+Patterns that show up again and again in postmortems:
+
+- **Design for failure.** Every machine and dependency will fail eventually; code should survive it.
+- **Keep deployment simple.** Files and automation, not manual steps.
+- **One change at a time.** When something breaks, you know what changed, and rolling it back is almost instant.
+
+## Chaos engineering
+
+Everything so far is about surviving failure. **Chaos engineering** causes failure **on purpose**, in a controlled way, to prove the safety nets work before a real outage tests them:
+
+- Kill a pod in production during business hours and check that the ReplicaSet replaces it without user impact.
+- Remove a machine and check that its pods are rescheduled.
+- Add latency to a dependency and check that timeouts and fallbacks fire.
+
+If you delete one of three pods, you should see it go Terminating while a replacement goes Pending, ContainerCreating, then Running, and your dashboards should show nothing unusual.
+
+## Supply chain security
+
+Your image contains your code plus a base image, a language runtime and often hundreds of third-party packages. Each one is a place where someone else's mistake becomes yours. Two common failures:
+
+1. **A dependency disappears or changes.** A package is unpublished or a new version breaks, and thousands of builds fail overnight.
+2. **A dependency is poisoned.** In 2024, the **xz-utils** compression library, present on most Linux systems, shipped a **backdoor**. It was hidden in the release tarballs rather than the visible source repository, so people reviewing the code never saw it; anyone building from those tarballs got the backdoor.
+
+Defences:
+
+- **Pin everything**: base images (ideally by digest), runtimes and every dependency through lock files. Never use `latest`.
+- **Scan** images and dependencies against public vulnerability databases in your pipeline, and actually act on the results.
+- Prefer small base images with fewer packages, so there's less to go wrong.
+
+## Cheat sheet
+
+- DevOps makes deploys small, cheap and boring; DORA shows frequent deployers are also the most stable.
+- CI is a practice: merge to `main` at least daily, with automated tests on every merge. Use trunk-based development plus feature flags for backends.
+- Reproducible builds need pinned toolchains and committed lock files; version a service by its commit hash, not semver.
+- Order pipeline stages cheap to expensive; use OIDC for short-lived cloud credentials instead of stored keys.
+- A container is a normal process with namespaces (what it sees), cgroups (how much it uses) and a layered filesystem; it shares the host kernel.
+- Images are content-addressed layers plus a config and manifest; registries only transfer missing layers.
+- In Dockerfiles copy the lock file and install before copying source; use multi-stage builds; images should be small, non-root, pinned and scanned.
+- On one machine: systemd plus a reverse proxy plus ACME certificates. Never hand-edit servers; replace them.
+- Kubernetes reconciles desired state: Deployments own ReplicaSets own pods; Services give stable names; readiness gates traffic, liveness restarts (never check the DB in liveness).
+- Recreate has downtime; rolling mixes versions; blue-green doubles cost but rolls back instantly; canary limits blast radius.
+- GitOps: state in Git, an in-cluster agent pulls and reverts drift; Terraform state is remote, locked and never in Git.
+- SLI measures, SLO targets, SLA contracts; spend the error budget, freeze when it's gone; mitigate first, then write a blameless postmortem.

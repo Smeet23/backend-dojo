@@ -1,0 +1,200 @@
+import { TaskQueueSim } from "@/components/widgets/TaskQueueSim";
+
+## What a background task is
+
+A **background task** is any work your backend does **outside the request–response cycle**. The client sends a request, your server sends a response, and somewhere else, in a different process, more work carries on after that response has gone out.
+
+The test for whether something belongs in the background is simple: **does the client need the result of this work to get its response?** If not, the work isn't on the critical path. It can run a few milliseconds or a few minutes later, on its own schedule, without the user waiting for it.
+
+This matters because every millisecond spent inside a request handler is a millisecond the user stares at a spinner, a connection held open, and a chance for a timeout. Moving non-critical work out of the request is one of the most effective things you can do for a **responsive, scalable** backend.
+
+## The signup email problem
+
+Take a SaaS signup flow:
+
+1. The user submits email, name and password.
+2. The backend validates the input, hashes the password, and inserts the user row.
+3. It generates a verification code or a signed link.
+4. It sends a **verification email** so the user can prove they own the address.
+
+You don't run your own mail servers, so step 4 means calling an **email provider** such as Resend, Mailgun, Brevo or any SMTP relay. You render an HTML template with the link, set the recipient, subject and sender, and make an HTTP call to the provider's API. The provider checks your API key, accepts the message, and returns success or failure.
+
+### Why sending it inline hurts
+
+That provider is a server you **don't control**. It can be slow during a traffic spike, rate-limit you, or be down entirely. If you call it synchronously inside the signup handler, you're stuck with two bad options:
+
+- **Let the failure propagate.** The whole signup request fails with a 500, even though the user row was saved. The user retries and hits "email already registered". Terrible.
+- **Swallow the failure.** Signup succeeds, the UI says "we've sent you an email", but nothing was sent. The user waits, clicks "resend", and if the provider is still down you lie to them a second time.
+
+Either way, the slowest and least reliable dependency in the flow decides how your signup endpoint behaves.
+
+### Doing it in the background
+
+Instead, the handler does only the work that must happen now, and **hands off** the rest:
+
+1. Validate, save the user, generate the code, build the email payload.
+2. **Serialize** everything the email step needs (user id, address, template name, link) into a small message, usually JSON.
+3. **Enqueue** that message as a task on an `email` queue.
+4. Return `201 Created` immediately. The UI shows "check your inbox".
+
+A separate **worker** process is listening on the `email` queue. It picks the task up, **deserializes** it back into a native structure (an object, a dict, a struct), and calls the **handler registered for that task type**. That handler is exactly the code you would have run inline: render, call the provider, done.
+
+```ts
+// In the signup handler (producer)
+await queue.add("send-verification-email", {
+  userId: user.id,
+  email: user.email,
+  token: verification.token,
+});
+return res.status(201).json({ id: user.id });
+
+// In the worker process (consumer)
+worker.process("send-verification-email", async (job) => {
+  const { email, token } = job.data;
+  await emailProvider.send({
+    to: email,
+    template: "verify",
+    vars: { link: `https://app.notes.dev/verify?t=${token}` },
+  });
+});
+```
+
+Under normal load the email lands within a second; under heavy load maybe ten. That's fine, because verification links typically stay valid for 15–30 minutes. You can have a separate queue per kind of work (email, in-app notifications, push notifications), each with its own pool of workers sized to its load.
+
+### Retries with exponential backoff
+
+Now the provider goes down. The handler throws, so the **task fails**. In the inline version this was a 500 for the user. In the background version the user never notices: the task framework **schedules a retry**.
+
+Retrying immediately would just hammer a provider that's already struggling, so retries use **exponential backoff**: wait 1 minute, then 2, then 4, then 8, doubling each time up to a **max retries** cap (say 5). Good implementations add **jitter**, a small random offset to each delay, so that thousands of tasks that failed at the same moment don't all retry at the same moment too.
+
+Large providers rarely stay down for long, so one or two retries usually succeed. Once the retries are used up, the task goes to a **dead-letter queue (DLQ)**: a holding area for tasks that failed permanently, where you can inspect them, fix the cause, and replay them.
+
+| Approach | User experience during an outage | Email eventually sent? |
+|---|---|---|
+| Inline, no error handling | Signup fails with 500 | No |
+| Inline, error swallowed | "Email sent" (a lie) | No |
+| Background task with retries | Signup succeeds instantly | Yes, once the provider recovers |
+
+<Callout kind="remember">
+Background tasks buy you two things: **responsiveness** (the request isn't blocked by slow or external work) and **reliability** (failures get retried automatically instead of being lost).
+</Callout>
+
+## Common use cases
+
+| Use case | Why it belongs in the background |
+|---|---|
+| **Sending email** | Depends on an external provider that can be slow or down |
+| **Image and video processing** | Resizing and encoding into many sizes and formats (small for phones on slow networks, large for desktops) is CPU-heavy and slow |
+| **Generating reports** | A project tool builds a PDF of completed and overdue tasks for every team, every night. Heavy, and nobody is waiting on a request for it |
+| **Push notifications** | Your server can't reach a phone directly. It stores each device's push token and asks Apple's or Google's push service to deliver. Another external call |
+| **Webhooks and syncs** | Calling other companies' endpoints, which may be slow or flaky |
+
+Push notifications deserve a note: the phone registers with its OS vendor's push service and gets a token; your app sends that token to your backend; when you want to notify the user, your backend calls the vendor's service with the token and the message. Because that's a network call to a third party, it goes through a queue like any other.
+
+## How a task queue works
+
+A **task queue** is the system that manages and distributes background jobs. A useful mental model is a **shared to-do list**: application code writes items onto it, and workers take items off one at a time and do them.
+
+There are three roles:
+
+- **Producer.** Your application code (the signup handler). It builds a task containing everything the worker will need, serializes it, and **enqueues** it.
+- **Broker.** The queue itself: durable storage that holds tasks until a worker is ready. Common choices are **RabbitMQ**, **Redis** (using lists, sorted sets or streams, which is what libraries such as BullMQ and Asynq build on), and **AWS SQS**, a fully managed queue that scales without you running anything.
+- **Consumer, or worker.** A separate process (same codebase or a different one) that continuously watches the queue, **dequeues** tasks, and runs the matching handler.
+
+```
+Producer ──enqueue──▶  Broker (queue)  ──deliver──▶  Worker
+(app code)            holds tasks until              runs the
+                      a worker is free               handler
+                          ▲                             │
+                          └──────────── ack ────────────┘
+```
+
+Libraries handle the plumbing on both sides: **Celery** for Python, **BullMQ** for Node.js, **Asynq** for Go, Sidekiq for Ruby. They give you enqueueing, worker loops, retries, scheduling and dashboards.
+
+<Callout kind="warn">
+Redis **Pub/Sub** is not a task queue. A published message goes only to subscribers connected at that instant; if no worker is listening, or a worker crashes mid-task, the message is gone. Task queues on Redis use data structures that **persist** until the task is acknowledged.
+</Callout>
+
+### Acknowledgements
+
+When a worker finishes a task successfully it sends an **acknowledgement (ack)** to the broker, and only then does the broker delete the task. If the handler fails, the worker reports failure (a **nack**) and the framework schedules a retry.
+
+The important question is what happens when the worker **never answers** at all, because it crashed, was killed during a deploy, or is stuck on a hung network call.
+
+### Visibility timeout
+
+When a worker takes a task, the broker doesn't delete it. It hides it from other workers for a fixed window, the **visibility timeout** (the name comes from SQS; RabbitMQ gets the same effect by redelivering any unacked message when the worker's connection drops).
+
+- If the worker acks within the window, the task is deleted.
+- If the window expires without an ack, the task becomes **visible again** and another worker picks it up.
+
+So a crashed worker can't lose a task. The price is that a task may run **more than once**: a slow worker might finish just after its timeout expired, by which point a second worker has started the same task. This is called **at-least-once delivery**, and it's the norm for task queues. Set the visibility timeout comfortably longer than the task's normal run time, and design handlers so a duplicate run is harmless (see idempotency below).
+
+<TaskQueueSim />
+
+## Types of tasks
+
+### One-off tasks
+
+Triggered once by an event. The verification email on signup, the welcome email after verification, a password-reset email, a "you have a new message" notification. This is the most common kind.
+
+### Recurring tasks
+
+Run on a schedule, like cron. Nightly or weekly reports, monthly invoices, and **maintenance jobs**. For example, with server-side sessions your `sessions` table fills up with expired rows as users log in and out over months. A recurring job that deletes expired sessions keeps the table small and queries fast. Celery (beat), BullMQ (repeatable jobs) and Asynq (scheduler) all support schedules.
+
+### Chained tasks
+
+Some work is a pipeline where each step depends on the previous one. Picture a course platform where an instructor uploads a lecture video. The upload goes straight to object storage using a pre-signed URL, and the backend records it and returns at once. Then:
+
+```
+Upload complete
+  └─▶ Encode video into 1080p, 720p, 480p
+        ├─▶ Generate thumbnails ──▶ Resize thumbnails
+        └─▶ Transcribe audio into subtitles
+```
+
+A child task runs only once its parent succeeds. **Siblings that don't depend on each other** (thumbnails and transcription) run **in parallel** on different workers. If thumbnail resizing fails, only that step is retried; the expensive encode isn't redone.
+
+### Batch tasks
+
+One trigger fans out into many tasks.
+
+- **Account deletion.** A heavy user may have notes, files and shared projects spread across several databases and storage buckets. Deleting all of it could take minutes. So the endpoint marks the account as pending deletion, logs the user out, and returns `202 Accepted`. Often there's a **grace period** of a few days to cancel. A background job then removes the user from shared projects, deletes their files, deletes their rows, and finally sends a confirmation email, each step being its own sub-task.
+- **Mass reports.** At midnight, one scheduler task enqueues a "generate and email report" task for each of your 40,000 customers.
+
+## Design considerations
+
+| Concern | What to do |
+|---|---|
+| **Idempotency** | Because delivery is at-least-once, running a task twice must be safe. Check state before acting ("already sent?"), use idempotency keys with external APIs, wrap database steps in a transaction so a half-done attempt rolls back and the retry starts clean |
+| **Error handling** | Workers run in another process with no user to show errors to. Catch, classify (retryable or not), and **log with context** (task id, user id, attempt number) |
+| **Monitoring** | Track queue depth, processing rate, success and failure counts, task latency and failure causes. Export metrics to something like Prometheus and chart them in Grafana |
+| **Scalability** | Workers should be stateless so you can **add more** when load grows |
+| **Ordering** | Most queues don't guarantee strict order once there are several workers or retries. If order matters (e.g. events for one account), use a library or broker feature that supports it, such as FIFO queues or per-key partitions |
+| **Rate limiting** | Workers can easily send requests faster than an external API allows. Throttle per queue so you don't hit provider limits, get banned, or run up per-call costs |
+
+A concrete idempotency example: a "charge subscription" task fails after Stripe accepted the charge but before your database recorded it. The retry must not charge again. Passing an **idempotency key** (say, the invoice id) to the payment API makes the second call return the original result instead of charging twice.
+
+<Callout kind="tip">
+Not every failure deserves a retry. A 503 from the email provider is **transient**; retry it. "This email address is malformed" is **permanent**; retrying five times just delays the DLQ. Mark permanent errors as non-retryable.
+</Callout>
+
+## Best practices
+
+1. **Keep tasks small and focused.** One task, one unit of work. A giant task that encodes, thumbnails and transcribes redoes everything when the last step fails. Small tasks are cheaper to retry, easier to scale independently, and easier to debug.
+2. **Avoid long-running tasks.** A task that runs for 40 minutes is fragile: it can outlive its visibility timeout, it blocks a worker, and a deploy will kill it. Split it into chunks or a parent–child chain.
+3. **Handle and log errors properly.** Good logs tell you whether a failure was internal (your bug) or external (their outage), which decides the fix.
+4. **Alert on queue length and worker health.** A queue that keeps growing means workers can't keep up, so scale them up. Workers that keep crashing need debugging. Both should page someone before users notice that emails are an hour late.
+
+## Cheat sheet
+
+- A background task runs **outside the request–response cycle**; use it for work the response doesn't need.
+- **Producer** enqueues, **broker** stores, **worker** dequeues and runs the handler.
+- Serialize everything the worker needs into the task payload.
+- Failed tasks retry with **exponential backoff plus jitter**, up to a max, then go to a **dead-letter queue**.
+- The worker **acks** on success; only then is the task deleted.
+- **Visibility timeout**: no ack in time means the task is redelivered, so delivery is **at-least-once**.
+- Make handlers **idempotent** so duplicate runs are harmless.
+- Task types: **one-off, recurring, chained, batch**.
+- Brokers: RabbitMQ, Redis (lists or streams, not Pub/Sub), SQS. Libraries: Celery, BullMQ, Asynq.
+- Keep tasks small, monitor **queue depth**, rate-limit calls to external APIs.

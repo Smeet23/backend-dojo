@@ -1,0 +1,219 @@
+import { ConfigPrecedence } from "@/components/widgets/ConfigPrecedence";
+
+## What configuration management is
+
+**Configuration** is every setting that changes how your application behaves **without changing its code**. **Configuration management** is the systematic way you organize, store, load, validate and protect those settings.
+
+A good way to think about it: the code is the same everywhere, and the configuration is what makes the same build behave like a laptop dev server in one place and a production cluster serving millions of users in another.
+
+Most people's first answer to "what's config?" is secrets: the database password, the JWT signing key, the Stripe API key. Those matter a lot, but treating config as just secrets is like describing a car as just its engine. Configuration also decides:
+
+- how the app **starts** (port, worker count),
+- how it **connects** to databases, caches, queues and third-party APIs,
+- how it **behaves per environment** (debug output locally, strict security in production),
+- what, how much and where it **logs**,
+- where **metrics** and traces are sent,
+- which **features are switched on**, and for whom.
+
+## An example from a shop
+
+Here's a slice of a typical e-commerce backend's configuration:
+
+| Setting | Example value | Nature |
+|---|---|---|
+| Database host, port, user, password | `db.internal:5432`, `shop_app`, `•••` | Password is secret; differs per environment |
+| Stripe API key | `sk_live_•••` | Secret; test key in dev, live key in prod |
+| New checkout flow | `on` for 10% of users | Feature flag; changes often, at runtime |
+| DB connection pool size | `50` | Performance tuning; differs per environment |
+| Session idle timeout | `30m` | Security setting |
+| Max order value | `5000` | Business rule; changes rarely |
+
+These settings differ along three axes that drive how you handle them:
+
+- **Sensitivity.** Leaking the Stripe key costs money. Leaking the pool size costs nothing.
+- **Change frequency.** A feature flag may flip several times a day; the database host changes once a year.
+- **Per-environment variation.** The max order value is probably the same everywhere; the pool size and API keys almost certainly aren't.
+
+## Why it matters
+
+A modern backend is one part of a **distributed system**: several services, a database or two, a cache, a message queue, plus third-party integrations for auth, email, payments and search. Every connection point needs settings: where it is, how to authenticate, how long to wait, how many retries, how much concurrency. Multiply that by dev, test, staging and production, and the number of settings grows fast.
+
+Without a deliberate approach you drift into **configuration chaos**:
+
+- **Hard-coded values** scattered through the code, so changing a timeout means a code change and a deploy.
+- **Inconsistent behaviour** across environments, because each was set up by hand.
+- **Leaked secrets**, committed to git or pasted into chat.
+- **Debugging nightmares**, because nobody can say which setting was active when production broke.
+
+The stakes are higher on the backend than on the frontend. A misconfigured frontend shows the wrong banner. A misconfigured backend can **expose customer data**, **charge cards incorrectly** (a test key in production, or a live key in staging), or **take the whole platform down**. And backends run in many kinds of places, such as virtual machines, containers, serverless functions and edge runtimes, each with its own way of supplying settings.
+
+## Types of configuration
+
+The type of a setting decides how it's stored, how it's protected, and who can see it.
+
+### Application settings
+
+The most common kind:
+
+- **Log level.** `debug` in development so you can see everything, `info` or `warn` in production so the logs stay useful and affordable.
+- **Port.** `8080` locally; in production, whatever the platform or container orchestrator expects.
+- **Connection pool size.** How many database connections each instance keeps open.
+- **Timeouts.** These must agree across layers. If your load balancer or server times out requests after 60 s and an AI image-generation endpoint takes 80 s, every such request ends in a **504 Gateway Timeout** even though the work would have finished. Either raise the timeout for that route or, better, move the work to a background job.
+
+### Database settings
+
+Host, port, user, password and database name, usually combined into a single **connection URL**, plus settings such as statement timeout, SSL mode and pool limits.
+
+```
+postgres://shop_app:s3cret@db.internal:5432/shop?sslmode=require
+```
+
+### External services
+
+Credentials and options for each third-party client: the email provider's API key and sender domain, Stripe's secret key and webhook signing secret, the auth provider's client id and secret. Your code needs them to initialize those clients at startup.
+
+### Feature flags
+
+A **feature flag** turns behaviour on or off **without deploying new code**. A new checkout flow ships hidden behind a flag, gets enabled for internal staff, then for 5% of users, then for one country, then for everyone. If error rates rise, you flip it off in seconds instead of rolling back a deploy. Flags also power **A/B tests**, where two variants run side by side and you compare results.
+
+Flags that change at runtime can't live in environment variables, because those are read once when the process starts. They come from a flag service or a database the app checks at request time.
+
+### Other kinds
+
+- **Infrastructure settings**: regions, instance sizes, replica counts, usually owned by infrastructure-as-code.
+- **Security settings**: JWT signing keys, session secrets, CORS allowed origins, password hashing cost.
+- **Runtime tuning**: for example `GOMAXPROCS` for Go, or Node's `--max-old-space-size`.
+- **Business rules**: limits, thresholds and rates you want to change without touching code.
+
+## Where configuration lives
+
+### Environment variables
+
+The most common source, supported by every OS and language. In production, the platform (container, orchestrator, serverless runtime, CI pipeline) **injects** them into the process when it starts. Secrets usually originate in a secret manager, and a deploy step fetches them and exposes them to the app as environment variables or mounted files.
+
+Locally, typing `export` for twenty variables gets old, so developers keep a **`.env`** file and load it with a library like **dotenv**:
+
+```bash
+# .env (local only, listed in .gitignore)
+PORT=8080
+LOG_LEVEL=debug
+DATABASE_URL=postgres://dev:dev@localhost:5432/shop
+STRIPE_API_KEY=sk_test_51H...
+```
+
+Commit a `.env.example` with the keys and safe placeholder values so new developers know what to set. Never commit the real `.env`.
+
+### Config files
+
+Structured files are good for settings that are numerous, nested, and not secret.
+
+| Format | Strengths | Weaknesses |
+|---|---|---|
+| **JSON** | Universal, strict, easy to parse | **No comments**, so you can't explain why a value is what it is |
+| **YAML** | Readable, nested, **supports comments**; the most common in open-source projects | Indentation-sensitive; some surprising type coercions |
+| **TOML** | Simple, explicit types, comments | Less familiar to some teams |
+
+Many self-hosted open-source servers ship a single YAML file with sections for server, logging, storage, sessions and so on:
+
+```yaml
+server:
+  port: 8080
+  read_timeout: 15s     # long uploads go through presigned URLs, not this server
+log:
+  level: info
+database:
+  pool_size: 50
+session:
+  idle_timeout: 30m
+```
+
+### Key-value stores
+
+Distributed key-value stores such as **Consul** and **etcd** hold configuration centrally for many services. Services read keys at startup and can **watch** them for changes, which suits settings that must update at runtime across a whole fleet.
+
+### Secret managers
+
+Dedicated services such as **HashiCorp Vault**, **AWS Secrets Manager and Parameter Store**, **Azure Key Vault** and **Google Secret Manager** store secrets centrally, encrypt them, control who can read each one, keep an audit log of every access, and support rotation. They earn their keep once you have many services, autoscaling, several environments, or more than one cloud.
+
+### Combining sources
+
+Real applications usually combine several sources. A **config loader** reads each one and merges them by a defined **precedence**, where later sources override earlier ones. A widely used order, from lowest to highest priority:
+
+1. **Defaults** in code (sensible, safe values).
+2. **Config file** (per-environment YAML).
+3. **Environment variables** (including secrets injected from a secret manager).
+4. **Command-line flags** (one-off overrides).
+
+The exact order is a team decision. What matters is that it's **deterministic and documented**, so anyone can answer "where did this value come from?"
+
+<ConfigPrecedence />
+
+## Configuration per environment
+
+The code is identical in every environment. The configuration is what adapts it to each environment's priorities:
+
+| Environment | Main priority | Typical settings |
+|---|---|---|
+| **Development** | Developer speed and easy debugging | `debug` logs, local database, test API keys, hot reload |
+| **Test / CI** | Fast, repeatable automated checks | Throwaway databases, fakes for external services, deterministic seeds |
+| **Staging** | Behave like production to catch problems early, while keeping costs down | Production-like topology at a smaller size, test payment keys |
+| **Production** | Reliability, security, performance | `info` logs, live keys, strict timeouts, large pools |
+
+Database pool size shows how the same setting is tuned differently:
+
+| Environment | Pool size | Reasoning |
+|---|---|---|
+| Development | 10 | Plenty for one developer |
+| Staging | 2 | Only the team uses it; save on database cost and accept some waiting |
+| Production | 50 per instance | Real traffic and spikes, sized to the database's connection limit |
+
+Because behaviour is driven by config, none of these differences need an `if (env === "production")` scattered through the code.
+
+## Keeping secrets safe
+
+1. **Never hard-code secrets** or commit them to the repository. Git history is forever, and repositories get cloned, forked and leaked. Secret-scanning tools in CI catch mistakes before they merge.
+2. **Use a secret manager** when you can. It's one place where extra effort is almost always worth it. Secrets are **encrypted at rest** in the manager's storage and **encrypted in transit** over TLS when your app or pipeline fetches them, and every read is authorized and logged.
+3. **Least privilege.** Each person and each service can read only the secrets it needs. A frontend developer needs the public API URL and publishable keys, not the production database password. The billing service needs the Stripe key; the search service doesn't. Only the platform team holds keys to production infrastructure.
+4. **Rotate regularly**, and immediately after any suspected leak. Rotation limits how long a leaked key is useful. Design for it: support two valid signing keys during a changeover so rotating doesn't log everyone out.
+5. **Keep secrets out of logs and error messages**, including when you log the loaded config at startup. Mask them.
+
+## Validate at startup
+
+The most important habit in configuration management is to **validate all configuration when the app starts**, before it accepts any traffic, whatever the sources were.
+
+The anti-pattern is reading `process.env.SOMETHING` deep inside a request handler. A missing or malformed value then surfaces as a confusing failure hours later, in front of a user, and possibly only on one rarely used route.
+
+Instead, define a schema for your whole config: which keys are **required**, which are **optional**, their **types** and allowed values, and **defaults**. Parse once at startup into a typed object, and **refuse to start** if anything is wrong.
+
+```ts
+import { z } from "zod";
+
+const Config = z.object({
+  PORT: z.coerce.number().int().default(8080),
+  LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  DATABASE_URL: z.string().url(),                // required
+  DB_POOL_SIZE: z.coerce.number().int().min(1).default(10),
+  STRIPE_API_KEY: z.string().startsWith("sk_"),  // required
+});
+
+export const config = Config.parse(process.env); // throws: app won't start
+```
+
+Go has `go-playground/validator` and struct tags; Python has Pydantic settings; most frameworks have an equivalent. With a rolling or blue-green deploy, an instance that refuses to start never receives traffic, so the bad config is caught by the deploy instead of by your customers.
+
+<Callout kind="remember">
+If you take one habit from this lesson: **validate every setting at startup and fail fast.** Code then reads from the validated, typed config object, never from raw environment variables.
+</Callout>
+
+## Cheat sheet
+
+- Config is **every setting that changes behaviour without changing code**, not just secrets.
+- Classify settings by **sensitivity, change frequency and per-environment variation**.
+- Types: app settings, database, external services, **feature flags**, infrastructure, security, tuning, business rules.
+- Timeouts must line up across layers, or long requests end in **504**.
+- Runtime **feature flags** need a flag service or database, not environment variables.
+- Sources: **env vars** (`.env` + dotenv locally), **YAML/TOML** files, **Consul/etcd**, **secret managers**.
+- Merge sources by a documented **precedence**, e.g. defaults, then file, then env, then flags.
+- Same code everywhere; **environments differ only in config**.
+- Never commit secrets; use a **secret manager**, **least privilege** and regular **rotation**.
+- **Validate all config at startup** with a schema (Zod, Pydantic, validator) and refuse to start on errors.

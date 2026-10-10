@@ -1,0 +1,289 @@
+import { MiddlewareChain } from "@/components/widgets/MiddlewareChain";
+
+## Inside the server
+
+Earlier lessons followed a request **across the network**: client, DNS, TCP, HTTP, server. This one follows it **inside** your server process, from the moment it arrives to the moment a response leaves.
+
+The operating system hands the incoming connection to the **port your server listens on** (3000, 8080 and so on). Your framework parses the HTTP message, and then the **router** matches the method and path (`GET /notes`, `DELETE /notes/42`) to a **handler**, the function written for that endpoint.
+
+Around and behind that handler, most backends use three ideas:
+
+- **Layers**: the handler (or controller), service and repository each do one kind of job.
+- **Middleware**: reusable steps that run before and after handlers on many routes.
+- **Request context**: a small per-request store that those steps use to share information.
+
+```
+Request
+  → middleware (CORS, logging, auth, rate limit…)
+  → router
+  → handler / controller
+      → service
+          → repository → database
+      ← data
+  ← response (status, headers, body)
+  ← error handler (if anything threw)
+```
+
+## Why split into layers
+
+Nothing forces you to split code this way. One giant handler that parses input, runs business rules and writes SQL **works**. The split is a **design pattern**, and its payoff shows up as the codebase grows:
+
+- **Maintainability**: each file has one reason to change. A new database column touches the repository, not your HTTP code.
+- **Testability**: you can test a service with plain function calls, with no HTTP server and no real database.
+- **Reuse**: the same service can be called from an HTTP handler, a background job or a CLI script.
+- **Debuggability**: a wrong status code is a controller bug; a wrong total is a service bug; a slow query is a repository bug. You know where to look.
+
+| Layer | Deals with | Knows about HTTP? | Knows about SQL? |
+|---|---|---|---|
+| **Handler / controller** | Input and output formats, status codes | Yes | No |
+| **Service** | Business logic and orchestration | No | No |
+| **Repository** | Database queries | No | Yes |
+
+## The handler
+
+Every framework, in every language, gives a handler at least two things: a **request object** (to read the method, path, headers, params and body) and a **response object** (or a return value) for setting the status, headers and body. The handler's job is to manage **data flow in and out**. It runs in four steps.
+
+### Step 1, bind the input
+
+First, pull the data out of the request and **deserialize** it into a native type: a struct in Go or Rust, a Pydantic model or dict in Python, an object in TypeScript. Many frameworks call this **binding**.
+
+Where the data lives depends on the endpoint:
+
+- **Path params** identify the resource: the `42` in `/notes/42`.
+- **Query params** carry filters, sorting and pagination, typically on GET.
+- **The body** carries the payload, typically on POST, PUT and PATCH. DELETE usually has no body.
+- **Headers** carry metadata, such as the auth token.
+
+In Node.js, JSON parsing is usually done once, **upstream**, by a body-parsing middleware (for example `express.json()`) before your handler runs. In Go, Python or Rust you typically bind explicitly inside the handler. Either way, if binding fails (malformed JSON, wrong types), respond with **400 Bad Request** and stop.
+
+### Step 2, validate and transform
+
+Next, run the **validation and transformation pipeline** from the previous lesson: check that every required value exists, has the right type and format and makes sense, then reshape it for convenience.
+
+A common, valuable transformation is **filling defaults**. Make query parameters **optional** wherever you can, and set sane defaults here:
+
+```http
+GET /notes              → sort defaults to "createdAt"
+GET /notes?sort=title   → sort by title
+```
+
+Without the default, every service method would need `if sort was sent … else …` branches. With it, everything downstream receives one predictable shape.
+
+### Step 3, call the service
+
+Pass the **clean, validated data** to the service, along with anything else it needs from the request, such as the **authenticated user's ID** and permissions (which come from the request context, explained below).
+
+### Step 4, send the response
+
+Finally, turn the service's result (or error) into HTTP:
+
+- Success: **200** with data, **201** with the created resource, or **204** with an empty body (for example after a delete).
+- Failure: a **4xx** when the client got something wrong, a **5xx** when the server did, with a structured error message.
+
+```ts
+async function createNote(req: Request, res: Response) {
+  const input = CreateNoteSchema.parse(req.body);            // bind + validate (400 on failure)
+  const userId = req.context.userId;                          // from auth middleware
+  const note = await notesService.create(userId, input);      // business logic
+  res.status(201).json(note);                                 // HTTP response
+}
+```
+
+## The service layer
+
+The service holds the **actual processing**, and it should know **nothing about HTTP**: no request objects, no status codes, no headers.
+
+A useful litmus test: read a service method in isolation. If you **can't tell it's called from an API**, the boundary is right. It takes plain data, does the work, and returns plain data or throws a domain error such as `NoteNotFound`.
+
+A service can:
+
+- **orchestrate** several repository calls, then merge or pick fields from their results;
+- call external APIs, send emails and notifications, enqueue jobs;
+- skip the database entirely. A "send password reset email" service might take an address, call the email provider and return `{ sent: true }`.
+
+```ts
+async function shareNote(ownerId: string, noteId: string, email: string) {
+  const note = await notesRepo.getNoteById(noteId);
+  if (!note) throw new NotFoundError("note");
+  if (note.ownerId !== ownerId) throw new ForbiddenError();
+  const invitee = await usersRepo.getUserByEmail(email);
+  await sharesRepo.createShare(noteId, invitee.id);
+  await mailer.send(email, `${note.title} was shared with you`);
+}
+```
+
+Mapping `NotFoundError` to **404** and `ForbiddenError` to **403** is the handler's (or error handler's) job, not the service's.
+
+## The repository layer
+
+The repository has a single responsibility: take the inputs (values to insert, filters, sort order), **build the query**, run it against the data store, and **return the result**. No business rules, no HTTP.
+
+Keep each method **single-purpose**: one method returns one kind of data.
+
+```ts
+// Avoid: behaviour changes depending on whether id is passed
+getNotes(id?: string)
+
+// Prefer: two clear methods
+getAllNotes({ sort, limit, offset })
+getNoteById(id)
+```
+
+A method that sometimes returns a list and sometimes one item forces every caller to guess which it got. Two methods make the intent obvious and each easy to optimise.
+
+The `sort` default set by the handler flows straight through: handler, then `notesService.list({ sort })`, then `notesRepo.getAllNotes({ sort })`, which builds the `ORDER BY`. (Always map sort fields through an allowlist rather than pasting user input into SQL.)
+
+## Middleware
+
+Between the moment a request arrives and the moment the response leaves, there are many function boundaries. **Middleware** are functions that run **in the middle** of that path: before routing, after routing, before the handler, and after it.
+
+### The middleware signature
+
+Like handlers, middleware receive the **request** and **response** objects. They usually also receive a third argument, **`next`**, a function that hands control to the **next step** in the chain. That next step might be another middleware, the router or the handler itself.
+
+A middleware can do three things:
+
+1. **Read** the request (headers, IP, path).
+2. **Modify** the request or response (add a header, attach the user to the context).
+3. **End the request early** by sending a response and **not** calling `next()`. This is called **short-circuiting**.
+
+```ts
+function requireAuth(req, res, next) {
+  const user = verifyToken(req.headers.authorization);
+  if (!user) return res.status(401).json({ error: "UNAUTHENTICATED" }); // short-circuit
+  req.context.userId = user.id;                                       // modify
+  next();                                                             // hand off
+}
+```
+
+Some frameworks use a slightly different shape. Go's `net/http` wraps handlers (`func(next http.Handler) http.Handler`), and Koa uses `await next()` so code can also run **after** the handler. The idea is the same everywhere.
+
+### Why middleware exists
+
+For the same reason functions exist: to **avoid duplication**. A real backend has hundreds of endpoints serving many requests per second, and almost every request needs the same chores: security headers, logging, authentication, rate limiting, parsing, compression. Calling a helper at the top of every handler is still duplication, and someone will forget it on endpoint 143.
+
+Middleware registers that work **once**, so it applies to every matching route automatically. Because it runs before the handler, it can also **reject bad requests early** and save the server's resources.
+
+### Order matters
+
+Middleware run **in the order you register them**, one after another via `next()`. That order decides behaviour:
+
+- Logging placed **after** auth never logs rejected requests.
+- Rate limiting placed **after** an expensive auth lookup lets an attacker make you do that lookup thousands of times.
+- A global error handler placed **in the middle** never sees errors thrown by later steps.
+
+<MiddlewareChain />
+
+## Common middleware
+
+### CORS
+
+The browser's same-origin policy blocks a page on `app.notes.dev` from reading responses from `api.notes.dev` unless the server opts in. A CORS middleware reads the **`Origin`** header; if it's on your allowlist, it adds the `Access-Control-Allow-*` response headers and answers `OPTIONS` preflights directly. If not, it adds nothing, and **the browser** blocks the response. It's a natural fit for middleware because it must run on **every request** and needs **both** the request and the response. It usually goes **first**, so preflights are answered before anything else (like auth) can reject them.
+
+### Security headers
+
+Add headers such as `Content-Security-Policy`, `Strict-Transport-Security` and `X-Content-Type-Options: nosniff` to every response, then call `next()`.
+
+### Authentication
+
+Extract the credential (a JWT from the `Authorization` header, or a session ID from a cookie) and verify it:
+
+- **Invalid or missing**: respond **401 Unauthorized** and don't call `next()`.
+- **Valid**: put the **user ID, role and permissions** into the request context, then call `next()`.
+
+Authorization checks ("is this user an admin?", "does this user own note 42?") often live in a later middleware or in the service, because they may need the specific resource.
+
+### Rate limiting
+
+Stop one client from making too many requests too quickly: for example, at most 100 requests per minute. Key the limit by **IP address** for anonymous traffic, and by **user ID or API key** once the user is known (many users can share one IP behind an office NAT). When the limit is exceeded, respond **429 Too Many Requests**, ideally with a `Retry-After` header.
+
+### Logging and request IDs
+
+Log each request's method, path, status and duration, which helps with debugging, metrics and audits. Be careful about logging **bodies**: they may contain passwords, tokens or personal data, so redact sensitive fields.
+
+### Compression
+
+Large JSON responses compress very well. A compression middleware gzips (or Brotli-compresses) the body when the client sends `Accept-Encoding: gzip`, and sets `Content-Encoding`. The browser decompresses automatically, so the client code sees normal JSON.
+
+### Body parsing and validation
+
+Deserialization (binding) and validation can also live in middleware, attached per route with that route's schema. Whether it lives in middleware or in the handler is a codebase convention; just be consistent.
+
+### Global error handler
+
+Every backend should have **one place** that turns errors into responses. Wherever an error is thrown (a handler, a service, another middleware), it ends up here. The error handler:
+
+1. decides whether it's a **client error (4xx)** or **server error (5xx)**, often from a type or field on the error (`NotFoundError` becomes 404, `ValidationError` becomes 400, anything unknown becomes 500);
+2. logs it, with the request ID;
+3. returns a **consistent error shape**, including a machine-readable code the frontend can map to a friendly message;
+4. hides internals (stack traces, SQL) from the client for 5xx errors.
+
+```json
+{ "error": { "code": "NOTE_NOT_FOUND", "message": "Note not found", "requestId": "3f2b9c1e" } }
+```
+
+It's registered **last**, so it wraps everything before it. In Express, for example, an error handler is a middleware with four arguments `(err, req, res, next)` added after all routes.
+
+### A typical order
+
+```
+1. CORS                 answer preflights, reject bad origins early
+2. Request ID           so every later log line can include it
+3. Logging
+4. Security headers
+5. Rate limiting        cheap check before expensive work
+6. Body parsing
+7. Authentication       401 or set user in context
+8. Router → handler (validation, authorization, service, repository)
+9. Global error handler last, catches everything above
+```
+
+Treat this as a sensible default, not a law. Think through each requirement and order the chain deliberately.
+
+## Request context
+
+A **request context** is a small store, usually key–value, **scoped to a single request**. Every request gets its own fresh context, and it's discarded when the response is sent. Every middleware and handler along the way can read and write it.
+
+Implementations vary: `req.locals` or `res.locals` in Express, `AsyncLocalStorage` in Node, `context.Context` in Go, `request.state` in Starlette and FastAPI. The concept is the same.
+
+Why bother? Without it, the auth middleware would have to pass the user ID as a parameter through every function call down to the handler. With a context, one component **sets** a value and a later one **reads** it, without the two knowing about each other. The pieces stay **loosely coupled**.
+
+### Who is calling
+
+The most common use: the auth middleware stores the authenticated **user ID, role and permissions**. Later, `POST /notes` reads the user ID from the context to fill the `notes.owner_id` column, and permission checks read the role.
+
+<Callout kind="warn">
+**Never take the user's identity from the request body or query.** If `POST /notes` accepts `"ownerId": "u_123"` from the client, any user can create notes as anyone else. The only trustworthy identity is the one the auth middleware verified and put in the context.
+</Callout>
+
+### Tracing with request IDs
+
+An early middleware generates a unique **request ID** (often a UUID), or reuses one sent by a trusted upstream proxy, and stores it in the context. Every log line includes it, and when your service calls other services, it forwards the ID in a header such as `X-Request-ID`. When something fails, searching one ID shows the request's entire path through every service.
+
+```http
+X-Request-ID: 3f2b9c1e-7a4d-4e2b-9c11-0b8f5e6d2a90
+```
+
+It's also handy to return the ID in the response, so users can quote it in support tickets.
+
+### Deadlines and cancellation
+
+A context can carry a **deadline** ("this request must finish within 5 seconds") and a **cancellation signal** (the client disconnected). Database calls and outgoing HTTP calls that receive the context can then stop early instead of wasting resources on work nobody will receive. Go's `context.Context` and the `AbortSignal` in JavaScript are built for exactly this.
+
+<Callout kind="tip">
+Keep the context small: identity, request ID, deadline, maybe a locale. Don't use it to pass ordinary business data between your own functions; explicit parameters are easier to follow and test.
+</Callout>
+
+## Cheat sheet
+
+- Inside the server: port, then middleware, then router, then **handler, service, repository**, then the response.
+- The layer split is a **pattern**, not a rule: it buys maintainability, testability and clear debugging.
+- **Handler**: bind (400 on failure), validate and transform (defaults), call the service, choose the status and body.
+- **Service**: business logic and orchestration; it should **not know it's behind an API**.
+- **Repository**: builds and runs queries; **one method returns one kind of data**.
+- Middleware gets **req, res, next**: it can read, modify or **short-circuit**.
+- Middleware exists to **remove duplication** across endpoints; **order is behaviour**.
+- CORS first, auth returns **401**, rate limiting returns **429**, the **global error handler goes last**.
+- **Request context** is per-request key–value state shared across middleware and handlers.
+- Take the user ID **from the auth context, never from the payload**.
+- Context also carries the **request ID** (forwarded as `X-Request-ID`) and **deadlines and cancellation**.

@@ -1,0 +1,456 @@
+import { JwtInspector } from "@/components/widgets/JwtInspector";
+import { SessionVsJwt } from "@/components/widgets/SessionVsJwt";
+import { RbacChecker } from "@/components/widgets/RbacChecker";
+
+## Two different questions
+
+Every protected request has to answer two questions, in this order:
+
+| | Question | Example in a notes app | Failure status |
+|---|---|---|---|
+| **Authentication** (authn) | **Who are you?** | "This request comes from user 123, Asha." | `401 Unauthorized` |
+| **Authorization** (authz) | **What are you allowed to do?** | "Asha may edit note 42 because she owns it." | `403 Forbidden` |
+
+Authentication establishes an **identity** for whoever is making the request (a person, a device or another service) within a particular system. Authorization takes that identity and decides which **actions** it may perform on which **resources**.
+
+They're often blurred together, but keeping them apart makes systems easier to reason about. Authentication happens once per request, usually in middleware, and attaches the identity to the request. Authorization happens wherever a decision is made: "can this user delete this note?". And the HTTP status codes follow the split. `401` means "I don't know who you are, log in", while `403` means "I know exactly who you are, and the answer is no". (The name "Unauthorized" for 401 is a historical misnomer; it really means unauthenticated.)
+
+## A short history of proving identity
+
+Today's mechanisms make more sense once you see the problems they were invented to solve. Each era added a new kind of proof.
+
+### Recognition and trust
+
+In small communities, identity was **recognition**. People knew each other, a respected member could vouch for a stranger, and a handshake sealed a deal. This works only while everyone shares the same circle of trust. As trade spread between towns, a person vouched for at home was a stranger elsewhere, and people needed proof that worked **without personal acquaintance**.
+
+### Seals: something you have
+
+Medieval documents carried **wax seals** pressed from a unique ring or stamp. Possessing the seal proved authority, which made it an early **authentication token**: proof by **something you have**. It also introduced the first bypass attacks: forged seals. Defences followed, such as watermarks, signatures and coded phrases in trade documents, which is where cryptographic thinking starts.
+
+### Passphrases: something you know
+
+With the telegraph, messages travelled faster than any courier, and operators needed to confirm that a message really came from a trusted station. They used **pre-agreed passphrases**: a **shared secret**, or **something you know**. Like today's passwords, these were static, so anyone who overheard one could reuse it.
+
+### Passwords on shared computers
+
+In **1961**, MIT's **CTSS** (Compatible Time-Sharing System) let many people use one computer and gave each user a **password** so they couldn't read each other's files. The password file was stored in **plain text**, and in a famous incident it was printed out for anyone to see.
+
+The lesson stuck: **never store passwords in a form that can be read back**. That led to storing **hashes** instead (more on this below), and to thinking about security in terms of the **CIA triad**: **confidentiality** (only the right people see data), **integrity** (data isn't tampered with) and **availability** (the system works when needed).
+
+### Public-key cryptography and tickets
+
+In **1976**, Whitfield Diffie and Martin Hellman published a way for two parties to agree on a **shared secret over a channel an eavesdropper can see**. Together with RSA soon after, this gave us **asymmetric cryptography**: a public key anyone can know and a private key only the owner holds. It underpins TLS, certificates and **PKI** (public key infrastructure).
+
+**Kerberos** (MIT, 1980s) introduced **tickets**: a trusted third party verifies you once and issues a time-limited ticket that services accept as proof. That's the direct ancestor of today's **token-based** authentication.
+
+### Multi-factor authentication
+
+As more services went online, passwords alone fell to **brute-force** attacks (trying every combination) and **dictionary** attacks (trying common passwords). **Multi-factor authentication** (MFA) requires proofs from two or more categories:
+
+| Factor | Examples |
+|---|---|
+| Something you **know** | Password, PIN |
+| Something you **have** | Phone with an authenticator app, hardware key, smart card |
+| Something you **are** | Fingerprint, face, retina |
+
+A stolen password is useless without the second factor. Biometrics are convenient but not perfect: they have false accepts and false rejects, and unlike a password, you can't change your fingerprint once its stored template leaks.
+
+### The modern era and what comes next
+
+Cloud services, mobile apps and API-first architectures brought **OAuth 2.0** (delegated access), **JWTs** (self-contained tokens), **zero-trust** architecture (never trust a request just because it comes from inside your network) and **passwordless** login such as **WebAuthn / passkeys**, where a private key stays on your device and the server only ever stores the public key.
+
+Looking ahead, people are exploring **decentralized identity** (credentials you hold yourself rather than accounts at each site, still early), **behavioural biometrics** (how you type or move) and **post-quantum cryptography**. Large quantum computers would break RSA and elliptic-curve algorithms, so new algorithms designed to resist them are already being standardized and rolled out.
+
+## Storing passwords
+
+Before any session or token, a login has to check a password. The server must never store that password in a recoverable form. Instead it stores a **hash**: the output of a one-way function.
+
+- A hash is **one-way**: you can't compute the password from it.
+- It's **deterministic**: the same input always gives the same output, so you can check a login by hashing the attempt and comparing.
+- Its output has a **fixed length**, whether the input is 3 characters or 300.
+
+Determinism has a downside. If two users pick `sunshine1`, they'd get identical hashes, and attackers can precompute hashes of millions of common passwords. So real systems add a **salt**: a random value generated per user and stored next to the hash. Same password, different salt, different stored hash.
+
+General-purpose hashes like SHA-256 are also far too **fast**: a GPU can try billions per second. Password storage uses deliberately **slow, tunable** algorithms: **Argon2id** (the current recommendation), **bcrypt** or **scrypt**. They make each guess cost real time and memory.
+
+```text
+stored = argon2id(password, salt, cost settings)
+login ok  ⇔  argon2id(attempt, same salt, same settings) == stored
+```
+
+## Sessions
+
+### Why sessions exist
+
+HTTP is **stateless**: each request stands alone, and the server remembers nothing between them. That was fine for a web of static documents. It stopped being fine once sites needed to remember things across requests: that you're logged in, what's in your shopping cart, which step of a checkout you're on.
+
+A **session** adds memory **on the server side**. It's a small record of context about one user's visit, stored by the server and looked up on every request.
+
+### How a session works
+
+1. **Create.** After a successful login, the server generates a long, **cryptographically random session ID** and stores a record: user ID, role, maybe cart contents, created and expiry times.
+2. **Hand it out.** The server sends the session ID to the browser in a cookie.
+3. **Look it up.** On every later request the browser sends the cookie back. The server looks up the ID, finds the user and continues.
+4. **Expire.** Sessions have a lifetime. An **idle timeout** (say 30 minutes without activity, extended on each request: a *sliding* expiry) plus an **absolute timeout** (say 7 days, however active you are). After expiry the user logs in again and gets a brand-new session.
+
+The session ID itself means nothing; it's a random pointer into the server's store. Stealing it lets an attacker act as the user, so it must be unguessable and protected in transit (HTTPS) and in the browser (HttpOnly cookies). The server should also issue a **new** session ID at login, so an attacker can't plant a known ID beforehand (session fixation).
+
+### Where sessions live
+
+| Era | Store | Trade-off |
+|---|---|---|
+| Early web | **Files** on the web server | Simple, but tied to one machine and slow with many users |
+| Growth | **Database** table | Survives restarts and works across several servers, but adds a query per request |
+| Today | **Redis** or Memcached, in memory | Very fast reads, shared by all app servers, built-in key expiry |
+
+Redis is the common default: a session lookup is a single key read, and keys can expire automatically.
+
+## Cookies
+
+A **cookie** is a small piece of data a server asks the browser to store, using a response header:
+
+```http
+Set-Cookie: sid=9f2c...e1; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800
+```
+
+From then on, the browser **automatically attaches** it to matching requests:
+
+```http
+Cookie: sid=9f2c...e1
+```
+
+That automatic round trip is what makes cookies convenient for authentication: the frontend writes no code to send credentials. Cookies are scoped: the browser only sends a cookie to the **domain and path it was set for**, so `shop.example` can't read cookies set by `notes.example`.
+
+The attributes matter a lot for security:
+
+| Attribute | Effect | Why it matters |
+|---|---|---|
+| `HttpOnly` | JavaScript can't read the cookie | An XSS bug can't steal the session ID |
+| `Secure` | Only sent over HTTPS | No leaking over plain HTTP |
+| `SameSite=Lax` or `Strict` | Not sent on most cross-site requests | Main defence against **CSRF**, where another site makes the browser send your cookie |
+| `Max-Age` / `Expires` | When the browser deletes it | Without it, the cookie lasts until the browser session ends |
+| `Domain`, `Path` | Where it's sent | Keep the scope as narrow as possible |
+
+A cookie can carry either a **session ID** or a **token** such as a JWT. The cookie is just the transport.
+
+## JWTs
+
+### Why JWTs appeared
+
+As applications spread across many servers and regions, server-side sessions started to hurt. Every request needed a lookup in a shared store; keeping millions of sessions in memory cost money; and replicating that store across regions added latency and consistency problems. The idea behind **JSON Web Tokens** (JWT, standardized as RFC 7519 in 2015) is to move the state **into the token itself**: the server hands the client a signed statement of who it is, and any server can check that statement without a lookup.
+
+### Structure
+
+A JWT is three **Base64URL-encoded** parts separated by dots:
+
+```text
+header.payload.signature
+```
+
+```json
+// header
+{ "alg": "HS256", "typ": "JWT" }
+
+// payload (the "claims")
+{
+  "sub": "user_123",
+  "name": "Asha",
+  "role": "member",
+  "iat": 1772357400,
+  "exp": 1772358300,
+  "iss": "https://auth.notes.dev"
+}
+```
+
+- The **header** says how the token is signed.
+- The **payload** holds **claims**. Standard ones include `sub` (subject, usually the user ID), `iat` (issued at), `exp` (expiry), `iss` (issuer) and `aud` (audience: which service it's meant for). You can add your own, like `role`.
+- The **signature** is computed over `header.payload` with a key. If anyone changes a single character of the header or payload, the signature no longer matches.
+
+<Callout kind="warn">
+Base64URL is an **encoding**, not encryption. Anyone holding a JWT can decode and read its payload. Never put passwords, secrets or sensitive personal data in it. The signature guarantees **integrity** (it wasn't changed), not **confidentiality**.
+</Callout>
+
+### Signing and verifying
+
+There are two common families of algorithm:
+
+- **HS256** (HMAC): one **shared secret** both signs and verifies. Simple, but every service that verifies tokens holds the key that can also **mint** them.
+- **RS256 / ES256** (asymmetric): the auth server signs with a **private key**; other services verify with the matching **public key**, often fetched from a published key set (JWKS). A compromised API server can't forge tokens. This is the usual choice once several services are involved.
+
+The server must also check `exp` (and `iss` and `aud` where used), and must only accept the algorithm it expects. Some old libraries accepted `"alg": "none"`, which let attackers send unsigned tokens.
+
+<JwtInspector />
+
+### Strengths
+
+- **Stateless.** Verification is CPU work only: no session store, no lookup.
+- **Scales horizontally.** Any server or microservice holding the verification key can authenticate the request, in any region.
+- **Portable.** A compact, URL-safe string that works in an `Authorization` header, a cookie or a mobile app's secure storage, across domains.
+
+### Weaknesses
+
+- **Theft.** A JWT is a **bearer** token: whoever holds it is treated as its owner until it expires. Nothing on the server knows it was stolen.
+- **Revocation.** Because the server keeps no record, it can't "log out" one specific token before `exp`. Rotating the signing key invalidates it, but also **every other user's** token.
+- **Stale claims.** If you demote an admin, their existing token still says `"role": "admin"` until it expires.
+
+### Access and refresh tokens
+
+The standard way to limit the damage is to keep **access tokens short-lived** (5 to 15 minutes) and pair them with a **refresh token**:
+
+1. Login returns a short-lived **access token** (JWT) and a long-lived **refresh token**.
+2. The client sends the access token on every API request.
+3. When it expires, the client calls a refresh endpoint with the refresh token and gets a new access token.
+4. Refresh tokens are **stored server-side** (or tracked by ID), so they **can** be revoked, and they're usually **rotated** on each use so a stolen one is detected.
+
+A stolen access token now works for minutes, not days, and logging a user out means revoking their refresh token.
+
+### The denylist compromise
+
+Another option is to keep a **denylist** (blacklist) of revoked token IDs (the `jti` claim) in Redis and check it after verifying the signature. It works, but it's worth noticing what just happened: every request now does a store lookup again, which was the very cost JWTs were meant to remove. If you need instant revocation on every request, plain server-side sessions are often the simpler, more honest design.
+
+### Where clients keep tokens
+
+In a browser, a token in `localStorage` is readable by any JavaScript on the page, so a single XSS bug leaks it. For browser apps, prefer an **HttpOnly, Secure, SameSite cookie**. Native mobile apps should use the platform's secure storage (Keychain on iOS, Keystore on Android).
+
+## Stateful authentication
+
+Stateful authentication means the server keeps the authoritative record of who is logged in. A typical flow for the notes web app:
+
+```text
+1. Browser → POST /login  { email, password }
+2. Server: find user, verify password hash, create session in Redis
+           sess:9f2c… → { userId: 123, role: "member", expiresAt: … }
+3. Server → 200 OK, Set-Cookie: sid=9f2c…; HttpOnly; Secure; SameSite=Lax
+4. Browser → GET /notes, Cookie: sid=9f2c…   (sent automatically)
+5. Server: look up sess:9f2c… → missing or expired? 401 : attach user, continue
+```
+
+Logout is a single delete of the session key, and the next request with that cookie gets `401`.
+
+## Stateless authentication
+
+Stateless authentication puts everything the server needs inside a signed token:
+
+```text
+1. Client → POST /login  { email, password }
+2. Server: verify password, sign a JWT { sub: 123, role: "member", exp: +15 min }
+3. Server → 200 OK  { accessToken: "eyJ…", refreshToken: "…" }
+4. Client → GET /notes, Authorization: Bearer eyJ…
+5. Server: verify signature and exp with the key → valid? attach user : 401
+```
+
+No store is consulted in step 5. The signing key is the crown jewel: anyone who has it can mint tokens for any user, so it lives in a secrets manager, never in the code.
+
+## Choosing stateful or stateless
+
+| | Stateful (sessions) | Stateless (JWT) |
+|---|---|---|
+| Per-request cost | A store lookup (fast with Redis) | Signature check only |
+| Revocation | **Instant**: delete the session | **Hard** before expiry |
+| Visibility | You can list and manage active sessions ("log out other devices") | No central view |
+| Scaling | Needs a shared store reachable by every server and region | Any server with the key can verify |
+| Natural fit | Browser web apps on your own domain | APIs called from mobile apps, other services, multiple domains |
+
+<SessionVsJwt />
+
+A sensible default for most products:
+
+- Use **sessions** for your own browser web app. Revocation, visibility and HttpOnly cookies give you strong security with little effort, and a Redis lookup is cheap.
+- Use **short-lived JWTs with refresh tokens** where statelessness pays off: mobile clients, many services verifying the same identity, or third-party consumers of your API.
+
+## API keys
+
+Sometimes there's no human at a login screen at all. Your shop's backend calls a payment provider to charge a card; a nightly job calls a mailing service; your notes server calls a language-model API to summarize a note. This is **machine-to-machine** (M2M) communication, and it needs credentials that a program can hold.
+
+An **API key** is a long random string that a platform generates for you, usually from a dashboard "Create API key" button. Your server sends it with each request, typically in a header:
+
+```http
+POST /v1/summaries HTTP/1.1
+Host: api.ai-provider.example
+Authorization: Bearer sk_live_8f3a…
+```
+
+The provider looks the key up and knows which account is calling, which **permissions** (scopes) the key has, its **rate limits and quota**, and whether it has **expired or been revoked**.
+
+Why API keys work well for M2M:
+
+- **Easy to issue**: one click, no login flow, no redirects.
+- **No human needed**: the key sits in an environment variable or a secrets manager, and the program sends it on every call.
+
+Treat them like passwords. Keep them **server-side only**: a key shipped in frontend JavaScript or a mobile app binary is public. Give each key the **narrowest scopes** it needs, use separate keys per environment, rotate them, and store only a **hash** of each key on the issuing side, just as you would with passwords.
+
+## OAuth 2.0 and OpenID Connect
+
+### Too many passwords
+
+As people signed up for more and more sites, two problems grew. **Password fatigue**: dozens of accounts to remember. And **password reuse**: the same weak password everywhere, so one breach unlocked many accounts.
+
+### The delegation problem
+
+At the same time, apps started wanting access to data held elsewhere. A travel app wants to read flight confirmations from your email. A social app wants to import your contacts. The early approach was shockingly simple: **give the app your email password**. That was a disaster:
+
+- A password grants **full access**. The travel app that only needed to read flight emails could also delete your mail or change your settings.
+- The only way to **revoke** access was to change your password, which logged out everything else (and, because of reuse, often meant changing it on other sites too).
+
+### Tokens instead of passwords
+
+**OAuth** (Open Authorization) was designed by engineers from companies including Google and Twitter to solve delegation **without sharing passwords**. The core idea: the user approves a **specific, limited** grant, and the app receives a **token** that carries only that grant, such as "read contacts". It can be revoked on its own, without touching the password.
+
+OAuth defines four roles:
+
+| Role | Meaning | Example |
+|---|---|---|
+| **Resource owner** | The user who owns the data | You |
+| **Client** | The app that wants access | A contact-importing social app |
+| **Authorization server** | Authenticates the user, asks for consent, issues tokens | Google's accounts server |
+| **Resource server** | The API holding the data, which accepts the tokens | Google's Contacts API |
+
+**OAuth 1.0** (2007) worked, but required every request to be **cryptographically signed** by the client, which developers found complex and easy to get wrong.
+
+**OAuth 2.0** (2012) simplified things in two ways:
+
+1. **Bearer tokens** sent over HTTPS replaced per-request signatures. Simpler, at the cost that a stolen token can be replayed, which is why TLS and short lifetimes matter.
+2. **Different flows (grant types)** for different kinds of clients:
+
+| Grant | For | Notes |
+|---|---|---|
+| **Authorization code** (+ **PKCE**) | Web apps with a backend, and today also SPAs and mobile apps | The recommended flow for anything with a user |
+| **Implicit** | Browser-only apps (historically) | **Deprecated**: tokens came back in the URL, where they leaked. Use authorization code + PKCE instead |
+| **Client credentials** | Machine-to-machine, no user | The service authenticates as itself |
+| **Device code** | Smart TVs, CLIs and other devices without a good keyboard | You approve on your phone while the TV polls |
+
+### OpenID Connect
+
+OAuth 2.0 answers "**what may this app do** on the user's behalf?". It deliberately doesn't say **who the user is**. An access token is like a hotel key card: it opens doors, but it isn't an ID card. Apps that misused access tokens as proof of identity created real security holes.
+
+**OpenID Connect** (OIDC, 2014) is a thin identity layer **on top of OAuth 2.0**. It adds an **ID token**, which is a **JWT** containing claims about the authentication: `sub` (a stable user ID at that provider), `iss` (the issuer), `aud` (your app), `iat` and `exp`, `auth_time` (when the user logged in), plus profile claims such as `email`, `name` and `picture` if you asked for them. OIDC is what powers every **"Sign in with Google / Microsoft / GitHub"** button.
+
+### Sign in with Google step by step
+
+Say the notes app offers "Sign in with Google" and also wants to read the user's Google Calendar to attach notes to meetings:
+
+1. The user clicks the button. The notes app **redirects** the browser to Google's authorization server, asking for scopes `openid email profile calendar.readonly` (plus a PKCE challenge and a random `state` value).
+2. The user **logs in on Google's own page**, so the notes app never sees the Google password, and **approves** the requested access.
+3. Google redirects back to the notes app with a short-lived **authorization code**.
+4. The notes backend **exchanges the code** with Google, server to server, for an **ID token** and an **access token** (and possibly a refresh token).
+5. The backend **verifies the ID token** (signature, `iss`, `aud`, `exp`) and reads `sub` and `email`. That's **authentication**: it finds or creates the local user and starts its **own** session.
+6. Later, the backend calls the Calendar API with the **access token**. That's **authorization**: it can read calendars and nothing more.
+
+<Callout kind="remember">
+**ID token** = who the user is, meant for **your app**. **Access token** = permission to call an API, meant for the **resource server**. Don't use one in place of the other.
+</Callout>
+
+## Which method when
+
+| Method | Best for |
+|---|---|
+| **Stateful sessions** | Your own browser web app; most SaaS dashboards |
+| **Stateless JWTs** | APIs used by mobile apps or multiple services; distributed systems |
+| **OAuth 2.0 / OIDC** | "Sign in with…", and accessing a user's data in another service |
+| **API keys** | Server-to-server calls to an API you or a vendor expose |
+
+Most backends combine several: sessions for the website, OIDC for social login, JWTs for the mobile API, and API keys for third-party developers.
+
+### Build it or buy it
+
+Authentication has a long tail of details: hashing parameters, MFA, password reset, email verification, rate limiting, session fixation, key rotation, account recovery. For a production system, especially a medium or large one, an **identity provider** such as Auth0, Clerk, Cognito, Firebase Auth or Keycloak takes most of that off your plate. Build it yourself while **learning**, so you understand every moving part, and in production when you have a good reason and real confidence in the details.
+
+## Authorization
+
+### The god-mode trap
+
+Suppose the notes app moves deleted notes to a trash bin, and after 30 days into a hidden **"dead zone"**: invisible to users but still in the database. You want an admin screen to inspect and purge dead-zone notes, and regular users must not be able to do this.
+
+The tempting shortcut is a secret **"god-mode" string**: any request carrying `X-Admin-Key: letmein` can do anything. It goes wrong fast:
+
+- If it leaks (a log, a screenshot, a departing contractor), the attacker can read or wipe **everyone's** data.
+- It doesn't scale. Giving a teammate access means sharing the same string; giving someone *partial* access is impossible; revoking one person means rotating it for everyone.
+- There's no record of **who** did what.
+
+What you actually want is to give **specific permissions to specific identities**. In a multi-tenant SaaS product, the same need appears inside customer organizations: an org admin wants some members to have read-write access and others read-only.
+
+### Role-based access control
+
+**RBAC** groups permissions into **roles** and assigns roles to users. You reason about a handful of roles instead of thousands of individual users.
+
+| Permission | user | moderator | admin |
+|---|---|---|---|
+| Create, edit, delete **own** notes | ✓ | ✓ | ✓ |
+| Hide any note for abuse | – | ✓ | ✓ |
+| View dead-zone notes | – | – | ✓ |
+| Purge dead-zone notes | – | – | ✓ |
+
+Name permissions explicitly (`deadzone:read`, `notes:hide:any`) and have code check **permissions**, not role names. Adding a "support" role later then means editing the mapping, not every `if` statement.
+
+### RBAC in the request cycle
+
+1. At sign-up the user is assigned a default role (`user`); admins can change it later. In multi-tenant apps the role is per organization.
+2. Each request carries the user's identity: a session cookie or a JWT.
+3. **Early in the request**, authentication middleware resolves the identity, loads the role (from the session record, a database lookup or a JWT claim) and attaches it to the request context.
+4. Route handlers or authorization middleware check the permission. Missing identity: `401`. Identity present but permission missing: **`403 Forbidden`**.
+
+```ts
+router.get("/admin/dead-zone", requireAuth, requirePermission("deadzone:read"), listDeadZone);
+```
+
+### Ownership checks
+
+Roles alone don't answer "can Asha edit **note 42**?". Every user has `notes:write:own`; the handler must still check that note 42 belongs to Asha. Forgetting this check is one of the most common API vulnerabilities (broken object-level authorization, also called IDOR): change the ID in the URL and read someone else's data. Policies that combine roles with attributes of the user and the resource, such as owner, organization or status, are called **attribute-based access control** (ABAC).
+
+<RbacChecker />
+
+<Callout kind="tip">
+Authorization always happens on the **server**. Hiding the admin button in the UI is good UX, not security; anyone can send the request directly.
+</Callout>
+
+## Secure error messages
+
+On a login form it's tempting to be helpful:
+
+- "No account with that email."
+- "Incorrect password."
+- "Account locked after too many attempts."
+
+Each one hands an attacker information. "No account" tells them to move on to the next email in their list. "Incorrect password" confirms the account **exists**, so they can focus a brute-force or credential-stuffing attack on it. This is called **user enumeration**.
+
+In authentication flows, return **one generic message** for every failure, such as **"Invalid email or password"**, with the same status code. The same applies to "forgot password": always reply "If that email has an account, we've sent a link". Detailed messages are fine everywhere else (form validation, business errors); only the identity-revealing paths need to stay vague.
+
+## Timing attacks
+
+Even with identical messages, the **time** a response takes can leak information. A typical login does:
+
+1. Look up the user by email.
+2. Check whether the account is locked or disabled.
+3. Hash the submitted password with the stored salt and compare it with the stored hash.
+
+If the email doesn't exist, the server fails at step 1 and answers in a few milliseconds. If it exists, it reaches step 3, and a slow password hash takes, say, 200 ms. By measuring response times, an attacker can tell which emails are registered without ever seeing a different message.
+
+Defences:
+
+- **Do the same work on every path.** When the user isn't found, still run the password hash against a fixed dummy hash, then return the generic error. This equalizes timing far better than a fixed `sleep`, because a sleep can't match the real hash's variable cost.
+- **Use constant-time comparison** for secrets: hashes, API keys, HMAC signatures, reset tokens. A normal string comparison returns at the first differing byte, which leaks how much of the value matched. Use your platform's helper (`crypto.timingSafeEqual` in Node, `hmac.compare_digest` in Python, `subtle.ConstantTimeCompare` in Go). Password-hash libraries such as bcrypt and Argon2 already compare safely.
+- **Rate-limit** login attempts per account and per IP, which slows down every kind of guessing.
+
+```ts
+const user = await users.findByEmail(email);
+const hash = user?.passwordHash ?? DUMMY_HASH;      // always hash something
+const ok = await argon2.verify(hash, password);      // constant-time inside
+if (!user || !ok || user.locked) {
+  return res.status(401).json({ error: "Invalid email or password" });
+}
+```
+
+## Cheat sheet
+
+- **Authentication** = who are you (`401`); **authorization** = what may you do (`403`).
+- Store passwords with a **salted, slow hash** (Argon2id, bcrypt), never plain text or fast SHA.
+- **Sessions**: random ID in an **HttpOnly, Secure, SameSite** cookie, data in Redis; logout is a delete.
+- A **JWT** is header.payload.signature, **encoded not encrypted**; the signature proves it wasn't altered.
+- JWTs scale without lookups but **can't be revoked** before `exp`; use **short access tokens + revocable refresh tokens**.
+- A denylist brings back per-request lookups; if you need that, sessions are often simpler.
+- Default: **sessions for your web app**, **JWTs for mobile and multi-service APIs**.
+- **API keys** for machine-to-machine; keep them server-side, scoped and rotated.
+- **OAuth 2.0** delegates limited access without sharing passwords; use **authorization code + PKCE**, not implicit.
+- **OIDC** adds the **ID token** (a JWT) for identity: the basis of "Sign in with Google".
+- **RBAC**: roles map to permissions, resolved in middleware; always add **ownership checks**.
+- Auth errors stay **generic**; equalize timing with a **dummy hash** and **constant-time** comparisons.

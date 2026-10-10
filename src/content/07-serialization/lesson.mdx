@@ -1,0 +1,170 @@
+import { JsonRoundTrip } from "@/components/widgets/JsonRoundTrip";
+
+## The problem
+
+Your notes app has a React frontend and a backend written in Go (or Rust, or Python). The user types a note and presses Save. In the browser, that note is a JavaScript object:
+
+```ts
+const note = { title: "Groceries", pinned: true, tags: ["home"] };
+```
+
+On the server, the same note should become a typed structure:
+
+```go
+type Note struct {
+    Title  string   `json:"title"`
+    Pinned bool     `json:"pinned"`
+    Tags   []string `json:"tags"`
+}
+```
+
+These two things have nothing in common at the memory level. A JavaScript object lives on the JS engine's heap with dynamic types; a Go struct is a fixed block of memory laid out by the compiler. Neither side can read the other's memory, and even if it could, the layouts wouldn't match. Between them is a network that only moves **bytes**.
+
+So both sides need to agree on a **shared format**: a way of writing data as bytes that any language can produce and read.
+
+## Serialization and deserialization
+
+- **Serialization** turns an in-memory value into that shared format (an object into a JSON string, then bytes).
+- **Deserialization** goes the other way, from the shared format into a native value (JSON bytes into a Go struct, a Python dict or a JS object).
+
+A single request-response cycle does this four times:
+
+1. The browser **serializes** the note to JSON and sends it as the request body.
+2. The server **deserializes** the body into a `Note` struct and runs its logic.
+3. The server **serializes** its result (the saved note, with an ID) into JSON.
+4. The browser **deserializes** the response and renders it.
+
+Serialization isn't only for the network. The same idea applies whenever data leaves a program's memory: writing to a **file**, storing a value in a **cache** like Redis, putting a message on a **queue**, saving a **JSON column** in Postgres, or writing **structured logs**. You'll also hear it called marshalling/unmarshalling (Go), encoding/decoding, or pickling (a Python-only format).
+
+## Where it sits in the stack
+
+Underneath your request, the network stack splits data into segments, packets and frames, and eventually sends signals over copper, radio or fibre. The OSI model describes those layers, and it's worth knowing at a high level, but as a backend engineer you work at the top: the **application layer**.
+
+The useful mental model is simple:
+
+```text
+Your code  ──JSON──►  [ transport, network, physical layers ]  ──JSON──►  Their code
+```
+
+Whatever bytes you put in, the same bytes come out at the other end. Everything in the middle is the network's job. What *you* control is which format you choose, how you map it to your types, and what you do with input that doesn't fit.
+
+The body's format is announced with the `Content-Type` header, usually `application/json`, and the client asks for a format with `Accept`. That's how the receiver knows which deserializer to use.
+
+## Text and binary formats
+
+Formats fall into two families:
+
+| | Text formats | Binary formats |
+|---|---|---|
+| Examples | **JSON**, XML, YAML, CSV | **Protocol Buffers**, Avro, MessagePack, CBOR |
+| Human-readable? | Yes; you can read it in logs or DevTools | No; you need tooling to inspect it |
+| Size and speed | Larger; parsing text is slower | Compact and fast to encode/decode |
+| Schema | Optional (JSON Schema, OpenAPI) | Usually required (`.proto` files, Avro schemas) |
+| Typical home | Public HTTP APIs, config files, logs | Service-to-service calls (gRPC), data pipelines (Kafka), high-volume storage |
+
+JSON dominates public web APIs because every language has a parser, browsers handle it natively, and you can debug it by eye. Protobuf shines when the same two services exchange millions of messages: a shared schema means smaller payloads, faster parsing and type checking on both ends. YAML is mostly used for **configuration** (Kubernetes, CI pipelines) rather than API traffic, and XML lives on in older enterprise systems and document formats.
+
+## JSON
+
+**JSON** (JavaScript Object Notation) borrows JavaScript's object-literal syntax, but it's a language-independent standard (RFC 8259). It shows up in API bodies, config files (`package.json`, `tsconfig.json`), structured logs and database columns.
+
+A JSON document is a single **value**, and there are exactly six kinds:
+
+| Type | Example | Notes |
+|---|---|---|
+| object | `{"id": 7}` | Keys **must be double-quoted strings** |
+| array | `["home", "work"]` | Ordered, may mix types |
+| string | `"Groceries"` | **Double quotes only**; escapes like `\n`, `\"`, `é` |
+| number | `42`, `-3.5`, `1e9` | No `NaN`, `Infinity`, leading zeros or hex |
+| boolean | `true`, `false` | Lowercase |
+| null | `null` | An explicit "no value" |
+
+The top-level value is usually an object, but it doesn't have to be. `[1, 2, 3]`, `"hello"` and `42` are all valid JSON documents. Objects and arrays nest freely:
+
+```json
+{
+  "id": 7,
+  "title": "Groceries",
+  "pinned": true,
+  "tags": ["home"],
+  "folder": null,
+  "owner": { "id": 12, "name": "Asha" }
+}
+```
+
+### What strict JSON rejects
+
+JSON is deliberately small, and parsers are strict. These are all **invalid**:
+
+- single-quoted strings: `{'id': 7}`
+- unquoted keys: `{id: 7}`
+- trailing commas: `{"id": 7,}`
+- comments: `// note id`
+- `undefined`, `NaN`, `Infinity`, functions
+
+Config formats like JSON5 and JSONC (used by VS Code's settings and `tsconfig.json`) relax some of these rules, but an API body should be plain JSON. JSON text is encoded as **UTF-8**.
+
+## The pitfalls
+
+The JSON type system is smaller than any real language's, so some information doesn't survive the trip. These are the classic bugs:
+
+- **Dates.** There is no date type. Dates travel as strings, ideally **ISO-8601 in UTC** (`"2026-03-01T09:30:00Z"`), and the receiver must parse them back into a date. Unix timestamps also work, but agree whether they're seconds or milliseconds.
+- **Big integers.** JSON numbers have no size limit, but JavaScript stores every number as a 64-bit float, which represents integers exactly only up to 2^53 − 1 (9,007,199,254,740,991). A 64-bit database ID like `9007199254740993` silently becomes `...992` in the browser. Send large IDs and money-sensitive values as **strings**.
+- **Decimals.** `0.1 + 0.2` isn't `0.3` in floating point. Represent money as integer cents or as a decimal string.
+- **Missing vs null.** JavaScript drops keys whose value is `undefined`, so they don't appear at all; `null` is sent explicitly. For a PATCH request this difference matters: a missing field means "don't change it", `null` means "clear it".
+- **Unsupported types.** `Map`, `Set`, class instances with private state and binary data don't map directly. Convert them to arrays, plain objects or Base64 strings first.
+- **Naming conventions.** JavaScript prefers `camelCase`, Python and Postgres often prefer `snake_case`. Pick one for the API and map at the edges (the `json:"title"` struct tag above is exactly that mapping).
+
+<JsonRoundTrip />
+
+## Deserialization is untrusted input
+
+Everything a client sends you is **untrusted**. Deserializing it is the first thing your server does with it, so this is where defensive habits start:
+
+- If the body isn't valid JSON, reply **`400 Bad Request`**, not 500.
+- Valid JSON isn't valid data. `{"title": 42}` parses fine but has the wrong type; `{}` parses fine but is missing required fields. Check the shape against a schema (validation is the next lecture's topic).
+- Cap the body size so a 2 GB payload can't exhaust memory.
+- Ignore or reject fields you didn't expect, so a client can't slip `"role": "admin"` into a profile update (this bug is called **mass assignment**).
+- Never use a format that can rebuild arbitrary objects or run code (Python's `pickle`, Java's native serialization) on data from outside your system. Insecure deserialization of such formats has led to many remote-code-execution vulnerabilities. JSON is safe here because it can only describe plain data.
+
+Typed languages give you some of this for free: decoding into a Go struct or a Rust type fails if a field has the wrong type. Dynamic languages need a validation library to get the same guarantee.
+
+## A request end to end
+
+Here's the notes app creating a note:
+
+```http
+POST /api/v1/notes HTTP/1.1
+Content-Type: application/json
+
+{"title":"Groceries","tags":["home"],"dueAt":"2026-03-01T09:30:00Z"}
+```
+
+1. The server sees `Content-Type: application/json` and runs its JSON decoder over the body.
+2. The decoder produces a `CreateNote` value. `dueAt` is still a string, so the server parses it into a real timestamp.
+3. Validation checks the title is a non-empty string and the tags are strings.
+4. The note is stored, and the service gets back a `Note` with a numeric `id` and a timestamp `createdAt`.
+5. The handler serializes the result:
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{"id":"9007199254740993","title":"Groceries","tags":["home"],"createdAt":"2026-02-27T10:02:11Z"}
+```
+
+Notice the ID sent as a string and the timestamp as ISO-8601: two deliberate choices that keep the browser's deserializer from losing information.
+
+## Cheat sheet
+
+- **Serialize** = in-memory value to a shared format; **deserialize** = shared format back to native values.
+- It's needed whenever data leaves memory: network, files, caches, queues, logs.
+- **Text** formats (JSON, YAML, XML) are readable; **binary** formats (Protobuf, Avro) are compact and schema-driven.
+- JSON has six types: **object, array, string, number, boolean, null**.
+- Keys and strings use **double quotes**; no comments, trailing commas, `NaN` or `undefined`.
+- Any JSON value can be the top level, not just an object.
+- Dates travel as **ISO-8601 strings**; big IDs and money as **strings**.
+- `undefined` keys vanish; use **null** to say "empty" explicitly.
+- `Content-Type: application/json` tells the server which decoder to use.
+- Unparseable body: **400**. Parsed body still needs **validation**.
+- Never deserialize untrusted data with code-executing formats like `pickle`.

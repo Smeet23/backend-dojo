@@ -1,0 +1,508 @@
+import { PresignedUploadLab } from "@/components/widgets/PresignedUploadLab";
+import { PrefixListing } from "@/components/widgets/PrefixListing";
+
+## Files are a different kind of data
+
+Your notes app already has auth, a database and a clean handler, service and repository structure. Then a new requirement lands: **users can upload a profile picture**. A month later product asks for **video notes** too.
+
+Most of what a backend handles is small, structured JSON: a note title, an order line, a user record. User files are a different shape of data entirely:
+
+- **Size.** A profile picture is a few hundred KB to 10 MB. A camera RAW can be 20 MB. A video is anywhere from a few MB to several GB.
+- **Access pattern.** A file is written once, almost never edited, and read many times, often by people far away on slow networks.
+- **Cost profile.** Files are the fastest-growing data in nearly every product, and they cost money to store *and* to send.
+
+Different data deserves a different storage system. For files, that system is **object storage** (Amazon S3, Cloudflare R2, Backblaze B2, Google Cloud Storage, MinIO). This lesson explains why, how it works inside, and how to get bytes from a user's laptop into a bucket safely. Part 2 covers large files, downloads and cost.
+
+## Saving uploads to local disk
+
+The obvious first design looks like this:
+
+1. The browser sends the image as `multipart/form-data`.
+2. Your handler reads it and writes it to the server's disk, say `/var/app/uploads/avatar-42.png`.
+3. You store that path in the `users` table so later requests can find the file and send it back.
+
+It works on your laptop. Profile pictures are small, they fit in memory, and you have one server. It falls apart in production, sometimes on the very next request.
+
+### The 4 GB video
+
+Picture a mid-size startup running containers with **4 GB of RAM** each. Video notes ship, and a user uploads a **4 GB** recording.
+
+- Many frameworks helpfully read the **entire request body into memory** before your handler runs. 4 GB of video in a 4 GB container means **out of memory**, and the orchestrator kills the container.
+- The platform restarts it automatically. The new container starts from the image, which contains your code, not your users' files. **Every upload stored on that instance is gone.**
+- Last month you scaled to **three instances**. The files that survived only exist on the instance that received them, so roughly **one in three** profile-picture requests now returns `404`.
+
+The root mistake is the assumption that **a file is something your application owns**. It isn't. Your app server is the wrong place to keep it.
+
+## Six problems with local disk
+
+Even if nobody uploads a 4 GB video, storing files on the app server's disk has six separate problems.
+
+### Ephemeral containers
+
+Docker, Kubernetes, PaaS platforms like Render or Railway, and serverless platforms all run your app in a **container**, and a container's file system is **ephemeral**: it lives only as long as that container. Every deploy throws the old container away and starts a fresh one from the new image, so user files are wiped **on every deploy**.
+
+A **persistent volume** (a disk attached to the container that survives restarts) fixes ephemerality. That's what volumes are for. It does nothing for the next two problems.
+
+### Horizontal scaling
+
+Three instances sit behind a load balancer. An upload lands on instance 1 and is written to its disk. Two minutes later the browser asks for the image, round robin sends that request to instance 3, and instance 3 has never heard of the file: `404`.
+
+With N instances, the chance of hitting the right one is about **1 in N**, so the problem gets *worse* as you scale. Local files break the property that makes horizontal scaling work: **statelessness**. An instance must never hold state the others don't have.
+
+### Disks only grow vertically
+
+You can add instances, but a disk only grows by making it **bigger**. Resizing often means downtime (detach, resize, reattach), and every provider has a **maximum disk size**. Meanwhile uploads grow forever: 1,000 active users uploading 100 MB a month is **100 GB of new data every month**, and people rarely delete.
+
+### Durability
+
+One server means one disk, and disks die: hardware faults, power events, a bad firmware update. If that disk held the only copy, the files are gone. Two terms are worth separating:
+
+| Term | Question it answers | When it fails |
+|---|---|---|
+| **Availability** | Can I reach the data **right now**? | Annoying. Wait for the fix and the data comes back. |
+| **Durability** | Does the data **still exist** anywhere? | Permanent. No amount of waiting brings it back. |
+
+The only real answer to durability is **multiple copies**, which quickly drags in checksums, background corruption detection and automatic repair. That's an entire engineering discipline, not a weekend task for your notes app.
+
+### Serving downloads
+
+Sending a 50 MB file to a phone on a 2 Mbps connection takes about **3.5 minutes**. For that whole time one of your workers (a goroutine, a slice of Node's event loop, a thread) does nothing but trickle bytes to a slow client.
+
+This is **I/O-bound** work your server isn't built for. You've turned an expensive API server into a slow, small CDN. Real CDNs exist precisely to push bytes from machines close to the user.
+
+### No transaction across disk and database
+
+The file system and the database are **two separate systems** with no shared transaction:
+
+- **File first, then row.** If the insert fails, you have an **orphan file**: unreachable, but still costing money.
+- **Row first, then file.** If the write fails, the row points at a path that doesn't exist, and every read returns a `404` or `500`.
+
+Object storage doesn't magically fix this one. It makes a clean pattern possible, which you'll see in the two-phase upload below.
+
+## Block, file and object storage
+
+There are three broad kinds of storage. Knowing why each exists explains what object storage gives up and what it gains.
+
+### Block storage
+
+The lowest level: a raw array of **fixed-size blocks** (typically 512 bytes or 4 KB), each identified by a number. The whole interface is "read block 9,000,000" and "write block 9,000,000". There are no names, files or folders.
+
+An SSD is block storage; so is **Amazon EBS**. It's the fastest kind, with latency in **microseconds**, which is why databases like Postgres and MySQL live on it. The catch: a block device usually **attaches to one machine at a time**, and the interface is far too primitive to build apps on directly.
+
+### File storage
+
+File systems such as ext4, XFS and NTFS sit on top of blocks and add **directories, paths, permissions and file handles**. The interface is rich: open, seek to byte 9,000,000, overwrite exactly 4 bytes in the middle, append, lock, and **atomically rename** a file or folder. This set of operations is standardised as **POSIX**.
+
+That convenience requires **coordination**:
+
+- **Rename must be atomic**: it fully succeeds or fully fails, never a half-renamed state. Editors rely on this when they save by writing a temp file and swapping it in, so readers see the old version or the new one, never a torn mix.
+- **Concurrent writers need locks**, for example several processes appending to one log file.
+
+Coordination is cheap inside one machine and very expensive across a network, a data centre or a continent. Network file systems (NFS) exist, but they carry painful trade-offs.
+
+### Object storage
+
+Object storage starts from the opposite question. Not "what's the richest interface?" but **"what's the smallest interface we can get away with?"** The aim is effectively unlimited capacity without any of that coordination. The entire API is four operations:
+
+| Operation | Meaning |
+|---|---|
+| `PUT` | Store bytes under a name (replacing anything already there) |
+| `GET` | Fetch the bytes for a name |
+| `DELETE` | Remove a name |
+| `LIST` | List names, optionally by prefix |
+
+### What you give up
+
+- **No in-place edits.** No append, no seek-and-write, no partial update. Objects are **immutable**: you replace them whole. Changing one byte of a 1 GB object means uploading a new 1 GB object under the same key. This is why they're called *objects*, not files.
+- **No real directories.** Only key prefixes, covered below.
+- **No rename.** A rename is a **copy to a new key plus a delete**, and costs the full size of the object.
+- **No locks**, in the operating-system sense.
+- **Higher latency.** Every operation is an HTTP request to a remote data centre, so think **milliseconds to tens of milliseconds**, not microseconds.
+
+### What you get back
+
+- **Nothing to coordinate.** With no in-place modification and no tree of directories to keep consistent, a whole class of distributed-systems problems disappears.
+- **Unlimited horizontal scale.** Every request is self-contained, so any of thousands of front-end servers can handle any request.
+- **Effectively infinite capacity.** You never provision or resize. You just keep writing.
+- **Very high durability**, explained below.
+- **Direct HTTP access.** Browsers, mobile apps and video players can read and write objects **without going through your servers**. That property drives the whole upload design later in this lesson.
+
+<Callout kind="remember">
+This trade is a pattern you'll keep seeing in distributed systems: **giving up mutability buys scale**. Stateless servers, immutable deployments and content-addressed caches all make the same deal. Object storage is one of its purest forms.
+</Callout>
+
+| | Block | File | Object |
+|---|---|---|---|
+| Interface | Numbered blocks | POSIX: paths, seek, rename, locks | PUT, GET, DELETE, LIST over HTTP |
+| Latency | Microseconds | Microseconds (local) | Milliseconds |
+| Edit in place | Yes | Yes | No, replace the whole object |
+| Sharing | One machine at a time | Local, or NFS with trade-offs | Anything that speaks HTTP |
+| Scale limit | Disk size | Coordination | Effectively none |
+| Examples | SSD, EBS | ext4, XFS, NTFS, NFS | S3, R2, B2, GCS, MinIO |
+
+## What an object is
+
+An object has four parts:
+
+1. **Key**: a string that is the object's **entire identity**, such as `t_81/u_42/9f3c2a.png`.
+2. **Value**: the bytes themselves, an opaque blob.
+3. **System metadata**: size, last-modified time, content type, and the **ETag** (a fingerprint of the content).
+4. **User metadata**: your own key-value pairs, such as `uploaded-by: u_42` or `original-name: holiday.png`.
+
+Objects live in a **bucket**, a named container one level above them. A bucket is not a folder; it's more like a database. The pair **bucket name plus key** is globally unique, and on AWS bucket names themselves are unique across the entire platform, so `notes-uploads` can only belong to one account in the world.
+
+Metadata is set **when the object is written**. Because objects are immutable, changing metadata later means rewriting (copying) the object.
+
+## Folders are an illusion
+
+Open the S3 or R2 dashboard and you'll see `uploads/` containing `2026/` containing `cat.png`. That hierarchy is invented for your comfort. The bucket holds **one object** whose key is the string `uploads/2026/cat.png`. The `/` is an ordinary character, no more special than `-` or `#`. There are no parent objects and no nesting: a bucket is a flat set of keys.
+
+The "folder" view comes from one feature of `LIST`. You pass a **prefix** and a **delimiter**:
+
+1. Find every key that starts with the prefix.
+2. For each one, look at the rest of the key after the prefix.
+3. If that rest contains the delimiter, cut it at the first delimiter and report the piece **once**, in a list called `CommonPrefixes`.
+4. Otherwise report the key as a normal object.
+
+So folders are just a **group-by over strings**. Try it:
+
+<PrefixListing />
+
+Two consequences follow directly:
+
+- **Renaming a "folder" is expensive.** There is nothing to rename. Moving `uploads/2026/` with 40,000 objects in it means 40,000 copies and 40,000 deletes.
+- **Empty folders don't exist.** A folder has no identity of its own, so when its last object goes, the folder goes too. Tools that let you "create a folder" fake it by writing a **zero-byte object whose key ends in** `/`.
+
+## Designing object keys
+
+Since the key is the object's whole identity, choosing a key format is a real design decision.
+
+### Never use the uploaded file name
+
+Using the user's file name as the key is tempting and wrong, for three reasons:
+
+1. **Silent overwrites.** Two users upload `resume.pdf`. The second `PUT` **replaces** the first, exactly as HTTP `PUT` semantics say. There's no error and no warning; one user's file is simply gone.
+2. **Path tricks.** File names can contain `..`, slashes and other characters. Depending on how the key is built and later used, a crafted name can land outside the prefix you intended.
+3. **Hostile characters.** Emoji, right-to-left override characters, null bytes and very long names are all valid in someone's file name and are all future bugs.
+
+**Generate the key yourself**, using something random like a UUID. Keep the original file name in your database (and optionally in user metadata), and use it only to set the download name.
+
+### Put randomness first
+
+A common pattern is `uploads/2026-10-10T14/uuid.png`, with a timestamp first. The problem is in how the store indexes keys: the index is **sorted and split into partitions by key range**. With a timestamp prefix, every upload in the same hour shares a prefix and lands on the **same partition**. Under load, that **hot partition** starts returning `503 SlowDown`.
+
+Put **high-entropy** data early in the key: a UUID, a random ID or the first characters of a content hash. Modern S3 re-partitions automatically and you're unlikely to hit this at small scale, but getting it right on day one is free, while changing key formats at scale is painful.
+
+### Encode ownership
+
+A key format like `tenant_id/user_id/object_id` (for example `t_81/u_42/9f3c2a.png`) pays off twice:
+
+- **Cheap authorization.** Middleware can check that a requested key starts with the caller's own `t_81/u_42/` prefix with a string comparison, **before** any database or storage call.
+- **Scoped policies.** Storage credentials or upload policies can be limited to exactly one prefix.
+
+With a flat random UUID, every authorization check needs a database lookup to find the owner. Encoding ownership saves a network hop on every request.
+
+<Callout kind="tip">
+A good default key is `tenant/user/uuid` plus an extension, such as `t_81/u_42/0b7e1f6c.png`. The tenant and user parts give cheap ownership checks; the UUID gives uniqueness. If you expect extreme write rates within one tenant, put a short hash or random segment in front.
+</Callout>
+
+## Inside an object store
+
+What actually happens when your app sends a 100 MB `PUT` to S3?
+
+1. The request reaches one of a huge fleet of **stateless front-end servers**.
+2. The front end **authenticates** it by recomputing the request signature (more on signatures below).
+3. Then the work splits into **two separate problems**, which is the core architectural idea behind object storage.
+
+### Data plane and metadata plane
+
+| | Data plane | Metadata plane |
+|---|---|---|
+| Job | Store the bytes so they survive | Remember that `bucket + key` lives in these pieces on these drives |
+| Volume | Enormous (exabytes) | Small per object, but trillions of entries |
+| Operations | Few, large and simple | Huge numbers of tiny lookups |
+| Hard requirement | Durability | Strong consistency and very low latency |
+| Difficulty | Storing bytes on drives is a well-solved problem | The hard part: a consistent, distributed, sorted index |
+
+### Erasure coding
+
+The simple way to make bytes durable is **replication**: keep three copies in three separate failure domains. If one drive dies, copy from another. It works, but 1 PB of customer data needs 3 PB of drives, a 200% overhead that costs a fortune at cloud scale.
+
+Large providers use **erasure coding** instead. For example:
+
+1. Split the object into **14 data shards**.
+2. Use a **Reed-Solomon** code to compute **6 parity shards**, for 20 shards total.
+3. Spread the 20 across 20 drives in different racks, power domains and ideally buildings.
+
+The key property: **any 14 of the 20 shards** are enough to rebuild the object. It doesn't matter which 14.
+
+| | 3x replication | Erasure coding, 14 + 6 |
+|---|---|---|
+| Storage used | 3x the data | 20/14, about 1.43x |
+| Simultaneous losses survived | 2 | 6 |
+| Extra cost | Lots of drives | CPU for the parity maths, extra reads during repair |
+
+Drives cost far more than CPU, so erasure coding is both **cheaper and more durable**. That math is where S3's famous **"eleven nines"** of durability (99.999999999%) comes from: store 10 million objects and you'd statistically expect to lose one roughly every 10,000 years.
+
+### Durability is not a backup
+
+Eleven nines protects you from **drives dying**. It does nothing to protect you from **yourself**.
+
+- If a bug deletes the wrong prefix, the store will delete it, durably and correctly. There's no undo.
+- If a bug overwrites objects with garbage, the store will keep the garbage with eleven nines of confidence.
+
+Two protections you have to turn on deliberately:
+
+1. **Versioning.** Overwrites and deletes create a new version (or a delete marker) instead of destroying the old data.
+2. **Replication to a bucket in a separate account.** If credentials for one account leak, the attacker can't reach the copy.
+
+<Callout kind="warn">
+Durability guarantees are about hardware. Accidental deletes, buggy overwrites and leaked credentials are your problem. **Enable versioning and cross-account replication** on buckets whose contents matter.
+</Callout>
+
+### The metadata index
+
+Conceptually, the metadata plane is a giant **sorted key-value index**, something like a distributed B-tree. It maps `bucket + key` to shard locations, size, ETag, content type and so on, and it is **partitioned by key range** (which is why sequential prefixes create hot partitions).
+
+This explains several behaviours:
+
+- **Size and metadata are instant.** A `HEAD` request is answered from the index without touching any drive holding the data.
+- **No atomic rename.** Changing a key means moving an entry to a potentially different partition, so stores model rename as copy plus delete.
+- **LIST is slow.** Even paginated at 1,000 keys per page, it's a **range scan** over a distributed index, far more expensive than a single lookup.
+
+<Callout kind="remember">
+**Never call LIST in the request path.** To answer "which files does user 42 have?", query your database. The **database is the index of what exists and who owns it**; the bucket is just where the bytes live.
+</Callout>
+
+### Strong consistency
+
+- **Strongly consistent**: once a write succeeds, every subsequent read, by anyone, sees it.
+- **Eventually consistent**: reads may briefly return old data (or nothing) after a write.
+
+S3 used to be eventually consistent for some operations: a `PUT` followed immediately by a `GET` could return `404` because the read hit an index replica that hadn't caught up. Since **December 2020**, S3 offers **strong read-after-write consistency**. Old blog posts that recommend sleeping or retrying after an upload are out of date.
+
+## Conditional writes
+
+For most of its history, object storage had no **compare-and-swap**. Every `PUT` overwrote whatever was there. If two processes wrote the same key at once, one silently won, and you couldn't even express "write this only if nothing is there yet".
+
+In 2024 S3 added **conditional writes**, using the same headers HTTP already uses for conditional requests.
+
+**Create only if absent** with `If-None-Match: *`:
+
+```http
+PUT /t_81/u_42/9f3c2a.png HTTP/1.1
+Host: notes-uploads.s3.amazonaws.com
+If-None-Match: *
+
+HTTP/1.1 412 Precondition Failed
+```
+
+The first request succeeds with `200` and an ETag. Running the exact same request again returns **`412 Precondition Failed`** instead of quietly replacing the object.
+
+**Compare-and-swap** with `If-Match`:
+
+1. Client A reads an object and gets its ETag, say `"a1b2"`.
+2. A edits the content locally and sends `PUT` with `If-Match: "a1b2"`.
+3. If the object is unchanged, the write commits and a new ETag is issued.
+4. If client B wrote first, the ETag is no longer `"a1b2"`, so **A gets `412`** and B's write is protected. A can re-read and retry.
+
+Why the excitement? A `412` on create-if-absent is effectively a **distributed lock**: exactly one writer can win. Combined with strong consistency, that's enough to build leader election, coordination and even databases that keep their **write-ahead log** directly in S3. For everyday apps, the immediate win is simpler: an upload can never silently overwrite an existing object, which closes the duplicate-key bug from the key-design section.
+
+<Callout kind="warn">
+"**S3-compatible**" means a provider speaks the S3 API, so you can point the AWS SDK at R2, B2 or MinIO. It does **not** mean every feature exists. Conditional writes, POST policies and lifecycle options vary by provider and change over time. Check the docs before you depend on one.
+</Callout>
+
+## Uploading through your server
+
+How do bytes get from the user's laptop into the bucket? The first architecture routes them through your API:
+
+```text
+Browser --POST file--> Your API --PutObject--> Bucket
+```
+
+This has real advantages. Your code sees every byte, so it can validate the content, scan it or hash it before storing. Authentication is your normal middleware. There's no CORS to configure. For **small files** (avatars, CSVs, documents of a few MB) it's a reasonable choice.
+
+### Buffering versus streaming
+
+The hidden danger is **buffering**. Many default body parsers, such as Go's `ParseMultipartForm` or a typical Node body-parsing middleware, read the whole upload into memory (or spill it to temp files) before your handler sees it. A 100 MB upload costs 100 MB of RAM. Twenty concurrent 100 MB uploads cost 2 GB, which is enough to OOM-kill a 2 GB container, and you're back at the opening disaster.
+
+You won't see this locally: you test with small files, on a fast connection, on a machine with 16 GB or more of RAM.
+
+The fix is to **stream**: read the body in small chunks and hand each chunk to the storage client as it arrives. Memory stays at one buffer of a few KB whether the file is 1 MB or 1 GB. Always **cap the body size** before reading.
+
+```go
+func uploadAvatar(w http.ResponseWriter, r *http.Request) {
+    r.Body = http.MaxBytesReader(w, r.Body, 5<<20) // hard 5 MB cap
+    mr, err := r.MultipartReader()                // stream, don't ParseMultipartForm
+    if err != nil { http.Error(w, "bad form", 400); return }
+    part, err := mr.NextPart()                     // part is an io.Reader
+    if err != nil { http.Error(w, "no file", 400); return }
+    key := fmt.Sprintf("t_%s/u_%s/%s", tenantID(r), userID(r), uuid.NewString())
+    _, err = uploader.Upload(r.Context(), &s3.PutObjectInput{
+        Bucket: aws.String("notes-uploads"), Key: aws.String(key), Body: part,
+    })
+    // ...record key in the database, respond
+}
+```
+
+Uploading a 500 MB file both ways shows the difference clearly: the buffered server's memory climbs by roughly the file size, while the streaming server's memory stays flat. Both take the same time, because the network is the bottleneck either way.
+
+Even with streaming, the bytes still pass through your infrastructure, and that hits other limits:
+
+- **Load balancer idle timeouts**, often 60 seconds by default, cut off slow mobile uploads.
+- **Reverse proxy body limits**: Nginx's default is famously small and answers `413 Content Too Large` (formerly "Request Entity Too Large").
+- **Serverless functions and API gateways** have hard payload caps of a few MB that you can't raise.
+
+Fine for small files on a traditional server. Not the production answer for anything large.
+
+## Presigned URLs
+
+The better design lets the **browser upload directly to the bucket**, so the bytes never touch your servers. That raises three problems:
+
+- The bucket must stay **private**. Public-write buckets are a security incident waiting to happen.
+- You can't hand your storage **credentials** to a browser.
+- You want to grant **exactly one operation on exactly one key for a few minutes**, and nothing more.
+
+A **presigned URL** solves all three. It's a normal object URL with extra query parameters:
+
+```text
+https://notes-uploads.s3.amazonaws.com/t_81/u_42/9f3c2a.png
+  ?X-Amz-Algorithm=AWS4-HMAC-SHA256
+  &X-Amz-Credential=AKIA.../20261010/us-east-1/s3/aws4_request
+  &X-Amz-Date=20261010T120000Z
+  &X-Amz-Expires=300
+  &X-Amz-SignedHeaders=host
+  &X-Amz-Signature=5d1f...e9
+```
+
+Your server builds a string describing the allowed request (method, bucket, key, expiry time, signed headers) and computes an **HMAC** of it using your **secret key**. The signature goes into the URL; the secret never does.
+
+When the browser sends `PUT` to that URL, the storage service rebuilds the same string from the incoming request, computes the HMAC with **its own copy of your secret**, and compares:
+
+- Match, and not expired: the request is authorized as if you'd made it.
+- Expired: `403 Forbidden`.
+- Any change to the method, bucket or key, even one character: the signature no longer matches, `403 Forbidden`.
+
+The browser gets a narrow, short-lived capability and never sees a credential. In the browser's network tab, the upload goes straight to the bucket's domain, not to your API.
+
+### Limiting size with a POST policy
+
+A presigned `PUT` signs the method, bucket and key, but **nothing about the body size**. A URL issued for a 2 MB avatar will happily accept a 300 MB file, and you pay to store it. A presigned `PUT` is effectively an unlimited write capability for that key.
+
+The fix is a **presigned POST with a policy**. Instead of signing a URL, your server signs a small JSON **policy document** and gives the browser a URL plus form fields. The storage service enforces every condition itself:
+
+```json
+{
+  "expiration": "2026-10-10T12:05:00Z",
+  "conditions": [
+    { "bucket": "notes-uploads" },
+    ["content-length-range", 1024, 5242880],
+    ["starts-with", "$Content-Type", "image/"],
+    ["starts-with", "$key", "t_81/u_42/"]
+  ]
+}
+```
+
+- `content-length-range`: between 1 KB and 5 MB, or the upload is rejected with `EntityTooLarge` and nothing is stored.
+- `starts-with $Content-Type`: only images.
+- `starts-with $key`: the client can't write outside its own prefix. Trying to upload into another user's prefix is rejected with `403`, and the error names the condition that failed.
+
+On the client, two details trip people up:
+
+```ts
+const { url, fields } = await api.post("/uploads", { size: file.size, type: file.type });
+const form = new FormData();
+for (const [k, v] of Object.entries(fields)) form.append(k, v as string);
+form.append("file", file);          // the file field must come LAST
+await fetch(url, { method: "POST", body: form }); // do NOT set Content-Type yourself
+```
+
+The file field must be the **last** field in the form, because the service reads the fields in order and needs the policy and signature first. And don't set `Content-Type` on the request: the browser must generate the multipart boundary itself.
+
+<Callout kind="tip">
+Use a **presigned POST with `content-length-range`** whenever the browser uploads directly. A plain presigned PUT can't limit size. (Provider support for POST policies varies; on providers without it, keep expiries very short and verify size after upload.)
+</Callout>
+
+## The two-phase upload
+
+With direct uploads, your server never sees the bytes. So how does your database learn that a file exists, and under which key? The answer is to split the upload into two phases around the direct transfer.
+
+**Phase 1: request an upload.**
+
+1. The browser asks your API for permission to upload, sending size and type.
+2. The API authenticates and authorizes the user, validates the request, and **generates the key itself**.
+3. It inserts a row with `status = 'pending'`, recording the key and the expected constraints. The database now holds the **intent** before any bytes move.
+4. It returns the presigned POST (URL and fields) plus an **upload ID**.
+
+**Phase 2: upload, then complete.**
+
+5. The browser uploads directly to the bucket.
+6. The browser calls your completion endpoint with the **upload ID** (not the key, which the client shouldn't control).
+7. The API calls `HeadObject` on the key. It's a cheap, metadata-only call that confirms the object **exists** and its **size and content type** are what was promised.
+8. If everything checks out, the row moves from `pending` to `ready`.
+
+```sql
+CREATE TABLE uploads (
+  id           uuid PRIMARY KEY,
+  user_id      uuid NOT NULL,
+  object_key   text NOT NULL UNIQUE,
+  original_name text NOT NULL,
+  max_bytes    bigint NOT NULL,
+  status       text NOT NULL DEFAULT 'pending',  -- pending | ready | expired
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+```
+
+<PresignedUploadLab />
+
+### Cleaning up abandoned uploads
+
+Some uploads never finish. Tabs close, phones lose signal, and sometimes the upload succeeds but the completion call never arrives. The client is outside your control, so plan for it:
+
+- **A bucket lifecycle rule** deletes objects under the pending area after 24 hours (for example, everything under an `incoming/` prefix that was never promoted, or objects tagged as pending).
+- **A small background job** finds `pending` rows older than 24 hours and marks them `expired`.
+
+This is the answer to the "no transaction across disk and database" problem. The **database is the source of truth for which files exist**, the **bucket is the source of truth for the bytes**, and a background job **reconciles** the two whenever they drift.
+
+<Callout kind="remember">
+Record intent first (pending row with a server-generated key), let the client upload directly, verify with `HeadObject`, then mark it ready. Expire whatever is left pending.
+</Callout>
+
+## CORS for direct uploads
+
+A page on `app.notes.dev` uploading to `notes-uploads.s3.amazonaws.com` is making a **cross-origin** request, so the browser enforces CORS. The bucket needs a CORS configuration that:
+
+- allows your frontend's **origin**,
+- allows the **methods** you use (`PUT`, `POST`),
+- **exposes the `ETag` header**, so browser JavaScript can read it. You'll need that for multipart uploads in part 2.
+
+```json
+[
+  {
+    "AllowedOrigins": ["https://app.notes.dev"],
+    "AllowedMethods": ["PUT", "POST"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
+
+<Callout kind="tip">
+If an upload **works with curl or Postman but fails in the browser**, it's almost always CORS. curl doesn't enforce CORS; browsers do. Check the bucket's CORS configuration first.
+</Callout>
+
+## Cheat sheet
+
+- Files on an app server's disk break on deploys (ephemeral), across instances (1 in N hit rate), on growth (vertical-only disks) and on drive failure.
+- Availability is "can I reach it now"; durability is "does it still exist". Waiting fixes the first, never the second.
+- Block storage is numbered blocks (fast, one machine); file storage adds POSIX features that need coordination; object storage is just PUT, GET, DELETE and LIST over HTTP.
+- Objects are immutable: no edits, no rename (copy plus delete), no locks. In return you get unlimited scale, capacity and direct HTTP access.
+- An object is key, bytes, system metadata and user metadata, in a bucket. Folders are prefixes grouped by a delimiter.
+- Generate keys yourself, put randomness early, and encode ownership like `tenant/user/uuid`.
+- Erasure coding (14 data plus 6 parity, any 14 rebuild) beats 3x replication on cost and durability.
+- Durability is not a backup: enable versioning and cross-account replication.
+- Never LIST in the request path. Your database is the index of which files exist.
+- S3 is strongly consistent since 2020. `If-None-Match: *` and `If-Match` give create-if-absent and compare-and-swap, failing with `412`.
+- Small uploads through your server must stream with a size cap. Large ones go direct via presigned URLs.
+- Prefer presigned POST with `content-length-range`, run the two-phase pending-to-ready flow with `HeadObject`, clean up with lifecycle rules, and expose `ETag` in bucket CORS.

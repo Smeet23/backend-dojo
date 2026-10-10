@@ -1,0 +1,387 @@
+import { WebhookDeliverySim } from "@/components/widgets/WebhookDeliverySim";
+import { HmacVerifier } from "@/components/widgets/HmacVerifier";
+
+## Why the server needs to call you
+
+Until now every conversation has had the same shape: a client opens a connection, sends a request, and the server answers. Even real-time techniques like polling, server-sent events and WebSockets start with the client reaching out first.
+
+Some events, though, happen **in someone else's system**. Say your notes app sells a Pro plan and takes payments through Stripe. The card is charged inside Stripe's infrastructure, not yours. Your backend needs a signal that says "this payment succeeded", and only then should it unlock Pro for that user.
+
+Why not let the browser deliver that signal? Two reasons:
+
+- **Reliability.** The user can close the tab, lose their connection or have their laptop die right after paying. The signal is lost, and you have a paying customer without Pro.
+- **Trust.** Anything the browser sends can be forged. A request from the client saying "payment approved" is worth nothing; anyone can write it with curl.
+
+So the signal has to travel **backend to backend**: from the payment provider's servers to yours, with no browser and no human in the loop. Your server stays the source of truth.
+
+## Why not poll
+
+The obvious approach is to keep asking. After starting a payment, your server calls Stripe's "get payment" endpoint every second until the status flips to succeeded or failed.
+
+This works, but it scales badly:
+
+- **Delay.** If you poll every second, an event that happens at a random moment waits on average half a second before you notice it. In general the average delay is **half the polling interval**.
+- **Wasted work.** Almost every response is "still pending". You're paying for thousands of requests that carry no news.
+- **Load on the provider.** Ten thousand merchants polling once a second is ten thousand requests per second hitting the provider. To protect itself, the provider **rate-limits** you. If you're forced down to one poll per minute, your average delay jumps to **30 seconds**.
+
+Polling makes the side that knows nothing do all the work. It's better to flip the direction.
+
+## What a webhook is
+
+A **webhook** is a plain **HTTP POST** that the provider sends to a URL **you** expose and register with them, whenever an event you care about happens. The body describes the event. You can think of it as a **reverse API call**: normally you call their API; here, they call yours.
+
+There's nothing exotic underneath. It's the same HTTP you already know, just with the roles swapped: the provider acts as the client and your backend acts as the server.
+
+The idea dates back to 2007, when Jeff Lindsay argued the web needed something like the Unix pipe: a way for one service to push its output to another the moment something happens. He called these user-defined HTTP callbacks "webhooks". A couple of years later, PubSubHubbub applied the same idea to blog feeds, so subscribers got pushed updates instead of polling.
+
+### Vocabulary
+
+Providers use slightly different words for the same things. This lesson uses a normalized set:
+
+| Term | Meaning |
+|---|---|
+| **Provider** (sender) | The system where the event happens: Stripe, GitHub, Shopify |
+| **Receiver** (consumer) | You |
+| **Endpoint** | The URL on your side that the provider POSTs to |
+| **Event** | Something that happened, from a predefined list: `payment.succeeded`, `push`, `order.created` |
+| **Delivery** | **One attempt** to send an event to an endpoint |
+| **Subscription** | Your registration: "here is my URL, these are the events I want" |
+
+<Callout kind="remember">
+One event can have **many deliveries**. If an attempt fails, the provider tries again with the same event. From day one, write your receiver assuming any event might arrive more than once.
+</Callout>
+
+## Anatomy of a delivery
+
+Here's roughly what GitHub sends when someone pushes to a repository you've subscribed to:
+
+```http
+POST /hooks/github HTTP/1.1
+Content-Type: application/json
+X-GitHub-Event: push
+X-GitHub-Delivery: 7c1e9a40-5b2d-11f0-8e1f-2a7c3b9d0e11
+X-Hub-Signature-256: sha256=3f1d0c...
+
+{"ref":"refs/heads/main","commits":[...],"pusher":{"name":"asha"}}
+```
+
+Three headers do the heavy lifting: the **event type** (what happened), a unique **delivery ID**, and a **signature** that proves who sent it. The body carries the event data. Good providers also keep a "recent deliveries" log in their dashboard with the headers, payload and the response you returned, which is invaluable for debugging.
+
+A typical receiver handler does four things: read the raw body, verify the signature, record the delivery, respond.
+
+### What counts as success
+
+The provider judges each delivery by two rules:
+
+1. **Status code.** Any **2xx** (200, 202, 204) is success. **Everything else is failure**, including 3xx redirects and 4xx errors.
+2. **Deadline.** You must respond within a time limit, or the attempt counts as failed even if you'd have returned 200 eventually.
+
+| Provider | Response deadline |
+|---|---|
+| GitHub | 10 s |
+| Shopify | 5 s |
+| Slack | 3 s |
+| Microsoft Graph | 3 s |
+
+Check your provider's documentation for the exact limit. A failed delivery usually triggers a retry, which matters a lot once you look at load and duplicates.
+
+## Registering an endpoint
+
+A subscription form normally asks for three things: the **URL**, a **secret** (generated by the provider or by you) and the **event types** you want.
+
+Give each provider its **own endpoint**: `/hooks/stripe`, `/hooks/github`, `/hooks/shopify`. Avoid a single generic `/hooks/callback`. Every provider has its own headers, signature scheme, ID location and retry behaviour, so separate handlers stay simple and can't be confused with each other.
+
+### Handshakes
+
+Some providers verify your URL before they send real events:
+
+| Provider | Handshake |
+|---|---|
+| Microsoft Graph | Sends a validation token you must echo back as plain text |
+| Discord | Sends a PING, expects a PONG |
+| Amazon SNS | Sends a SubscriptionConfirmation message containing a URL you must visit |
+
+Why bother? Without a handshake, an attacker could register **someone else's URL**, subscribe it to every event type, and let a huge provider flood the victim with traffic: a denial-of-service attack carried out by a trusted third party. The handshake proves the owner of the URL actually agreed to receive events.
+
+### Testing locally with a tunnel
+
+Webhooks are **inbound** requests from the internet. Your laptop sits behind a home router that drops unsolicited inbound traffic, and `localhost` means nothing to Stripe's servers. During development you use a **tunnel** such as ngrok or Cloudflare Tunnel: it gives you a temporary public HTTPS URL that forwards to a port on your machine. Register that URL with the provider and deliveries reach your local server.
+
+## Proving who sent it
+
+Your endpoint is **public**, and a POST to it can unlock a paid plan. Webhook paths are easy to guess (`/webhooks`, `/hooks/stripe`, `/callback`). Without verification, anyone could send this and get Pro for free:
+
+```json
+{ "type": "payment.succeeded", "user_id": 42, "plan": "pro" }
+```
+
+**HTTPS does not solve this.** TLS stops people reading or altering bytes in transit, but it says nothing about **who wrote** them. An attacker can open a perfectly valid HTTPS connection to your server.
+
+There are five common ways to authenticate a webhook:
+
+| Method | How it works | Verdict |
+|---|---|---|
+| Secret token in the URL | `/hooks/stripe?token=abc123` | Weakest. URLs land in access logs, proxies and log tools, so the token leaks |
+| IP allow list | Accept only the provider's published source IPs | Useful extra layer, not enough on its own |
+| Mutual TLS | Provider presents a client certificate you verify | Strong, but heavier to operate |
+| **HMAC with a shared secret** | Provider signs the request with a secret only the two of you know | **The most common by far** |
+| Public-key signature | Provider signs with a private key, you verify with its public key (Discord does this) | Strong, and you don't hold a secret |
+
+## HMAC signatures
+
+**HMAC** stands for Hash-based Message Authentication Code. Recall that a cryptographic hash turns any input into a fixed-length fingerprint, and changing even one byte changes the whole fingerprint. HMAC mixes a **secret key** into that hash, so only someone who knows the secret can produce the right fingerprint.
+
+The flow:
+
+1. At registration, you and the provider share a secret.
+2. For each delivery, the provider computes `HMAC-SHA256(secret, message)` and sends it in a header.
+3. You compute the same HMAC over the message you received, with your copy of the secret.
+4. If the two match, the request came from someone holding the secret (the provider) and wasn't modified on the way.
+
+```ts
+const expected = hmacSha256(secret, `${timestamp}.${rawBody}`);
+if (!timingSafeEqual(expected, signatureFromHeader)) return reply(401);
+```
+
+### What gets signed
+
+The "message" differs between providers, so always read their docs:
+
+| Provider | What's signed |
+|---|---|
+| GitHub | The body only |
+| Stripe | `timestamp + "." + body`, sent as `t=1760090000,v1=<sig>` (there may be several `v1` values during secret rotation) |
+| Standard Webhooks spec | `webhook_id + "." + timestamp + "." + body`, so the ID is protected too |
+| Twilio | The full endpoint URL plus the sorted form parameters, using SHA-1, so the URL you registered must match exactly |
+
+### Verify the raw bytes
+
+The signature covers the **exact bytes** the provider sent. A common bug: your framework parses the JSON body automatically (for example a global JSON middleware), and you re-serialize the parsed object to compute the HMAC. The provider sent `{"plan":"pro"}`; your encoder produces `{"plan": "pro"}`. Same data, different bytes, different HMAC, and every legitimate delivery is rejected.
+
+**Rule: read the raw body bytes, verify, then parse.** Most frameworks let you keep the raw body on a specific route.
+
+<HmacVerifier />
+
+## Replay attacks
+
+A valid signature proves who wrote a request, not **when**. Suppose an attacker captures one real delivery, headers and all. Hours later they send it again, maybe a thousand times. The signature is genuine, so naive verification accepts it every time. This is a **replay attack**.
+
+The defence is to put a **timestamp inside the signed message** and reject anything too old. Because the timestamp is part of what's signed, the attacker can't change it without breaking the signature. Stripe's libraries, for example, reject signatures older than **5 minutes** by default. (Idempotency, covered next, also neutralizes replays of events you've already processed.)
+
+### Constant-time comparison
+
+Never compare signatures with ordinary string equality. Normal comparison **stops at the first mismatched byte**, so a guess with a correct first byte takes a tiny bit longer to reject than one without. Over many thousands of requests an attacker can measure that difference and recover the signature byte by byte. This is a **timing attack**.
+
+Use a **constant-time** comparison, which always takes the same time regardless of where the strings differ:
+
+| Language | Function |
+|---|---|
+| Go | `hmac.Equal` |
+| Node.js | `crypto.timingSafeEqual` |
+| Python | `hmac.compare_digest` |
+
+## At-least-once delivery
+
+Picture this: your handler receives `payment.succeeded`, upgrades the user, commits, and returns 200. But the connection drops (a load balancer restarts, a network blip) and the 200 never reaches Stripe. From Stripe's point of view, the delivery **failed**. So it sends the same event again, perhaps seconds later, perhaps an hour later.
+
+This is why provider docs promise **at-least-once** delivery: an event won't be lost, but it **may arrive more than once**. No provider can promise exactly-once, because acknowledgements themselves can be lost, and the sender can never tell "you didn't get it" from "I didn't hear you say you got it".
+
+<WebhookDeliverySim />
+
+## Idempotent receivers
+
+If duplicates are guaranteed, your handler has to make them harmless. A handler is **idempotent** when processing the same event once or ten times leaves the system in the same state.
+
+The tool is the **event or delivery ID**, which stays the same across retries:
+
+| Provider | Where the stable ID lives |
+|---|---|
+| GitHub | `X-GitHub-Delivery` header |
+| Stripe | `id` field in the event body |
+| Standard Webhooks | `webhook-id` header |
+
+Keep a `processed_webhooks` table with a **UNIQUE constraint** on that ID, and record the ID **in the same database transaction** as the work:
+
+```sql
+BEGIN;
+  INSERT INTO processed_webhooks (event_id) VALUES ('evt_9f2');  -- UNIQUE: a duplicate fails here
+  UPDATE subscriptions SET plan = 'pro', pro_until = now() + interval '30 days'
+   WHERE user_id = 42;
+COMMIT;
+```
+
+If the insert hits the unique constraint, you know the event was already handled: roll back and return 200 so the provider stops retrying.
+
+The single transaction is the important part. Consider the alternatives:
+
+- **Work first, then record the ID.** If the process crashes between the two (an out-of-memory kill, a deploy), the retry finds no ID and does the work **again**.
+- **Record the ID first, then work.** If the work fails, the retry sees the ID and **skips work that never happened**.
+- **Both in one transaction.** Either both happen or neither does. That's the only safe version.
+
+<Callout kind="warn">
+Side effects outside your database (sending an email, calling another API) can't join the transaction. Put them in an outbox or queue table inside the same transaction, and let a worker perform them, deduplicated by the same ID.
+</Callout>
+
+## Out-of-order events
+
+Retries also scramble **order**. A classic case: an object is created and then deleted a second later. The `created` delivery fails because you were mid-deploy and is retried five minutes later; the `deleted` delivery succeeds immediately. You receive **deleted, then created**. If you apply events literally, you end up with a row for an object that no longer exists.
+
+Stripe's docs state plainly that events are not guaranteed to arrive in order, and timestamps with one-second resolution can't break ties between events that happen close together.
+
+Ways to cope:
+
+1. **Treat the event as a signal, not as data.** On any event for object X, fetch X's **current** state from the provider's API and save that. Order stops mattering, at the cost of an extra API call per event.
+2. **Version check.** Apply an event only if its version or `updated_at` is newer than what you have stored, inside one transaction.
+3. **Buffering.** Hold events for an object until earlier ones arrive. This is fragile and unpredictable; avoid it.
+
+Some providers sell strictly ordered delivery as a paid feature. Unless you're paying for it, assume no ordering.
+
+## Retries differ by provider
+
+Every provider has its own retry policy, so read it before you rely on it:
+
+| Provider | Behaviour on failure |
+|---|---|
+| Stripe | Retries with exponential backoff for up to **3 days**, then disables the endpoint and emails you |
+| Svix (webhooks as a service) | Immediately, then about 5 s, 5 min, 30 min, 2 h, 5 h, 10 h... |
+| Shopify, Slack and others | Each has its own schedule and its own rules for disabling endpoints |
+| GitHub | **No automatic retries.** A failed delivery stays failed until someone presses Redeliver, or a script calls GitHub's API to find failed deliveries and redeliver them |
+
+Building a sending system that handles all of this properly is real engineering work, which is why services like Svix exist: companies hand them the retries, signing, logs and customer-facing dashboard.
+
+## Keep the receiver thin
+
+Combine short deadlines with retries and you get a feedback loop. Every slow response becomes a failed delivery, every failed delivery becomes a retry, and retries add load on top of your normal user traffic. Bursts are normal: a billing provider renews every subscription on the first of the month, or an email tool sends a delivery receipt for each of half a million messages.
+
+If your handler does everything inline (verify, update three tables, call two other APIs, then respond), it misses deadlines exactly when traffic peaks, and the retries make it worse.
+
+The robust shape is:
+
+1. Read the raw body.
+2. Verify the signature and timestamp.
+3. Store the delivery (an "inbox" row, deduplicated by ID).
+4. **Respond 2xx immediately.**
+5. A **background worker** picks the event up from a queue and does the real processing.
+
+```ts
+app.post("/hooks/stripe", rawBody(), async (req, res) => {
+  if (!verifyStripeSignature(req.rawBody, req.headers["stripe-signature"], SECRET)) {
+    return res.status(401).end();
+  }
+  const event = JSON.parse(req.rawBody);
+  await db.insertIgnoreDuplicate("webhook_inbox", { id: event.id, payload: req.rawBody });
+  await queue.enqueue("process-stripe-event", { id: event.id });
+  res.status(202).end(); // milliseconds, not seconds
+});
+```
+
+## Sending webhooks
+
+Now flip sides. Your notes app becomes a provider: customers want a webhook every time a note is moved to their "Published" folder, so they can post it to a chat channel or run their own automation. They give you a URL, you give them a secret, just as Stripe does for you.
+
+The naive version calls the customer's URL right inside the request handler:
+
+```ts
+await db.moveNote(noteId, "published");
+await http.post(customer.url, event); // inline
+```
+
+It has three problems:
+
+1. **Latency coupling.** If the customer's endpoint is slow or down, your own "move note" request hangs. Their outage becomes yours.
+2. **Lost events.** The database write succeeds, then your server crashes or redeploys before the POST. The move happened; the webhook never goes out.
+3. **False events.** Swap the order and you POST first, then the database write fails. You've told the customer about a move that never happened.
+
+### The transactional outbox
+
+The fix is the **transactional outbox**. The outbox is an ordinary table in the **same database** as your notes. The move handler opens one transaction, updates the note **and** inserts an outbox row with the full event, then commits. Both happen or neither does.
+
+```sql
+BEGIN;
+  UPDATE notes SET folder = 'published' WHERE id = 881;
+  INSERT INTO outbox (event_id, type, payload)
+  VALUES ('evt_51c', 'note.published', '{"note_id":881,"by":42}');
+COMMIT;
+```
+
+A separate background process, the **dispatcher**, reads outbox rows and makes the deliveries. The user's request returns as fast as before, no matter how the customer's endpoint behaves. It's the write-ahead-log idea applied to events: durably record the intention first, then let another process carry it out.
+
+A minimal design uses three tables:
+
+| Table | Holds |
+|---|---|
+| `endpoints` | Each customer's URL and secret |
+| `outbox` | Events, written in the same transaction as the change |
+| `deliveries` | One row per attempt: status code, first ~2 KB of the response, timing, next retry time |
+
+### The dispatcher
+
+For each pending delivery, the dispatcher:
+
+1. Runs the **SSRF guard** (next section) on the destination.
+2. **Signs** the payload, for example `id.timestamp.body` in the Standard Webhooks format, with that endpoint's secret.
+3. POSTs with a **timeout** (around 10 seconds is common).
+4. **Records the attempt** in `deliveries`.
+5. On **2xx**, marks the event delivered. Done.
+6. On anything else, schedules the next attempt with **exponential backoff plus jitter**, and honours a `Retry-After` header if the receiver sent one.
+7. After the final attempt, marks the event **exhausted**. After many consecutive failures (say 10), **disables the endpoint** and emails its owner.
+8. Uses **one queue per endpoint**, so one customer's dead server doesn't hold up deliveries to everyone else.
+
+### Backoff and jitter
+
+Retrying every 5 seconds forever would hammer a receiver that's already struggling. **Exponential backoff** grows the wait each time: 5 s, then 5 min, then 30 min, then 2 h. The receiver gets breathing room, and transient problems have time to clear.
+
+**Jitter** adds a random offset to each wait: 5 min becomes 5 min 42 s for one event and 5 min 07 s for another. Without it, if a receiver went down and a thousand deliveries failed at once, all thousand retries would fire at exactly the same moment five minutes later, knocking the receiver over again. Jitter spreads them out.
+
+## SSRF on the sending side
+
+As a provider, you make HTTP requests **from inside your own network** to **any URL a customer types in**. An attacker can register `http://169.254.169.254/latest/meta-data/`, the cloud metadata service on most clouds, which hands out credentials to anything on the machine that asks. Or `http://10.0.3.7/admin`, an internal admin panel. Your dispatcher dutifully POSTs into your private network. This is **Server-Side Request Forgery (SSRF)**.
+
+Checking the URL once at registration is not enough:
+
+- A hostname can resolve to a public IP during the check and be repointed to a private IP later.
+- A public URL can answer with a **redirect** to a private address.
+
+The correct defences:
+
+- **Resolve the hostname yourself on every send** and refuse private, loopback and link-local ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16` and their IPv6 equivalents). Then connect to the IP you checked.
+- **Never follow redirects.** Following 3xx is normal for HTTP clients, but for webhooks it's a hole. This is also why a 3xx response counts as a failed delivery.
+- Treat **only 2xx** as success.
+- Ideally, send webhooks from an **isolated network through an egress proxy** that enforces these rules. Stripe open-sourced one called Smokescreen.
+
+## Webhooks are notifications, not sync
+
+At heart a webhook says "this happened". It's a great fit for:
+
+- posting to a chat channel when something happens,
+- kicking off a CI build when code is pushed,
+- unlocking a plan after a payment.
+
+It's a poor fit as a **data synchronization pipe**. A common example is a hosted auth provider like Clerk, where users, organizations and roles live in the provider's database. Calls to its API may take hundreds of milliseconds, while your own database in the same region answers in tens, so teams want a local copy of the users table. The tempting design is to subscribe to every user and org webhook and write each payload into local tables.
+
+Keeping a local copy is fine. Building it from raw webhook payloads is the problem: now the copy is only correct if you handle every timeout, duplicate, replay and out-of-order delivery perfectly, forever.
+
+The robust approach uses the provider's **event log**: an API (often something like `/events`) that lists changes **in order**. Ordering is easy inside one provider's database; it's only lost when events travel over the network as separate deliveries.
+
+- **Periodic pull.** Every few minutes a worker fetches events after the **last event ID you processed**, applies them in order, and saves the new last ID. Simple, slightly stale.
+- **Webhook as a "go pull" signal.** Subscribe to a webhook that fires whenever the log gets a new entry, and treat it purely as a nudge: start a job that pulls everything after your last processed ID, in order. Your copy updates within seconds, and the webhook payload itself never has to be trusted for ordering or completeness.
+
+<Callout kind="tip">
+A good default for any webhook: verify it, record it, acknowledge it, and then **ask the provider for the truth** rather than trusting the payload's view of the world.
+</Callout>
+
+## Cheat sheet
+
+- A webhook is an HTTP POST from the provider to an endpoint you registered: a reverse API call, backend to backend.
+- Polling costs half the interval in delay, wasted requests, and rate limits; webhooks flip the direction.
+- Success means a 2xx within the provider's deadline (GitHub 10 s, Shopify 5 s, Slack 3 s); anything else is a failure.
+- One endpoint per provider; handshakes stop attackers aiming a provider at a victim's URL; use a tunnel for local testing.
+- HTTPS hides bytes but doesn't prove the sender. Verify an HMAC (or public-key) signature over the **raw** body, then parse.
+- Sign a timestamp and reject old ones to block replays; compare signatures in constant time.
+- Delivery is at-least-once: dedupe on the event ID with a UNIQUE constraint in the **same transaction** as the work.
+- Events arrive out of order: refetch current state or apply only newer versions.
+- Retry policies vary wildly; GitHub doesn't retry at all.
+- Keep receivers thin: verify, store, 2xx fast, process in a background worker.
+- As a sender, use a transactional outbox plus a dispatcher with timeouts, backoff with jitter, per-endpoint queues and auto-disable.
+- Guard against SSRF on every send: resolve and block private IPs, never follow redirects.
+- Use webhooks as notifications; sync data from the provider's ordered event log.

@@ -1,0 +1,176 @@
+import { LogLevelExplorer } from "@/components/widgets/LogLevelExplorer";
+import { TraceWaterfall } from "@/components/widgets/TraceWaterfall";
+
+## Why you need eyes on production
+
+On your laptop, debugging is easy. You see every line the server prints, you can add a breakpoint, and there's exactly one user: you.
+
+Production is different. Your shop's API might run as twenty copies across three regions, behind a load balancer, talking to a database, a cache, a queue and a payment provider. Thousands of people hit it at once. When a customer says "checkout failed at 14:02", you can't attach a debugger to that moment. It's gone.
+
+Logging, monitoring and observability are the practices that let you answer questions about a running system **after the fact** and **at scale**: what happened, is it healthy right now, and why did that request fail?
+
+<Callout kind="remember">
+None of this is a checklist you either pass or fail. Every real system sits somewhere on a **spectrum**: some things are instrumented carefully, others barely. The goal is to keep moving toward "when something breaks, we can find out why quickly".
+</Callout>
+
+## Logging, monitoring and observability
+
+The three words get used loosely, so pin them down.
+
+### Logging
+
+A **log** is a record of an event, written at the moment it happens, with enough context to understand it later. Think of it as the **diary** your backend keeps: "user 81 logged in", "query on orders took 1.2 s", "payment provider returned 502".
+
+The context matters as much as the message. A log line that says only "failed to create order" is close to useless. One that also carries the user ID, the request ID, the route, the latency and the error text lets you reconstruct what happened.
+
+Log the whole life of the app, not only requests: startup ("connected to database", "listening on 8080"), shutdown, background jobs, and security-relevant events like failed logins.
+
+### Monitoring
+
+**Monitoring** tracks the **state and health** of the system as numbers over time: CPU and memory per server, requests per second, error rate, response-time percentiles, open database connections, queue depth.
+
+Monitoring is "near real time". Metrics are usually collected every 10–15 seconds rather than every millisecond, because sampling constantly would flood the pipeline with data nobody needs. Its strengths are **trends** ("memory has crept up all week") and **alerts** ("error rate above 5% for 5 minutes").
+
+### Observability
+
+A system is **observable** if you can work out its **internal state from its external outputs**, without shipping new code to ask a new question. Those outputs are the **three pillars**:
+
+| Pillar | Answers | Example |
+|---|---|---|
+| **Logs** | *What* happened, in detail | `{"level":"error","msg":"insert order failed","user_id":81}` |
+| **Metrics** | *How much / how often*, as trends | p95 latency of `POST /orders` over the last hour |
+| **Traces** | *Where* the time went, across components | One checkout request: gateway → handler → service → DB → payment API |
+
+### Monitoring vs observability
+
+Monitoring tells you **that** something is wrong. Observability helps you find **what** is wrong and **where**.
+
+A decade ago, most teams relied on monitoring alone: a dashboard turns red, someone SSHes into servers and greps text files. Observability is the newer idea that logs, metrics and traces should be **connected**, so you can jump from a red graph to the exact failing requests to the exact slow component.
+
+## The three pillars together
+
+Here's how a real investigation flows when all three are in place:
+
+1. **Alert.** A rule fires: "checkout error rate above 5%". It posts to Slack or pages the on-call engineer through a webhook.
+2. **Metrics.** You open the dashboard. Errors started at 14:00, only on `POST /orders`, only in one region.
+3. **Logs.** You filter logs for that route and time window. They're full of `payment timeout` errors.
+4. **Trace.** You open the trace for one failing request. The handler and database were fast; the call to the payment provider hung for 10 seconds and timed out.
+5. **Fix.** You lower the timeout, add a retry with backoff, and open a ticket with the provider.
+
+Metrics only exist if you **decided in advance** to record them, in code and in your tooling. You can't graph "orders failed" if nothing ever counted failed orders.
+
+<Callout kind="tip">
+Be precise about what "failed" means. A common mistake is counting every non-200 status as a failure. A `404` for a missing note or a `401` from an expired login is the client's problem and normal traffic. Server errors (**5xx**) are the ones that usually mean *you* are broken. Track 4xx separately: a sudden spike can still be a useful signal, such as a bad frontend deploy.
+</Callout>
+
+## Log levels
+
+Every log line has a **level** that says how important it is. The logger is configured with a minimum level, and anything below it is dropped.
+
+| Level | Use it for | Notes app example |
+|---|---|---|
+| **DEBUG** | Fine-grained detail for development and troubleshooting | "note 42 serialized, 3 tags, 1.8 KB" |
+| **INFO** | Normal operations and **business events** | "note created", "user signed up" |
+| **WARN** | Something unusual that isn't a failure of your system | "login failed: wrong password", "retrying payment call (attempt 2)" |
+| **ERROR** | An operation failed | "insert into notes failed: connection refused" |
+| **FATAL** | The app can't continue and is shutting down | "can't read config at startup, exiting" |
+
+A wrong password is a **WARN**, not an ERROR: nothing in your system broke, the user just typed the wrong thing. But many of them in a row against one account is a security signal, so it's still worth logging.
+
+The usual setup:
+
+- **Development:** level DEBUG, so you see everything.
+- **Production:** level INFO. DEBUG output is huge, costs money to store, and often contains things you don't want lying around (raw SQL, payloads, internal structure).
+
+## Structured vs unstructured logs
+
+**Unstructured** logs are plain text written for humans:
+
+```
+14:02:11 ERROR failed to create order for user 81 (payment timeout after 10000ms)
+```
+
+**Structured** logs are machine-readable, usually one JSON object per line:
+
+```json
+{"ts":"2026-10-10T14:02:11Z","level":"error","msg":"create order failed","user_id":81,"request_id":"req_9f2c","route":"POST /orders","error":"payment timeout","duration_ms":10000}
+```
+
+| | Unstructured (console) | Structured (JSON) |
+|---|---|---|
+| Best for | Local development | Production |
+| Read by | You, in a terminal, often colour-coded | Log tools: ELK (Elasticsearch, Logstash, Kibana), Loki, Datadog |
+| Searching | `grep` and hoping the wording matches | Query fields directly: `user_id = 81 AND level = error` |
+| Downside | Fragile to parse; every message has its own shape | Tiring to read by eye |
+
+Most logging libraries let you switch format with config, so you get coloured text locally and JSON in production from the same code.
+
+<LogLevelExplorer />
+
+<Callout kind="warn">
+Never log secrets or sensitive personal data: passwords, full tokens, card numbers, session IDs. Logs get copied to many systems and read by many people. Log a user ID, not their password reset token.
+</Callout>
+
+## Instrumentation and traces
+
+**Instrumentation** is adding code that measures what your app does: timing a function, recording attributes like user ID or note ID, counting events, attaching errors. It's what turns a black box into an observable system.
+
+### Traces and spans
+
+A **trace** follows one request through every component it touches. It's made of **spans**: each span is one unit of work (a handler, a DB query, an outgoing HTTP call) with a start time, a duration, attributes and a parent.
+
+1. Middleware at the edge starts the **root span** when a request arrives and records attributes: route, method, user ID, request ID, client IP.
+2. The span (or its context) is stored in the **request context**, so deeper layers can reach it.
+3. The service and repository start **child spans**, add their own attributes, and end them when they return.
+4. If something fails, the error is **attached to the span** as well as logged.
+
+```go
+func (s *NoteService) Create(ctx context.Context, userID string, in NewNote) (*Note, error) {
+    ctx, span := tracer.Start(ctx, "notes.service.create")
+    defer span.End()
+    span.SetAttributes(attribute.String("user.id", userID))
+
+    note, err := s.repo.Insert(ctx, userID, in)
+    if err != nil {
+        span.RecordError(err)
+        log.Error().Err(err).Str("user_id", userID).Msg("create note failed")
+        return nil, err
+    }
+    log.Info().Str("note_id", note.ID).Msg("note created") // business event
+    return note, nil
+}
+```
+
+The key link: every log line includes the **trace ID** (or request ID). From a log you can open its trace, and from a trace you can see its logs. When a request crosses services, the trace ID travels in a header (the W3C `traceparent` header), so the trace continues across them.
+
+<TraceWaterfall />
+
+### OpenTelemetry
+
+**OpenTelemetry (OTel)** is an open standard for instrumentation: one set of APIs and SDKs for every major language, plus a **collector** that receives telemetry and forwards it to whatever backend you choose. Instrument once with OTel and you can switch vendors without rewriting your code. Many libraries (HTTP servers, database drivers) ship OTel instrumentation, so you get spans for free.
+
+## Choosing tools
+
+| Pillar | Open-source stack | All-in-one services |
+|---|---|---|
+| Metrics | Prometheus | New Relic, Datadog, Grafana Cloud |
+| Dashboards and alerts | Grafana | (built in) |
+| Logs | Loki with Promtail, or the ELK stack | (built in) |
+| Traces | Jaeger, Tempo | (built in) |
+
+The open-source route is powerful and cheap in licence fees, but you have to deploy, configure, scale and maintain it. A small team without dedicated ops time is often better off with a hosted all-in-one tool, and can still instrument with OpenTelemetry to keep the option to switch later.
+
+Observability is a **shared job**: developers instrument the code (logs, attributes, spans, metrics), and whoever runs the infrastructure builds the pipeline that collects, stores and alerts on it.
+
+## Cheat sheet
+
+- **Logs** say what happened, **metrics** show trends, **traces** show where time went across components.
+- Monitoring tells you *that* something broke; observability lets you find *what* and *where*.
+- Debug flow: alert → metrics dashboard → filtered logs → one trace → fix.
+- Levels: DEBUG (dev), INFO (business events), WARN (unusual, not your failure), ERROR (operation failed), FATAL (app exits).
+- Run DEBUG locally and INFO in production.
+- Structured JSON logs in production, readable console logs in development.
+- Put a request or trace ID on every log line so logs and traces link up.
+- Count 5xx as your failures; track 4xx separately.
+- Never log passwords, tokens or card numbers.
+- OpenTelemetry: instrument once, send anywhere.

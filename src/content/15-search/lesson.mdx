@@ -1,0 +1,206 @@
+import { InvertedIndexLab } from "@/components/widgets/InvertedIndexLab";
+
+## The search box that got slow
+
+You run the backend for a growing online shop with about 5,000 products. Product wants a search box, and the obvious query takes five minutes to write:
+
+```sql
+SELECT * FROM products
+WHERE name ILIKE '%laptop%'
+   OR description ILIKE '%laptop%';
+```
+
+`ILIKE` is case-insensitive `LIKE`, and the `%` on each side means "anything before, anything after". At 5,000 rows it returns in a few milliseconds and everyone is happy.
+
+Then the catalogue grows to five million products. The same query now takes many seconds, and the complaints start arriving with new requirements attached:
+
+1. **Speed.** Search must answer in tens of milliseconds, not seconds. Slow search directly costs conversions.
+2. **Relevance.** Searching "laptop" should show an actual laptop before a laptop bag or a laptop sticker.
+3. **Typo tolerance.** Shoppers in a hurry type "laptpo" and still expect laptops.
+
+None of these are things `ILIKE` can give you. They're the problems that dedicated search engines like **Elasticsearch** exist to solve.
+
+## Why ILIKE breaks down
+
+Imagine a librarian who knows exactly where every book is shelved, but answers "find me books about machine learning" by pulling **every book off every shelf** and flipping through it. Fine for a hundred books; hopeless for ten million.
+
+That's what `ILIKE '%laptop%'` asks the database to do:
+
+- **It scans every row.** A normal B-tree index helps with `name = 'x'` or a prefix search like `name LIKE 'lap%'`, because the index is sorted by the start of the string. A pattern that starts with `%` can match anywhere in the text, so the sorted order is useless and the database reads the whole table.
+- **It matches characters, not words.** `'%cat%'` matches "category" and "education". It doesn't know that "laptops" and "laptop" are the same word, or that "Laptop" in the title matters more than "laptop" in the fine print.
+- **It has no notion of relevance.** Every row either matches or doesn't. The results come back in whatever order the database found them, so the best product might be result 3,000.
+
+The rest of this lesson is about the data structure that fixes all three.
+
+## The inverted index
+
+The key idea is to **flip the problem**. Instead of scanning documents looking for a term at query time, you build a map **from each term to the documents that contain it**, once, when documents are written.
+
+A book's index at the back works this way: look up "recursion" and it tells you pages 41, 88 and 112, without you reading the book. Because the map goes from content to location (term to documents) instead of from document to content, it's called an **inverted index**.
+
+For three products:
+
+| Doc | Title |
+|---|---|
+| 1 | Lightweight laptop with 16GB RAM |
+| 2 | Laptop bag, padded |
+| 3 | Gaming mouse, lightweight |
+
+The index looks like:
+
+| Term | Postings (doc ids, with positions) |
+|---|---|
+| `laptop` | 1 (pos 2), 2 (pos 1) |
+| `lightweight` | 1 (pos 1), 3 (pos 3) |
+| `bag` | 2 (pos 2) |
+| `gaming` | 3 (pos 1) |
+
+A query for "lightweight laptop" becomes two lookups, each a fast dictionary access, followed by merging the two posting lists. The cost depends on how many documents contain the terms, **not on how many documents exist**. That's why it stays fast at a billion documents. Storing **positions** lets the engine also answer phrase queries ("lightweight laptop" with the words next to each other).
+
+### Analysis turns text into terms
+
+Before text goes into the index it passes through an **analyzer**, and the same analyzer runs on the query so both sides agree:
+
+1. **Tokenize**: split text into words (`"Laptop bag, padded"` becomes `Laptop`, `bag`, `padded`).
+2. **Lowercase**: `Laptop` becomes `laptop`.
+3. **Remove stop words** (optional): drop words like "the" and "with" that appear everywhere and carry little meaning.
+4. **Stem**: reduce words to a root, so "laptops", "running" and "runs" index as "laptop", "run".
+
+Analysis is why searching "Laptops" finds a product titled "laptop", and why the engine matches whole words instead of fragments like `cat` inside "education".
+
+<InvertedIndexLab />
+
+### Lucene and Elasticsearch
+
+**Apache Lucene** is the Java library that implements inverted indexes, analyzers and scoring. **Elasticsearch** (and its fork OpenSearch) wraps Lucene in a distributed server: it splits an index into **shards** spread over several machines, replicates them, and exposes everything over an HTTP API. Solr is another Lucene-based server.
+
+In Elasticsearch, each record is a **JSON document**, a lot like a row in a document database, and documents live in an **index** (the rough equivalent of a table). Queries are written in the **Query DSL**, which is also JSON:
+
+```json
+POST /products/_search
+{
+  "query": {
+    "multi_match": {
+      "query": "lightweight laptop",
+      "fields": ["title^3", "description"]
+    }
+  }
+}
+```
+
+### Text vs keyword mappings
+
+A **mapping** declares how each field is indexed, like a schema:
+
+```json
+PUT /reviews
+{
+  "mappings": {
+    "properties": {
+      "review":    { "type": "text" },
+      "sentiment": { "type": "keyword" }
+    }
+  }
+}
+```
+
+| Type | Indexed as | Use for |
+|---|---|---|
+| `text` | Analyzed into terms | Free-text search: titles, descriptions, reviews |
+| `keyword` | The exact whole value | Filtering, sorting, aggregations: status, category, sentiment, SKU |
+
+Searching a `keyword` field for "positive" matches only the exact value `positive`. A `text` field would split, lowercase and stem it. Getting this wrong is a classic bug: a `text` field for SKUs makes "AB-123" split into `ab` and `123`, and exact lookups behave strangely.
+
+## Relevance scoring
+
+Finding the matches fast is half the job; ordering them is the other half. For every matching document the engine computes a **relevance score**, and results are sorted by it. Elasticsearch's default formula is **BM25**, a refinement of the classic TF-IDF idea. It combines three signals:
+
+| Factor | Meaning | Effect |
+|---|---|---|
+| **Term frequency (TF)** | How often the term appears in this document | More occurrences score higher, but with **diminishing returns**: the tenth "laptop" adds far less than the second |
+| **Inverse document frequency (IDF)** | How rare the term is across all documents | Rare terms count more. In a shop, "laptop" is more telling than "black" |
+| **Field length** | How long the field is | A match in a short field ("Laptop") counts more than the same match buried in a 2,000-word description |
+
+On top of BM25, you control **field boosting** in the query. In the example above, `"title^3"` makes a title match worth three times a description match. There's no built-in "title beats description" rule; Elasticsearch only knows your field names, so **you** decide the weights per query. For a shop you'd normally boost title, then brand and category, then description.
+
+Put together, "laptop" ranks a product titled "Lightweight laptop" above "Laptop bag" (both short titles, but the bag's description is about bags) and far above a mouse whose long description mentions laptops once.
+
+<Callout kind="tip">
+You don't need to memorize BM25's formula to use search well. What matters is knowing the levers: **analyzers** decide what matches, **mappings** decide how fields are indexed, and **boosts** decide what ranks first.
+</Callout>
+
+## Typos and search as you type
+
+### Typo tolerance
+
+Elasticsearch handles typos with **fuzzy matching** based on **edit distance**: the number of single-character insertions, deletions, substitutions or swaps needed to turn one word into another. "laptpo" is one swap away from "laptop", so a fuzzy query with `"fuzziness": "AUTO"` finds it. AUTO allows zero edits for very short words, one for medium words and two for longer ones, so "cat" doesn't fuzzily match "car".
+
+"Did you mean" suggestions, like the ones big search engines show when you type "what is treading today", combine edit distance with how common each candidate word or phrase is: "trending" is close and far more frequent, so it's suggested.
+
+### Type-ahead
+
+**Search as you type** shows suggestions after each keystroke. Elasticsearch supports this with completion suggesters and with **edge n-grams**: at index time, "laptop" is also stored as `l`, `la`, `lap`, `lapt` and so on, so a prefix lookup is just another fast term lookup. It costs more index space, which is the usual trade: do more work when writing so reads are cheap.
+
+## Postgres search or Elasticsearch
+
+You don't always need a separate search cluster. **Postgres has built-in full-text search**: it converts text into a `tsvector` (a list of normalized terms), queries with a `tsquery`, ranks with `ts_rank`, and indexes the whole thing with a **GIN index**, which is an inverted index inside Postgres.
+
+```sql
+ALTER TABLE products ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', name), 'A') ||
+    setweight(to_tsvector('english', description), 'B')
+  ) STORED;
+
+CREATE INDEX products_search_idx ON products USING GIN (search);
+
+SELECT id, name, ts_rank(search, q) AS rank
+FROM products, websearch_to_tsquery('english', 'lightweight laptop') q
+WHERE search @@ q
+ORDER BY rank DESC
+LIMIT 20;
+```
+
+The `setweight` calls give title matches more weight, the same idea as field boosting. The `pg_trgm` extension adds trigram indexes that speed up `ILIKE` and give basic fuzzy matching too.
+
+| | Postgres full-text search | Elasticsearch |
+|---|---|---|
+| Extra infrastructure | None | A cluster to run, monitor and pay for |
+| Consistency | Same transaction as your data | Separate copy; must be kept in sync |
+| Relevance tuning | Basic weights and ranking | BM25, boosts, rich analyzers, many languages |
+| Typos and type-ahead | Possible with `pg_trgm` and prefix queries | Built in: fuzzy queries, suggesters, n-grams |
+| Scale | Good to millions of rows on one database | Shards across many nodes |
+| Also great at | Everything else your app does | Logs and analytics (the ELK stack) |
+
+A practical rule: **start with Postgres full-text search** if search is a supporting feature and your data already lives in Postgres. Reach for Elasticsearch when relevance tuning, typo tolerance, faceting or scale outgrow it, or when your company already runs Elasticsearch, often as part of the **ELK stack** (Elasticsearch, Logstash, Kibana) for logs.
+
+<Callout kind="warn">
+Elasticsearch is a **secondary index**, not your source of truth. Your database stays primary, and every create, update and delete must also reach the search index, typically through a background job or a change-data-capture pipeline. Plan for that sync and for re-indexing from scratch when mappings change.
+</Callout>
+
+## Measuring the difference
+
+A simple benchmark makes the gap concrete. Load 50,000 product reviews into both a Postgres table and an Elasticsearch index (with `review` as `text` and `sentiment` as `keyword`, bulk-inserting in batches), then run the same term against both:
+
+- Postgres with `WHERE review ILIKE '%term%'` has to scan and pattern-match all 50,000 rows every time. Expect seconds on a small hosted instance.
+- Elasticsearch looks the term up in its inverted index and returns in well under a second, even with network overhead.
+
+To compare fairly, both sides should return the same matches. Keep in mind that wrapping an Elasticsearch query in wildcards to mimic `ILIKE` (`*term*`) actually throws away much of its advantage, because leading wildcards can't use the term dictionary efficiently. A normal analyzed `match` query is both faster and more relevant. And on the Postgres side, a GIN-indexed `tsvector` closes most of the gap, which is the real point: the speed comes from the **inverted index**, not from any particular product.
+
+## How much to learn
+
+Search is a tool to keep within reach, not a career to master on day one. Know **why** `LIKE '%x%'` doesn't scale, how an inverted index and analysis work, what drives ranking, and when Postgres is enough versus when a search engine earns its operational cost. The Elasticsearch documentation covers query syntax well when you need specifics. Your deeper investment should go into **databases**, which nearly every backend feature touches; search engines sit beside them.
+
+## Cheat sheet
+
+- `ILIKE '%term%'` forces a **full scan** with character matching and gives **no relevance**.
+- An **inverted index** maps each term to the documents (and positions) that contain it.
+- **Analyzers** tokenize, lowercase, drop stop words and stem, at index time and query time.
+- **Lucene** is the library; **Elasticsearch** is a distributed server built on it.
+- `text` fields are analyzed for search; `keyword` fields match exact values for filters and sorts.
+- **BM25** scores by term frequency (with diminishing returns), rarity across documents, and field length.
+- **Field boosts** (`title^3`) are set by you per query; nothing is boosted by default.
+- Typos use **fuzzy matching** by edit distance; type-ahead uses **edge n-grams** or suggesters.
+- Postgres has full-text search with `tsvector`, `tsquery` and a **GIN** index.
+- Start with Postgres FTS; move to Elasticsearch for heavy relevance, typo or scale needs.
+- Elasticsearch is a **secondary index** you must keep in sync with your database.

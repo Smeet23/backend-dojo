@@ -1,0 +1,166 @@
+import { ShutdownTimeline } from "@/components/widgets/ShutdownTimeline";
+
+## The problem
+
+You deploy a new version of your shop's API ten times a day. With a **zero-downtime deployment**, new instances start and pass their health checks before the old ones are removed, so users never see the site go down.
+
+But at some point each old instance **has** to stop. At that moment it might be in the middle of 200 requests: someone loading their cart, someone uploading a product photo, someone whose card has just been charged but whose order row hasn't been written yet.
+
+If the process just vanishes:
+
+- The charged customer gets an error, retries, and is **charged twice**.
+- A half-finished multi-step write leaves **inconsistent data**.
+- Users see connection-reset errors for no visible reason.
+
+**Graceful shutdown** is the fix: when told to stop, the server finishes what it's doing, tidies up, and only then exits.
+
+<Callout kind="tip">
+Think of a host at the end of a dinner party. You don't switch off the lights and shove the guests out. You stop letting new people in, let current conversations wrap up, clear the table, and then lock the door.
+</Callout>
+
+## Processes and their life cycle
+
+Your backend runs as a **process** on the operating system. Like everything else on the machine, it has a life cycle: it **starts**, **runs**, and eventually **stops**. Graceful shutdown is about doing that last phase well.
+
+The OS (or whatever manages your process) doesn't usually yank a process out of existence. It follows a protocol that amounts to a short conversation:
+
+- Manager: "It's time for you to stop."
+- Process: "Understood. Give me a moment to finish up, then I'll exit."
+
+Processes don't talk in sentences. That conversation happens through **signals**.
+
+## Unix signals
+
+A **signal** is a small, numbered notification the OS delivers to a process. It's one of the oldest forms of **inter-process communication** on Unix-like systems: Linux (which runs nearly every server) and macOS.
+
+A process can register a **signal handler**: code that runs when a particular signal arrives. By registering handlers for the stop signals, your app is effectively saying: "when you want me to stop, send me this, and I'll shut myself down properly."
+
+| Signal | Sent by | Meaning | Can the app handle it? |
+|---|---|---|---|
+| **SIGTERM** | Process managers and orchestrators: Kubernetes, systemd, Docker, PM2 | Polite request: please finish up and exit | Yes |
+| **SIGINT** | A human pressing **Ctrl+C** in a terminal | Interrupt: the user wants it to stop | Yes |
+| **SIGKILL** | The OS or an operator, as a last resort | Stop **now** | **No.** It can't be caught or ignored |
+
+SIGKILL is pulling the power cord instead of clicking "Shut down". The process gets no chance to run any code at all.
+
+<Callout kind="remember">
+Handle **SIGINT and SIGTERM the same way**. Whether you press Ctrl+C locally or Kubernetes stops a pod during a deploy, the intent is identical, so the shutdown path should be too. And if you ignore the polite signals, the manager eventually sends SIGKILL, and you lose the chance to clean up.
+</Callout>
+
+### How the timeout is enforced
+
+Managers combine the two kinds of signal. Kubernetes, for example, sends SIGTERM, waits for a **grace period** (30 seconds by default), and then sends SIGKILL if the process is still alive. Docker's `docker stop` does the same with a 10-second default. Your own shutdown code should finish comfortably inside that window.
+
+## Draining in-flight requests
+
+**In-flight requests** are ones the server has already accepted and is still working on. At scale, that's hundreds or thousands at any moment.
+
+Think of a restaurant at closing time. The door staff stop letting new customers in. Diners already seated are told the kitchen is closing and get some time to finish, pay and leave. Then the lights go off.
+
+**Connection draining** does the same:
+
+1. **Stop accepting new work.** Close the listening socket so no new connections arrive.
+2. **Let in-flight work finish.** Requests already being handled run to completion and send their responses.
+3. **Close the connections**, including idle keep-alive connections.
+
+What "draining" means depends on the kind of server:
+
+| Server type | Draining looks like |
+|---|---|
+| HTTP API | Stop accepting requests; let current handlers finish and respond |
+| Database | Stop taking new queries and transactions; finish (commit or roll back) current ones; close client connections |
+| WebSocket server | **Tell clients** it's closing (a close frame, or a "reconnect" message) so they can reconnect elsewhere; then close sockets |
+| Queue worker | Stop pulling new jobs; finish the current job, or hand it back to the queue so another worker retries it |
+
+### Don't get traffic you can't serve
+
+Closing your own listener isn't enough if a load balancer keeps sending you requests. Shutdown has to be **coordinated with the load balancer or service discovery**:
+
+- Start failing the **readiness check** (or explicitly **deregister** the instance) so the balancer stops routing new traffic to it.
+- Give the balancer a moment to notice (a few seconds) before you close the listener. Otherwise requests already on their way get refused.
+
+**Service discovery** is how components find each other in a deployment (which IPs currently serve the API, where the database lives). Removing yourself from it is the "door staff" step at the infrastructure level.
+
+### Choosing the drain timeout
+
+You can't wait forever. Set a hard **drain timeout**, commonly 30 seconds; after it expires, whatever is still running is cut off.
+
+- **Too short:** legitimate slow work (a big export, a file upload) gets killed.
+- **Too long:** every deploy is slow, and a stuck request can hold up the whole rollout.
+
+Base it on your real request durations. If p99 latency is 800 ms, 30 seconds is generous. If some endpoints run for minutes, move that work to background jobs rather than raising the timeout. Make sure your timeout is **shorter** than the manager's grace period, so your code finishes before SIGKILL arrives.
+
+<ShutdownTimeline />
+
+## Cleaning up resources
+
+After draining, release everything the process acquired while running. It's like tidying your desk before you leave: return the mug, close the drawers.
+
+| Resource | Why it matters |
+|---|---|
+| **Database connections and transactions** | Open transactions must be **committed or rolled back** explicitly. Abandoned ones can hold locks, cause deadlocks for others, or leave partial writes |
+| **Network connections** (Redis, other services) | The OS limits how many sockets and file descriptors a process may hold; leaks on the other side waste capacity until they time out |
+| **File handles** | Each open file uses a descriptor. Buffered writes may be lost if not flushed and closed |
+| **Temporary files and caches** | Leftover temp files fill disks; in-memory buffers (like batched logs or metrics) need a final flush |
+
+### Release in reverse order
+
+Release resources in the **reverse order** of how you depend on them. Shut down the things that **produce work** first, then the things that work **depends on**:
+
+1. Stop the HTTP server and background job workers (no new work, drain current work).
+2. Flush buffered logs, metrics and traces.
+3. Close the database pool and the Redis client.
+
+If you close the database first, a request still draining would fail halfway through, which is exactly what you were trying to avoid.
+
+## Putting it together
+
+Here's the shape of a graceful shutdown in Go. Every major framework has an equivalent (Node's `server.close()`, Python's ASGI lifespan, and so on), so you rarely write this from scratch. What matters is understanding the steps.
+
+```go
+func main() {
+    db := mustOpenDB()       // acquired first
+    redis := mustOpenRedis()
+    jobs := startJobWorkers(redis, db)
+    srv := &http.Server{Addr: ":8080", Handler: routes(db)}
+
+    // 1. Listen for SIGINT (Ctrl+C) and SIGTERM (orchestrators)
+    ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+    defer stop()
+
+    go srv.ListenAndServe()
+    <-ctx.Done() // block until a stop signal arrives
+    log.Info().Msg("shutdown signal received")
+
+    // 2. Hard deadline for the whole shutdown
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+    defer cancel()
+
+    // 3. Stop producing work: drain HTTP and background jobs
+    srv.Shutdown(shutdownCtx) // stops accepting, waits for in-flight handlers
+    jobs.Shutdown()           // finish current jobs, take no new ones
+
+    // 4. Release dependencies in reverse order
+    redis.Close()
+    db.Close()
+    log.Info().Msg("server exited cleanly")
+}
+```
+
+Notice the 25-second timeout: shorter than Kubernetes' default 30-second grace period, so the app always finishes before SIGKILL.
+
+<Callout kind="warn">
+In a container, your app must actually **receive** the signal. If it's started through a shell script, the shell may be the main process and swallow SIGTERM, so your app never hears it and gets SIGKILLed after the grace period. Use `exec` in start scripts, or run the binary directly.
+</Callout>
+
+## Cheat sheet
+
+- Zero-downtime deploys still stop old instances; graceful shutdown makes that moment safe.
+- SIGTERM comes from orchestrators, SIGINT from Ctrl+C: handle both the same way.
+- SIGKILL can't be caught; it arrives after the grace period if you haven't exited.
+- Order: fail readiness or deregister, stop accepting, drain in-flight work, release resources, exit.
+- Set a drain timeout shorter than the manager's grace period (often 30 s).
+- WebSocket servers notify clients before closing; queue workers finish or requeue their job.
+- Commit or roll back open transactions; never leave them hanging.
+- Shut down producers of work first, then their dependencies (DB, Redis) last.
+- Frameworks provide shutdown helpers; your job is to wire them in the right order.

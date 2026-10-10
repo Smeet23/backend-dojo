@@ -1,0 +1,257 @@
+import { CacheEvictionLab } from "@/components/widgets/CacheEvictionLab";
+import { StaleCacheLab } from "@/components/widgets/StaleCacheLab";
+
+## What caching is
+
+Caching means **keeping a copy of some data somewhere faster and cheaper to reach than its original source**, so you don't have to fetch or recompute it every time.
+
+Two words in that definition carry the weight:
+
+- **A copy of some data.** A cache holds a **subset** of the data, picked because it's used often or likely to be used next. The original (the database, the origin server, the third-party API) stays the source of truth.
+- **Faster to reach.** "Faster" might mean memory instead of disk, a server in your city instead of one on another continent, or a stored answer instead of an expensive computation.
+
+### Hits and misses
+
+Every cache lookup ends one of two ways:
+
+- **Cache hit**: the data is in the cache. Return it immediately.
+- **Cache miss**: it isn't. Do the slow work (query the database, call the origin, run the computation), **store the result in the cache**, then return it, so the next request is a hit.
+
+The **hit rate** (hits divided by total lookups) is the number that tells you whether a cache is earning its keep. A cache with a 20% hit rate adds a network hop to 80% of requests for little benefit; one at 95% takes most of the load off whatever sits behind it.
+
+## When caching pays off
+
+Three familiar products show the two situations where caching matters most.
+
+**Search results.** Producing results for a query means consulting enormous indexes and ranking billions of documents, which costs real CPU. Yet the same queries ("weather today") are typed millions of times a day. A search engine stores computed results in a **distributed in-memory cache**: check the cache first, and on a miss compute the results, store them and return them. The next million people asking the same thing get the stored answer.
+
+**Video streaming.** A streaming service holds its catalogue on **origin servers** in a few data centres. Serving every viewer from there would be slow for anyone far away and would melt the origin's bandwidth. Instead, copies of popular titles sit on **edge servers** around the world, close to viewers. Each title is also encoded at several qualities (1080p, 720p, 480p), and the player picks the one the connection can handle. Edges can't hold everything (fast storage near users is expensive), so each region caches what its viewers are likely to watch.
+
+**Trending topics.** Working out what's trending means analysing millions of posts with heavy pipelines. If every page view triggered that, the servers would fall over within seconds. But trends change over minutes or hours, not milliseconds. So a background job recomputes them every few minutes per region and writes the result into an in-memory store such as **Redis**, and every page view simply reads it.
+
+The pattern: cache when you'd otherwise **repeat expensive computation**, or **move a lot of data a long way** to many people, **and** a slightly old answer is acceptable for a while.
+
+## Three levels of caching
+
+As a backend engineer you'll meet caches at three levels:
+
+| Level | Examples | What it saves |
+|---|---|---|
+| **Network** | CDNs, DNS caches | Distance and round trips |
+| **Hardware** | CPU L1/L2/L3 caches, RAM | Trips to slower memory or disk |
+| **Software** | Redis, Memcached, Valkey, managed services such as AWS ElastiCache | Database queries, computations and API calls |
+
+"Software" caches still run on hardware (RAM). The name just reflects that you use them through a library and a server you run or rent.
+
+## CDNs
+
+A **CDN (content delivery network)** is a fleet of servers spread across the world that cache your content close to users. Anything described as **edge** (edge servers, edge functions, edge caching) means "running at one of those nearby locations rather than at your origin".
+
+CDNs serve images, video, downloads and static frontend assets (HTML, CSS, JavaScript). When you deploy a frontend to a platform with an edge network, its static files are served from the location nearest each visitor.
+
+### How a CDN request works
+
+1. The user's browser requests `https://cdn.shop.dev/img/hero.webp`.
+2. A **DNS** lookup resolves the hostname. The CDN steers the user to a nearby **PoP (point of presence)**, a site with a cluster of edge servers, based on where they are and current network conditions. (CDNs do this with geo-aware DNS answers, anycast routing, or both.)
+3. The edge server checks its cache:
+   - **Hit**: it serves the file straight away.
+   - **Miss**: it fetches the file from your **origin server**, stores a copy, and serves it. The next user in that region gets a hit.
+
+### TTL at the edge
+
+Every cached copy has a **TTL (time to live)**: how long the edge may serve it before checking with the origin again. You usually control it with HTTP headers from your origin, such as `Cache-Control: public, max-age=86400`.
+
+- A **long TTL** gives more hits and less origin load, but changes take longer to reach users.
+- A **short TTL** keeps content fresher, at the cost of more trips to the origin.
+
+A common trick for static assets is to put a content hash in the file name (`app.3f9c2a.js`) and cache it for a year. A new deploy produces a new name, so there's never a stale copy to worry about. When you must remove something early, CDNs offer a **purge** (invalidation) API.
+
+## DNS caching
+
+### How a lookup works
+
+When your laptop needs the IP address for `shop.dev` and nothing nearby knows it, a full lookup goes like this:
+
+1. The device asks a **recursive resolver**, usually run by your ISP or a public provider such as Cloudflare (`1.1.1.1`) or Google (`8.8.8.8`).
+2. If the resolver has the answer cached, it replies immediately.
+3. Otherwise it asks a **root server**. There are 13 named root server identities, each run as hundreds of copies worldwide. The root doesn't know the IP, but it knows who handles `.dev` and replies with a **referral to the TLD servers**.
+4. The **TLD server** for `.dev` doesn't know the IP either, but it knows which **authoritative name servers** are responsible for `shop.dev`.
+5. The **authoritative name server** returns the actual record, for example `shop.dev A 203.0.113.10`, along with a TTL.
+
+The resolver does the legwork on your behalf, walking down the tree until it finds the answer, which is why it's called **recursive**.
+
+### Where DNS answers are cached
+
+That walk takes several network round trips, so nobody wants to repeat it for every request. Answers are cached at several layers, each honouring the record's TTL:
+
+1. The **browser**'s own DNS cache.
+2. The **operating system**'s resolver cache.
+3. The **recursive resolver** (shared by everyone using that ISP or provider, so popular domains are almost always hits).
+4. Resolvers also cache the referrals for root and TLD servers, so even a miss usually skips the top of the tree.
+
+<Callout kind="tip">
+This is why DNS changes "take time to propagate". Nothing is being pushed anywhere: caches around the world simply keep serving the old answer until its TTL runs out. Lower a record's TTL a day before a planned migration, then switch.
+</Callout>
+
+## Hardware caching
+
+Inside one machine, memory forms a hierarchy, each level bigger and slower than the one before:
+
+**CPU registers → L1 cache → L2 cache → L3 cache (shared between cores) → RAM → SSD / HDD → network storage**
+
+The CPU keeps recently used data, and data it expects to use next, in the small, very fast L1–L3 caches. Memory moves between RAM and these caches in fixed-size blocks called **cache lines** (typically 64 bytes), and the CPU **prefetches** the next lines when it spots a sequential pattern. That's why looping through an array in order is much faster than chasing pointers scattered across memory: each fetch brings the next elements along for free.
+
+### Why RAM is fast
+
+Redis and Memcached are called **in-memory** stores because they keep their data in RAM.
+
+- A **hard disk** has a spinning platter and a moving head; reading means physically moving to the right place, which takes milliseconds.
+- An **SSD** has no moving parts and is far faster, but every access still goes through a storage controller and bus.
+- **RAM** is addressed electronically. Any location can be reached in roughly the same short time, regardless of what you read before. That's what "random access" means.
+
+| | RAM | Disk (SSD/HDD) |
+|---|---|---|
+| Speed | Very fast | Slower |
+| Capacity per dollar | Low | High |
+| After power loss | **Gone** (volatile) | Still there (persistent) |
+
+RAM is fast but small, expensive and volatile, so it can't replace disk. That's also why a cache holds only a subset of your data.
+
+## In-memory key-value stores
+
+**Redis**, its open-source fork **Valkey**, and **Memcached** are the standard software caches. They're often described as **in-memory key-value NoSQL databases**:
+
+- **In-memory**: data lives in RAM, so reads and writes take well under a millisecond on the server.
+- **Key-value**: no tables or schema. You store a value under a key, such as `product:42`, and get it back by key. Redis values can be strings, numbers, lists, sets, hashes or sorted sets.
+- **NoSQL**: no SQL, no joins, no aggregations. You do the clever work in your application and cache the result.
+
+Using one from code is short:
+
+```ts
+const cached = await redis.get(`product:${id}`);
+if (cached) return JSON.parse(cached);              // hit
+
+const product = await db.query("SELECT ... WHERE id = $1", [id]);  // miss
+await redis.set(`product:${id}`, JSON.stringify(product), { EX: 3600 }); // cache for 1 hour
+return product;
+```
+
+Redis can also persist to disk (periodic snapshots, an append-only log, or both) and reload on restart. Depending on configuration, a crash can still lose the last second or more of writes. Treat it as a cache that **might** come back warm, not as your source of truth.
+
+## Caching strategies
+
+A strategy answers two questions: when does data get **into** the cache, and how does it stay **correct** when the source changes?
+
+### Cache-aside
+
+Also called **lazy loading**, and the most common pattern by far. The application talks to both the cache and the database:
+
+1. Look in the cache.
+2. On a hit, return it.
+3. On a miss, read the database, write the result into the cache (with a TTL), and return it.
+
+It's "lazy" because nothing is cached until someone asks for it. You only spend memory on data that's actually requested, and if the cache goes down, the app still works (just slower), because the database is always there.
+
+The weakness is **staleness**: if the database changes, the cache keeps serving the old value until the entry expires or you remove it.
+
+### Write-through
+
+On every write, the application updates the **database and the cache in the same flow**. The next read finds the fresh value already cached.
+
+| | Cache-aside | Write-through |
+|---|---|---|
+| Cache filled | On a read miss | On every write |
+| Write cost | Normal | Higher (database and cache) |
+| Reads right after a write | Miss, or stale if not invalidated | Hit, fresh |
+| Caches data nobody reads | No | Yes, possibly |
+
+Write-through keeps the cache fresh in the normal case, but it isn't magic. If the database write succeeds and the cache write fails, or two writers race, the cache can still end up wrong. Keep a TTL on write-through entries anyway, as a safety net.
+
+There's also **write-behind** (write-back): write to the cache now and flush to the database later in batches. It makes writes very fast but risks losing data if the cache dies before flushing, so it's reserved for things like counters and analytics.
+
+### Invalidation
+
+The usual way to keep cache-aside correct is to **invalidate on write**: after updating the database, **delete** the cache key. The next read misses and loads the fresh value.
+
+```ts
+await db.query("UPDATE products SET price = $1 WHERE id = $2", [price, id]);
+await redis.del(`product:${id}`);   // next read repopulates from the database
+```
+
+Deleting is usually safer than overwriting the key with the new value, because two concurrent writers can't leave an older value sitting in the cache. Even so, combine invalidation with a **TTL**, so any key you forget to invalidate fixes itself eventually.
+
+<StaleCacheLab />
+
+<Callout kind="warn">
+When a very popular key expires, hundreds of requests can miss at once and all hit the database together (a **cache stampede**). Common defences are letting only one request recompute while others wait or get the old value, and adding a little random jitter to TTLs so keys don't all expire at the same moment.
+</Callout>
+
+## Eviction policies
+
+Memory runs out. When the cache is full and a new key arrives, something must go. The **eviction policy** decides what.
+
+| Policy | Evicts | Good for |
+|---|---|---|
+| **No eviction** | Nothing; writes fail with an out-of-memory error | When losing a key is worse than failing loudly |
+| **LRU** (least recently used) | The key whose last access is oldest | Most general-purpose caches: recently used data tends to be used again |
+| **LFU** (least frequently used) | The key with the fewest accesses | Stable hot sets: a popular item survives a brief lull |
+| **TTL-based** (nearest expiry) | Among keys with a TTL, the one closest to expiring | When TTLs already reflect how valuable entries are |
+
+**Expiry** and **eviction** are different things. Expiry removes a key because its TTL ran out, whether or not memory is tight. Eviction removes a live key because memory is full. A real cache usually does both.
+
+Examples make the difference between LRU and LFU clear. Say the cache holds keys A, B, C and is full:
+
+- A, B and C were last read today, D yesterday. Under **LRU**, D goes.
+- A has been read 5 times, B 10, C 6, D 23. Under **LFU**, A goes, even if it was read a second ago.
+
+<CacheEvictionLab />
+
+In Redis you choose with the `maxmemory-policy` setting (`allkeys-lru`, `allkeys-lfu`, `volatile-ttl`, `noeviction` and others). Redis approximates LRU and LFU by sampling keys instead of tracking perfect order, which is close enough in practice and much cheaper.
+
+## Backend use cases
+
+### Database query results
+
+An admin dashboard runs a heavy query: several joins and aggregations over millions of rows, taking two seconds, and monitoring shows it's called constantly. Cache the result with a sensible TTL (say, 5 minutes or an hour, depending on how fresh it must be). One request pays the cost; the rest are hits. When the underlying data changes in a way users must see right away, invalidate the key.
+
+The same idea covers product pages in a big shop during a sale (product details change rarely but are read millions of times) and user profiles on a social app (edited a few times a year, read constantly).
+
+<Callout kind="remember">
+The best cache candidates are **read-heavy and rarely written**. Data that changes on almost every read gives you a low hit rate and constant invalidation work.
+</Callout>
+
+### Sessions
+
+With session-based login, every authenticated request looks up its session. Keeping sessions in Redis instead of the main database makes that lookup sub-millisecond and keeps a large, constant stream of tiny reads off your database. Sessions also have natural expiry, which maps directly onto key TTLs.
+
+### External APIs
+
+Your shop shows the weather at the delivery address using a third-party API. Calling it on every page view is slow, counts against your **rate limit** and may cost money per call. Weather doesn't change by the second, so cache each location's response for 30–60 minutes. Whenever you integrate an external API, ask whether its responses can be cached.
+
+### Rate limiting
+
+A **rate limiter** caps how many requests a client can make in a time window, protecting expensive endpoints from abuse and bots. It usually runs as **middleware** before your route handlers:
+
+```
+Client ──► [rate-limit middleware] ──► route handler
+              key = ratelimit:<client-ip>:<current-minute>
+              INCR key  (set EXPIRE 60 on the first hit)
+              count > 50 ?  → 429 Too Many Requests
+```
+
+Behind a reverse proxy, the client's IP arrives in the `X-Forwarded-For` header. Only trust the entry your own proxy added; clients can put anything they like in that header.
+
+Why Redis rather than Postgres for the counters? It would work, but every single request would pay for a database write, and your database would spend its capacity counting requests instead of serving real data. Redis's `INCR` is atomic and takes microseconds, and keys expire on their own when the window ends.
+
+## Cheat sheet
+
+- A cache is a **copy of a subset** of data in a faster place; the source of truth stays elsewhere.
+- **Hit**: return it. **Miss**: fetch, store, return. Watch the **hit rate**.
+- Cache to avoid **repeated heavy work** or **moving lots of data far**, when slightly old data is acceptable.
+- Levels: **network** (CDN, DNS), **hardware** (CPU caches, RAM), **software** (Redis, Memcached, Valkey).
+- **CDN**: DNS steers you to the nearest PoP; the edge serves hits and fetches misses from the origin; **TTL** controls freshness.
+- **DNS**: resolver → root → TLD → authoritative; answers cached in the browser, OS and resolver for the record's TTL.
+- RAM is fast but **small and volatile**, so caches hold subsets and databases stay on disk.
+- **Cache-aside**: fill on read miss. **Write-through**: update cache and DB on write. Invalidate by **deleting** the key, and always set a TTL.
+- Eviction: **no-eviction** (errors), **LRU**, **LFU**, **nearest TTL**. Expiry is not the same as eviction.
+- Great uses: heavy **query results**, **sessions**, **external API** responses, **rate-limit counters** (429).

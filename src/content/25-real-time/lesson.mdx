@@ -1,0 +1,315 @@
+import { RealtimeTimeline } from "@/components/widgets/RealtimeTimeline";
+import { PubSubFanout } from "@/components/widgets/PubSubFanout";
+
+## The server can't speak first
+
+Everything built so far has the same shape: **the client asks, the server answers**. Auth, validation, caching, background jobs and object storage all fit that pattern.
+
+Now the product team wants a **live task board** in the SaaS app. Two teammates look at the same board. When one drags a task from *To do* to *In progress*, the other should see it move **immediately**, without refreshing.
+
+That collides with a basic rule of HTTP: **the client always initiates**. A server can answer a request, or take its time answering, but it cannot start a conversation. If the server learns something the client didn't ask about, plain HTTP gives it no way to say so. Every technique in this lesson is a way around that rule, and each one has a cost.
+
+## Polling
+
+The obvious workaround: if the server can't tell you, keep asking. Every 3 seconds the browser sends "anything new on board 412 since my last check?"
+
+```http
+GET /boards/412/changes?since=2026-10-10T12:00:03Z HTTP/1.1
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{ "changes": [] }
+```
+
+Most of the time the answer is "nothing". Occasionally it's a change, and the client either applies it or refetches the board and re-renders.
+
+### When polling is fine
+
+For an internal admin tool with a handful of users, polling every few seconds is a perfectly good engineering choice. It's simple, works through every proxy and firewall, and needs no special infrastructure. The problems appear in user-facing products at scale.
+
+### Why polling gets expensive
+
+1. **Built-in delay.** A change waits for the next poll. On average that's **half the interval**: a 3-second interval gives about 1.5 seconds of delay.
+2. **"Poll faster" multiplies cost.** 10,000 open boards polling every 3 seconds is about **3,333 requests per second, forever**. Each one runs the full stack: load balancer, auth middleware validating a token, logging, the service layer, a database query, serialization. Drop the interval to 1 second and you get 3x better latency for a 3x bigger bill.
+3. **Cost scales with watchers, not events.** A board where nothing happens all day costs exactly as much as a busy one. You pay for the **requests**, not for the **changes** that actually matter.
+4. **Mobile battery and data.** Every poll wakes the phone's radio, one of the most power-hungry things a phone does, mostly to learn nothing happened.
+
+So there are two goals for anything better: the **server should be able to speak first**, and cost should scale with **events**, not with users.
+
+## Long polling
+
+Since the client must ask first, the next idea is: ask, and let the server **wait** to answer.
+
+1. The browser sends a request.
+2. The server **holds it open** (often up to 30 to 60 seconds) until something changes.
+3. When a change happens, it responds immediately and the request ends.
+4. The browser instantly sends a new long-poll request. If nothing happens before the timeout, the server returns an empty response and the browser asks again.
+
+Delivery is now near-instant: on average about **one network trip**. But there's a **gap**. After the server responds, the client must process the response and send a new request, and during that window the server has **no open request** to answer. An event that lands in the gap waits for the next request to arrive. RFC 6202, which documents long polling and its problems, notes that the worst-case delay is more than **three network trips** (response, new request, next response).
+
+Every cycle is also a full HTTP request with all its headers and middleware. Long polling powered many chat apps for years, but it's been largely replaced by the next two options.
+
+## Server-Sent Events
+
+Long polling ends the response after each event. **Server-Sent Events** (SSE) asks: what if the response **never ends**?
+
+1. The browser makes an ordinary `GET`.
+2. The server replies `200` with `Content-Type: text/event-stream` and **keeps the response open**.
+3. Whenever there's news, the server writes a few lines of text into that same response.
+
+It's not a new protocol. It's plain HTTP with a response body that keeps streaming, which is why it passes through proxies, load balancers and corporate networks without special handling.
+
+### The event stream format
+
+```text
+id: 17
+event: task.moved
+data: {"taskId": 9, "from": "todo", "to": "in_progress"}
+
+retry: 3000
+
+: keep-alive comment, ignored by the client
+```
+
+The format has four fields, and each event ends with a blank line:
+
+| Field | Purpose |
+|---|---|
+| `id` | A position in the stream, used for resuming |
+| `event` | The event's name, such as `task.moved` or `task.deleted` |
+| `data` | The payload, often JSON the frontend can render directly |
+| `retry` | How many milliseconds the browser should wait before reconnecting |
+
+Lines starting with a colon are comments; servers send them periodically as keep-alives so idle proxies don't close the connection.
+
+On the client, the browser's built-in `EventSource` does the work:
+
+```ts
+const events = new EventSource("/boards/412/events", { withCredentials: true });
+events.addEventListener("task.moved", (e) => {
+  const change = JSON.parse(e.data);
+  board.moveTask(change.taskId, change.to);
+});
+```
+
+### Reconnecting and resuming
+
+SSE is part of the HTML standard, so **the browser handles reconnection for you**. If the connection drops, it waits (the `retry` value) and reconnects automatically. On reconnect it sends a **`Last-Event-ID`** header containing the last `id` it received, and the server replays everything after that. Catch-up is built in.
+
+SSE is not a toy. Uber's driver push platform was originally built on SSE, LinkedIn used it for instant messaging (typing indicators, read receipts), and **essentially every LLM API streams tokens over SSE**: the text appearing word by word is a series of `data` lines. The reason is always the same: it's plain HTTP, so it works everywhere.
+
+### One direction only
+
+SSE is **server to client only**. When the user drags a task, the browser sends a separate `POST /tasks/9/move`; it can't use the event stream for that. For many products (notifications, dashboards, feeds, token streaming) that's completely fine.
+
+<Callout kind="tip">
+Over HTTP/1.1, browsers allow only about six connections per origin, and each open SSE stream holds one. Users with many tabs can exhaust that. HTTP/2 multiplexes streams over one connection and removes the problem.
+</Callout>
+
+## WebSockets
+
+For a live board where both sides send frequent small messages (moves, cursors, presence), you want **both directions on one connection**. That's a **WebSocket**.
+
+### The handshake
+
+A WebSocket starts life as an ordinary HTTP `GET`, so it can travel through infrastructure that already understands HTTP:
+
+```http
+GET /boards/412/ws HTTP/1.1
+Host: api.taskboard.dev
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+The client sends a random 16-byte `Sec-WebSocket-Key`, base64-encoded. The server appends a fixed GUID defined in the spec (`258EAFA5-E914-47DA-95CA-C5AB0DC85B11`), takes the SHA-1 and base64-encodes it to produce `Sec-WebSocket-Accept`.
+
+This is **not security**. The GUID is public, so anyone can compute the answer. Its job is to prove the server **genuinely understood a WebSocket request**, and that the reply isn't, say, a cache replaying an old HTTP response.
+
+After `101 Switching Protocols`, the TCP connection stays open but **stops being HTTP**: no more methods, headers or status codes. It's a two-way stream of **frames**, and either side can send at any time.
+
+### Frames
+
+Every message is wrapped in a compact binary frame header:
+
+| Field | Size | Meaning |
+|---|---|---|
+| FIN | 1 bit | This is the final fragment of a message |
+| RSV1 to RSV3 | 3 bits | Reserved for extensions |
+| Opcode | 4 bits | `0` continuation, `1` text, `2` binary, `8` close, `9` ping, `10` pong |
+| MASK | 1 bit | Whether the payload is masked |
+| Payload length | 7 bits, maybe more | Up to 125 is the length; `126` means the next 2 bytes hold it; `127` means the next 8 bytes do |
+| Masking key | 0 or 4 bytes | Present when MASK is set |
+
+A small server-to-client message has a **2-byte header**. Compare that with the hundreds of bytes of HTTP headers on every poll or long-poll request.
+
+### Masking
+
+Every frame **from client to server** must be masked: each payload byte is XORed with one byte of a 4-byte key, cycling through the key. The key is sent in plain sight just before the payload.
+
+```ts
+const unmasked = payload.map((byte, i) => byte ^ maskKey[i % 4]);
+```
+
+So masking is **not encryption**; anyone can undo it in one line. It exists because of an attack found while the protocol was being designed:
+
+1. A malicious page opens a connection to the attacker's own server and completes something that looks like an upgrade.
+2. It then sends bytes crafted to look like a fresh HTTP `GET` for a popular script, say a widely used analytics file.
+3. A **caching proxy** in the middle that doesn't understand WebSockets sees what looks like a request and response, and **caches the attacker's script** under the real URL.
+4. Everyone behind that proxy now gets the attacker's script.
+
+With masking, the browser picks a **fresh random key for every frame**, one the page's JavaScript can't predict or control. The attacker chooses the message but not the **bytes on the wire**, so they can't forge something a proxy would parse as HTTP. Masking protects **network infrastructure**, not your data; use `wss://` (TLS) for confidentiality.
+
+### Heartbeats
+
+Opcode `9` is **ping** and `10` is **pong**: either side can ping, and the other must answer with a pong.
+
+They exist because of how TCP behaves. If a user walks into a lift or their phone switches from Wi-Fi to mobile data, there's often **no error and no close**. The server keeps holding a socket it believes is alive. To TCP, an **idle connection and a dead one look identical**.
+
+The only way to tell is to send something and wait for a reply. A typical rule: ping every 25 to 30 seconds, and if no pong arrives within about 30 seconds, **close the connection and free its resources**. Heartbeats also keep idle connections from being cut by load balancer timeouts.
+
+## Choosing a transport
+
+<RealtimeTimeline />
+
+| Approach | How it works | Main limitation | Good for |
+|---|---|---|---|
+| Polling | Client asks every N seconds | Average delay N/2; cost scales with watchers | Small internal tools |
+| Long polling | Server holds the request until news | Reconnect gap; a full request per event | Legacy environments |
+| SSE | One response that never ends, `text/event-stream` | Server to client only | Notifications, feeds, token streaming |
+| WebSockets | HTTP upgrade to a framed, two-way connection | Persistent connections are state you must scale | Chat, live boards, games, collaboration |
+
+## How many connections fit on one machine
+
+Persistent connections change the scaling question from "how many requests per second?" to "how many open connections can we hold?" Consider a test on a Linux machine with 16 cores and about 61 GB of free RAM, running a tiny Go WebSocket server that only accepts and holds connections. It hits three limits, in order.
+
+### File descriptors
+
+On Unix, **sockets are files**: every connection consumes a **file descriptor**, and the number a process can open is limited. `ulimit -n` commonly reports a soft limit of **1,024**.
+
+Opening 2,000 connections stalls at about **1,017**: 1,024 minus a few descriptors the process already uses (stdin, stdout, stderr, the listening socket, the epoll instance). The symptoms are sneaky:
+
+- **Clients** don't see "connection refused", just a **timeout** waiting for the handshake.
+- **The server** logs `too many open files` and keeps retrying with backoff. It stays **up and passes health checks** while refusing every new connection.
+
+The limit is **language-dependent**. On the same machine, a Go program reports a limit of 1,048,575 while Python reports 1,024. The Go runtime raises its own soft limit to the hard limit at startup; the low default exists for old programs that use `select()`, which can't handle descriptor numbers above a fixed size. Go doesn't use `select()`, so it lifts the limit for itself. In Node, Python or Java you typically raise it yourself (`ulimit -n`, systemd's `LimitNOFILE`, or container settings).
+
+### Ephemeral ports
+
+With the descriptor limit raised, the next run stalls at **28,190** connections with `cannot assign requested address`. The error comes from the **load-testing client**, not the server.
+
+A TCP connection is identified by a **4-tuple**: source IP, source port, destination IP, destination port. Only the whole tuple must be unique. The server's IP and port are fixed, and the test client had one IP, so the only thing that varied was the **client's source port**. Linux picks those from an ephemeral range, by default 32768 to 60999: **28,232 ports**, minus a few already in use.
+
+<Callout kind="warn">
+"A server can only hold 65,535 connections because there are only 65,535 ports" is a myth. The server listens on **one** port; each connection is unique because of the **client's** IP and port. Real servers hold far more connections than that, from many clients.
+</Callout>
+
+The fix isn't a bigger server. Give the client three source IP addresses, 25,000 connections each, and the server holds **75,000 connections** with zero failures. The lesson for load testing: you need **several client machines or IPs** to generate realistic connection counts.
+
+### Memory
+
+The idle server used about 7.5 MB. With 75,000 connections it used about 722 MB, roughly **10 KB of heap per connection**, and that doesn't even count kernel socket buffers, which don't appear in the process's own memory. At that rate a million idle connections needs about 10 GB of heap, easily within this machine's RAM.
+
+Most of that 10 KB isn't the socket. It's the **goroutine per connection** and its read and write buffers. Systems that push into millions of connections drop the goroutine-per-connection model and watch all sockets from a few event loops using **epoll** directly. Either way, the conclusion stands: holding a lot of idle connections mostly comes down to **RAM** once the descriptor and port limits are handled.
+
+## Connections are state
+
+In production you run several instances behind a load balancer, autoscaling up and down, and every deploy replaces them. Put two teammates on the board: Ana's WebSocket lands on instance 1, Ben's on instance 2. Ana moves a task and **Ben sees nothing**.
+
+Instance 1 knows "this socket belongs to Ana and watches board 412". Instance 2 has no idea Ana exists. They're separate processes, possibly in different regions.
+
+This contradicts the rest of the course. You've made every server **stateless** so any instance can handle any request. But **a persistent connection is state**: it lives in one process's memory and can't be moved or shared. Once an instance accepts a WebSocket, it's the only machine in the world that can write to that user.
+
+### Sticky sessions are not the fix
+
+Sticky sessions make the load balancer send a client back to the same instance it used before. That helps with reconnects or in-memory session data, but here it changes nothing: Ana stays on instance 1, Ben stays on instance 2, and instance 1 still can't reach Ben. The real problem is that **instances need to talk to each other**.
+
+### Pub/sub between instances
+
+When something happens on board 412, the instance that handles it doesn't deliver the event itself. It **publishes** to a topic such as `board:412` on a broker (Redis, NATS, Kafka). The broker hands the event to **every instance subscribed** to that topic, and each instance writes it to **its own** local connections watching that board.
+
+```ts
+// On every instance, at startup
+broker.subscribe("board:*", (topic, event) => {
+  for (const socket of localSockets.watching(topic)) socket.send(event);
+});
+
+// In the handler for "move task", on whichever instance got the request
+await db.moveTask(taskId, to);
+await broker.publish(`board:${boardId}`, JSON.stringify({ seq, type: "task.moved", taskId, to }));
+```
+
+The instance that **receives** a change and the instance that **delivers** it no longer need to be the same machine.
+
+<PubSubFanout />
+
+### Delivery guarantees
+
+**Redis Pub/Sub is fire-and-forget.** If an instance isn't subscribed at the instant of publishing, the message is simply gone: no queue, no retry. During a deploy, in the seconds between an old container stopping and its replacement subscribing, every event for that instance's users disappears. They only see the change after a refresh.
+
+That's **at-most-once** delivery. If you need **at-least-once**, use something that **stores messages and tracks acknowledgements**: Redis Streams, Kafka, NATS JetStream or a queue. Choose deliberately; for typing indicators at-most-once is fine, for "your payment succeeded" it isn't.
+
+## Catching up after disconnects
+
+Disconnects are normal, not exceptional: phones switch networks, laptop lids close, load balancers drop idle connections, deploys restart instances. A production real-time system needs a **catch-up strategy**, not only a delivery strategy.
+
+The shape is the same as SSE's `Last-Event-ID`:
+
+1. Give every event a **monotonically increasing sequence number** (per board, per user or per stream).
+2. The client remembers the last sequence number it processed.
+3. On reconnect, it says "I have everything up to 2".
+4. The server sends events 3 onward (from a stream, a log table or a recent-events buffer), then continues live.
+
+```json
+{ "type": "resume", "boardId": 412, "lastSeq": 2 }
+```
+
+If the gap is too large to replay, the server tells the client to refetch the full board instead. Either way, nothing is silently lost.
+
+## Fan-out and reconnect storms
+
+### Fan-out
+
+If 30,000 people are watching one busy board or channel, a single change means **30,000 writes**. Real work is **events times subscribers**, and popular topics dominate it. Discord has written about large communities where delivering a single message to everyone online took on the order of a second or two, far too slow for a messaging product. The fix is to **spread the fan-out** across the machines that hold the recipients' connections, rather than having one process loop over everyone.
+
+### Reconnect storms
+
+An instance holding 50,000 connections crashes. All 50,000 clients reconnect **at the same moment**, and each one asks for its **initial state**: boards, tasks, who's online. That's 50,000 expensive requests in about a second, which can take down the database and cause the next instance to fall over too.
+
+Two defences work together:
+
+- **Randomized backoff on the client** (jitter), so reconnects spread over several seconds instead of one.
+- **Make connecting cheap.** Slack has described putting a cache at the network edge that holds what a client needs to start, so a reconnect storm is absorbed there and never reaches the core services.
+
+<Callout kind="remember">
+Plan for the **unhappy paths** from day one: heartbeats to detect dead connections, sequence numbers to catch up, a deliberate delivery guarantee, distributed fan-out and jittered reconnects.
+</Callout>
+
+## Beyond the basics
+
+Two big topics build on everything here and each deserves its own study:
+
+- **Presence**: reliably showing who's online, across devices, instances and flaky networks.
+- **Collaborative editing**: two people editing the same document at once, with live cursors. Someone's change has to win or merge, which leads to algorithms like operational transforms and **CRDTs**.
+
+## Cheat sheet
+
+- HTTP clients always initiate; real-time techniques work around that rule.
+- Polling's average delay is half the interval, and its cost scales with watchers, not events. Fine for small internal tools.
+- Long polling holds the request until news; the reconnect gap makes the worst case over three network trips.
+- SSE is a never-ending `text/event-stream` response with `id`, `event`, `data` and `retry`; the browser reconnects with `Last-Event-ID`. Server to client only.
+- WebSockets start with a GET plus `Upgrade: websocket`, answered by `101` and `Sec-WebSocket-Accept`, then switch to binary frames in both directions.
+- Client frames are XOR-masked with a random per-frame key to stop proxy cache poisoning; it's not encryption.
+- Ping and pong detect dead connections, because idle and dead look identical to TCP.
+- Connection limits come in order: file descriptors (1,024 by default in many runtimes), the client's ephemeral ports, then about 10 KB of memory per connection.
+- A persistent connection is state. Sticky sessions don't help; pub/sub between instances does.
+- Redis Pub/Sub is at-most-once. Use Streams, Kafka or a queue for at-least-once.
+- Sequence numbers plus "last seen" on reconnect give catch-up.
+- Fan-out cost is events times subscribers, so distribute it. Survive reconnect storms with jitter and cheap, edge-cached initial state.

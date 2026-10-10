@@ -1,0 +1,615 @@
+import { PgIndexScanLab } from "@/components/widgets/PgIndexScanLab";
+import { SqlJoinLab } from "@/components/widgets/SqlJoinLab";
+import { LostUpdateLab } from "@/components/widgets/LostUpdateLab";
+
+## Why databases exist
+
+Close a notes app, reopen it tomorrow, and your notes are still there, exactly as you left them. That property is called **persistence**: data outlives the process that created it. The server can restart, the deploy can roll out, the machine can reboot, and the data comes back in the same state, possibly read from a different machine in a different city.
+
+Almost every feature a backend ships either reads or writes persistent data, which is why working with the database is one of the most frequent things you'll do. This lesson covers the parts that matter day to day: what a database system does for you, how to model data in Postgres, how to change the schema safely, how to write the queries behind your APIs, and how to keep those queries fast.
+
+<Callout kind="tip">
+This lesson assumes you can read basic SQL: `CREATE TABLE`, `SELECT ... WHERE`, `ORDER BY`, `GROUP BY`. If not, spend an evening on any free SQL course first. Here we focus on the decisions a backend engineer makes, not on syntax.
+</Callout>
+
+## What counts as a database
+
+In the broadest sense, any structured, persistent store you can create, read, update and delete (**CRUD**) from is a database. Your phone's contact list qualifies. So does a browser's `localStorage` (open DevTools, then Application, and you'll see key–value pairs that sites have saved). Even a plain text file of notes is a crude database.
+
+In backend work, though, "the database" almost always means a **disk-based** system such as Postgres, MySQL or MongoDB.
+
+### RAM vs disk
+
+Computers have two broad kinds of storage, and they trade off against each other:
+
+| | RAM (main memory) | Disk (SSD / HDD) |
+|---|---|---|
+| Speed | Very fast (nanoseconds) | Much slower (microseconds to milliseconds) |
+| Cost per GB | High | Low |
+| Typical size | 8–128 GB on a server-class machine, sometimes more | Hundreds of GB to many TB |
+| Survives power loss | No (volatile) | Yes |
+| Typical tenant | Caches such as Redis | Databases such as Postgres |
+
+A database needs lots of space and must survive restarts, so it lives on disk and accepts some loss of speed. A cache holds a small, hot subset of data and wants speed above all, so it lives in RAM. That one sentence explains most of the architecture you'll see in the caching lesson.
+
+Real databases still use plenty of RAM: Postgres keeps recently used pages in memory (its shared buffers) so that hot data rarely needs a disk read. But the **source of truth** is on disk.
+
+## What a DBMS does
+
+Bytes on a disk are not enough. You need software that stores data in an organised way and lets many clients work with it safely. That software is a **database management system (DBMS)**. Postgres is a DBMS; so are MySQL, SQL Server and MongoDB.
+
+A DBMS has four core jobs:
+
+1. **Organisation.** Lay data out so that reads and writes stay fast as it grows to hundreds of gigabytes.
+2. **Access.** Offer a way to create, read, update and delete data, usually a query language such as SQL.
+3. **Integrity.** Keep data accurate, valid and consistent. If a shop's `orders.total` column is numeric, an insert of the string `'banana'` must be rejected.
+4. **Security.** Control who can read or change what, through users, roles and permissions.
+
+### Why not text files
+
+Before DBMSs were common, people did keep data in flat files. It works until it doesn't, and it fails in three predictable ways.
+
+| Problem | What goes wrong |
+|---|---|
+| **Parsing** | To find one customer you write code that reads the whole file, splits lines and compares fields. That is slow, and a bug in your parser can return wrong data or corrupt the file. |
+| **No structure** | A file can't enforce "this field is always a number" or "every order belongs to a real customer". Nothing stops bad data getting in. |
+| **Concurrency** | Two processes editing the same value at once can silently overwrite each other. The result depends on timing. |
+
+The concurrency problem deserves a closer look, because it doesn't go away just because you use a database. You have to use the database correctly.
+
+### Concurrency and transactions
+
+Say a product's stock is 40. A restock request adds 20 while a sale request removes 20 at the same moment. If each request **reads** the value, **computes** the new number in application code and **writes** it back, one of the writes can be lost: both read 40, one writes 60, the other writes 20, and the final value is 20 instead of 40. This is the **lost update** problem.
+
+A DBMS gives you tools to prevent it:
+
+- **Atomic statements.** `UPDATE products SET stock = stock + 20 WHERE id = 7` reads and writes in one step. Postgres locks the row while it updates it, so a second concurrent update waits and then applies its change to the new value.
+- **Explicit row locks.** When you must read, run logic in code, then write, use `SELECT ... FOR UPDATE` inside a transaction. Other transactions that want the same row wait until you commit.
+- **Transactions.** `BEGIN ... COMMIT` groups several statements so they succeed or fail together.
+
+<LostUpdateLab />
+
+Transactions are what the acronym **ACID** describes:
+
+| Property | Meaning | Example |
+|---|---|---|
+| **Atomicity** | All statements in a transaction apply, or none do | Charge the card and create the order, or neither |
+| **Consistency** | A transaction moves the database from one valid state to another; constraints always hold | A foreign key can never point at a missing row |
+| **Isolation** | Concurrent transactions don't see each other's half-finished work | Another request never sees an order with no line items |
+| **Durability** | Once committed, data survives a crash | The commit is written to the write-ahead log before you get "OK" |
+
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+UPDATE accounts SET balance = balance + 50 WHERE id = 2;
+COMMIT;  -- both happen, or (on error / ROLLBACK) neither does
+```
+
+**Isolation** comes in levels, trading safety for concurrency. Postgres defaults to **Read Committed**: each statement sees data committed before it started. **Repeatable Read** gives the whole transaction one consistent snapshot. **Serializable** makes concurrent transactions behave as if they ran one after another, and aborts one of them with a serialization error when that isn't possible, so your code must be ready to retry.
+
+<Callout kind="remember">
+The default level does **not** protect a read-then-write done in application code. Either push the arithmetic into a single `UPDATE`, lock the row with `SELECT ... FOR UPDATE`, or use a stricter isolation level and retry on conflict.
+</Callout>
+
+## Relational vs non-relational
+
+Databases split into two big families.
+
+**Relational** databases (Postgres, MySQL, SQL Server, SQLite) store data in **tables** of **rows** and **columns**. The schema is declared up front: every column has a name and a type, and relationships between tables are declared with **foreign keys**. You query them with **SQL**. The payoff is **integrity**: you can always rely on the shape of your data.
+
+**Non-relational** or **NoSQL** databases come in several shapes (document, key–value, wide-column, graph). The one you'll meet most is the **document** store, such as MongoDB:
+
+| Relational | Document store (MongoDB) |
+|---|---|
+| Table | Collection |
+| Row | Document (JSON-like) |
+| Every row has the same columns | Each document can have a different shape |
+| Schema enforced by the database | Schema optional; usually enforced in application code |
+
+A flexible schema is great for prototyping and for genuinely unstructured data. The cost is that the database stops protecting you: nothing prevents a typo'd field name, a missing required field or a reference to a deleted record. All of that integrity work moves into application code, which changes often and is where bugs live.
+
+Two examples make the choice concrete:
+
+- A **CRM** tracks customers, contacts, deals and who owns what. The data is highly relational and correctness matters, so a relational database is the obvious fit.
+- A **CMS** stores articles whose bodies mix paragraphs, images, code blocks and embeds, in a structure you can't predict. A document model fits that content well.
+
+## Why Postgres
+
+Postgres, MySQL and SQL Server all handle the needs of most products, and all of them scale further than most products ever will. Postgres is a strong default for several reasons:
+
+1. **Open source and free**, with no licence fees, and you can self-host it or use any cloud's managed version.
+2. **Close to the SQL standard**, so knowledge and most queries carry over to other databases.
+3. **Extensible**, with a huge feature set, thorough documentation and an extension ecosystem (PostGIS for maps, pgvector for embeddings, and many more).
+4. **Reliable** and battle-tested at scale.
+5. **Excellent JSON support.** The `JSONB` type stores JSON in a binary format you can query and index. That means the CMS example above doesn't force you onto a document database: keep your structured data relational and put the unpredictable part in a `JSONB` column.
+
+You'll find benchmarks claiming another database is faster at something. Unless you're serving huge traffic and have measured a specific bottleneck, that difference won't matter. Pick Postgres and move on.
+
+<Callout kind="tip">
+SQL is the language; Postgres is the system that runs it. A GUI client (TablePlus, DBeaver, pgAdmin, or your editor's database panel) makes exploring tables and testing queries much faster than the terminal.
+</Callout>
+
+## Data types
+
+Choosing column types is your first line of defence for integrity, and it affects storage and speed.
+
+### Integers and serial
+
+| Type | Range (roughly) | Use |
+|---|---|---|
+| `SMALLINT` | ±32 thousand | Small bounded numbers |
+| `INTEGER` | ±2.1 billion | Most counts and quantities |
+| `BIGINT` | ±9.2 quintillion | Large counters, IDs |
+
+`SERIAL` and `BIGSERIAL` are integer columns that **auto-increment**: omit them on insert and Postgres fills in 1, 2, 3 and so on. Modern Postgres prefers the standard form, `id BIGINT GENERATED ALWAYS AS IDENTITY`, which does the same job. If you use numeric IDs, use the 64-bit version; running out of a 32-bit ID space on a busy table is a painful migration.
+
+### Exact vs floating-point numbers
+
+`DECIMAL` and `NUMERIC` are the same type: **exact** decimal numbers. `NUMERIC(10, 2)` means up to 10 digits in total (the **precision**), 2 of them after the decimal point (the **scale**), so `12345678.90` fits and `123456789.00` doesn't.
+
+`REAL` and `DOUBLE PRECISION` are **floating-point** numbers. They're stored in binary, and many decimal fractions (such as 0.1) have no exact binary form, so values are stored as the nearest approximation and small rounding errors accumulate in arithmetic.
+
+```sql
+SELECT 0.1::float8 + 0.2::float8;   -- 0.30000000000000004
+SELECT 0.1::numeric + 0.2::numeric; -- 0.3
+```
+
+| Data | Type | Why |
+|---|---|---|
+| Prices, balances, tax, anything money | `NUMERIC` | Exact. A rounding error on money is a bug. |
+| Sensor readings, coordinates, scores, ML features | `DOUBLE PRECISION` / `REAL` | Faster and smaller; tiny errors don't matter |
+
+### Text types
+
+| Type | Behaviour |
+|---|---|
+| `CHAR(n)` | Fixed length. Shorter values are padded with spaces. |
+| `VARCHAR(n)` | Variable length, error if longer than `n` |
+| `TEXT` | Variable length, no declared limit |
+
+In Postgres, **prefer `TEXT`**:
+
+- `TEXT` and `VARCHAR` are stored the same way and perform the same. The Postgres documentation itself recommends `TEXT` or unlimited `VARCHAR`.
+- "VARCHAR is faster" and "you can't index TEXT" are habits carried over from other databases. In Postgres neither is true.
+- `VARCHAR(255)` is a MySQL-era convention with no special meaning in Postgres. Magic numbers make readers wonder what they mean.
+- Raising a length limit later needs a migration.
+- Your API validates input anyway, so enforce length rules there, where the error message can be friendly. (If you truly need a database-level limit, a `CHECK (char_length(name) <= 100)` is easier to change than a column type.)
+
+Use `CHAR(n)` only when every value has exactly the same length, such as two-letter country codes, and even then `TEXT` with a check works fine.
+
+### Dates, times and everything else
+
+| Type | Stores |
+|---|---|
+| `BOOLEAN` | true / false |
+| `DATE` | A calendar date |
+| `TIME` | A time of day |
+| `TIMESTAMP` | Date and time, with no time zone |
+| `TIMESTAMPTZ` | An absolute moment in time; converted to UTC on write and to the session's zone on read |
+| `INTERVAL` | A duration, such as `'7 days'` |
+| `UUID` | A 128-bit unique identifier |
+| `JSON` | JSON stored as text, exactly as sent |
+| `JSONB` | JSON parsed into a binary format: faster to query, indexable |
+| `TEXT[]`, `INT[]`, ... | Arrays of any type |
+| `INET`, `CIDR`, `MACADDR`, `POINT`, `XML` | Network addresses, geometry and more specialised data |
+
+Two defaults worth adopting: use **`TIMESTAMPTZ`** for every "when did this happen" column (plain `TIMESTAMP` invites time-zone bugs), and use **`JSONB`** rather than `JSON` unless you need to keep the exact original text and key order.
+
+## Migrations
+
+You could create tables by typing SQL into a GUI connected to production. Then six months later nobody knows when a column was added, who added it, or how to build an identical database for a new developer. **Migrations** fix that.
+
+A migration is a SQL file that changes the schema. Migrations live in a folder in your repository, named so they sort in order (usually a timestamp prefix):
+
+```
+db/
+└── migrations/
+    ├── 20250101120000_create_core_tables.sql
+    ├── 20250101130000_seed_dev_data.sql
+    └── 20250102090000_add_indexes_and_triggers.sql
+```
+
+A **migration tool** (dbmate, golang-migrate, Flyway, or the one built into your ORM such as Prisma or Django) applies pending files in order to the database in your environment's `DATABASE_URL`.
+
+```bash
+dbmate new add_due_date_to_tasks   # creates a new timestamped file
+dbmate up                          # applies everything not yet applied
+dbmate rollback                    # runs the latest file's down section
+```
+
+The tool records what it has applied in a tracking table (dbmate calls it `schema_migrations`). Next time it runs, it applies only files newer than that record.
+
+### Up and down
+
+Each migration has an **up** part that makes the change and, usually, a **down** part that reverses it exactly:
+
+```sql
+-- migrate:up
+ALTER TABLE tasks ADD COLUMN due_date DATE;
+
+-- migrate:down
+ALTER TABLE tasks DROP COLUMN due_date;
+```
+
+Down migrations let you roll back a bad deploy. Some teams skip them and only ever roll forward with a new fixing migration; either way, the rule is the same: **every schema change is a new migration file**, committed with the code that needs it. Never edit a migration that has already run somewhere else; write a new one.
+
+<Callout kind="warn">
+A down migration that drops a table or column also drops its data. Rolling back is safe for structure, not for the rows written since. Treat destructive migrations with care in production.
+</Callout>
+
+## Designing the schema
+
+We'll model a small project-management product: users, their profiles, projects, tasks and project membership.
+
+### Enums
+
+Some columns can only hold a known set of values. An **enum type** declares that set:
+
+```sql
+CREATE TYPE project_status AS ENUM ('active', 'completed', 'archived');
+CREATE TYPE task_status    AS ENUM ('pending', 'in_progress', 'completed', 'cancelled');
+CREATE TYPE member_role    AS ENUM ('owner', 'admin', 'member');
+```
+
+Enums give you two things:
+
+1. **Integrity.** Inserting `'done'` into a `task_status` column fails at the database, even if application validation has a bug.
+2. **Documentation.** Anyone reading the schema sees the allowed values instantly, without hunting through application code. For a new team member this is often the bigger win.
+
+Adding a value later is easy (`ALTER TYPE task_status ADD VALUE 'blocked'`); removing or renaming one is harder. If the set changes very often, a lookup table or a `TEXT` column with a `CHECK` constraint may suit better.
+
+### The users table
+
+```sql
+CREATE TABLE users (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email         TEXT NOT NULL UNIQUE,
+  full_name     TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Line by line:
+
+- **`PRIMARY KEY`** identifies a row uniquely. It implies `NOT NULL` and `UNIQUE`, and Postgres automatically builds an index for it.
+- **`DEFAULT gen_random_uuid()`** lets Postgres generate the ID, so inserts can leave it out. UUIDs are popular as public IDs because they don't reveal how many users you have and can be generated anywhere. Sequential integers are smaller and slightly faster; both are fine.
+- **`NOT NULL`**: columns in Postgres are nullable by default. Most columns in a well-designed schema should be `NOT NULL`; make a column nullable only when "no value" is a real, meaningful state. Otherwise a bug or a script will quietly fill your tables with NULLs.
+- **`UNIQUE`** on `email` makes a duplicate sign-up fail with a unique-violation error that your API can turn into a `409 Conflict`.
+- **`password_hash`**: never store plain passwords. Hash them in application code with a slow password hashing algorithm.
+- **`created_at` and `updated_at`** belong on nearly every table. They answer "when did this happen?" during debugging and power "recently updated" sorting in the UI.
+
+### Naming conventions
+
+- **Plural table names** (`users`, `projects`, `project_members`) are the most common convention. Singular is fine too; just be consistent.
+- **lowercase snake_case** for tables and columns. Postgres folds unquoted identifiers to lowercase, so `fullName` silently becomes `fullname`. Keeping camelCase means quoting `"fullName"` in every query, forever. Map to camelCase in your application layer instead.
+
+## Relationships
+
+### One-to-one
+
+Profile data (avatar, bio, phone, later social links and preferences) grows and changes more often than core account data. Putting it in its own table keeps the `users` table small and stable:
+
+```sql
+CREATE TABLE user_profiles (
+  user_id    UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  avatar_url TEXT,
+  bio        TEXT,
+  phone      TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+The trick for **one-to-one** is that the foreign key **is** the primary key. Because a primary key is unique, each user can have at most one profile, and no separate `id` column is needed. The profile fields are nullable because they're optional.
+
+### One-to-many
+
+A project has many tasks; a task belongs to exactly one project. Put the parent's key in the child as an ordinary foreign key column:
+
+```sql
+CREATE TABLE projects (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name        TEXT NOT NULL,
+  description TEXT,
+  status      project_status NOT NULL DEFAULT 'active',
+  owner_id    UUID NOT NULL REFERENCES users ON DELETE RESTRICT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE tasks (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  project_id  UUID NOT NULL REFERENCES projects ON DELETE CASCADE,
+  title       TEXT NOT NULL,
+  description TEXT,
+  priority    INTEGER NOT NULL DEFAULT 1 CHECK (priority BETWEEN 1 AND 5),
+  status      task_status NOT NULL DEFAULT 'pending',
+  due_date    DATE,
+  assigned_to UUID REFERENCES users ON DELETE SET NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Things to notice:
+
+- `REFERENCES users` with no column defaults to the referenced table's primary key.
+- `project_id` is `NOT NULL`, so a task can never exist without a project (no orphans).
+- A **foreign key** means the value must exist in the parent table. A perfectly formatted UUID that matches no project is rejected.
+- Enum columns get a sensible `DEFAULT`, so the API doesn't have to send them.
+- **`CHECK`** enforces a custom rule: priority must be between 1 and 5.
+
+### Many-to-many
+
+Check the relationship from both sides. A user can belong to many projects, **and** a project has many users. Neither table can hold a single foreign key for that, so you add a **junction table** (also called a linking or join table):
+
+```sql
+CREATE TABLE project_members (
+  project_id UUID NOT NULL REFERENCES projects ON DELETE CASCADE,
+  user_id    UUID NOT NULL REFERENCES users    ON DELETE CASCADE,
+  role       member_role NOT NULL DEFAULT 'member',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id, user_id)
+);
+```
+
+The **composite primary key** `(project_id, user_id)` says "this user is in this project" is a single fact that can't be recorded twice. Data that describes the relationship itself, like the member's `role`, lives on the junction table, because it belongs to a user *within* a project, not to the user or the project alone.
+
+| Relationship | How to model it | Example |
+|---|---|---|
+| One-to-one | Child's primary key is also a foreign key to the parent | `user_profiles.user_id` |
+| One-to-many | Child has a foreign key column to the parent | `tasks.project_id` |
+| Many-to-many | Junction table with two foreign keys and a composite primary key | `project_members` |
+
+## Referential actions
+
+A foreign key also decides what happens when the parent row is deleted. Suppose someone deletes a user who owns projects:
+
+| Action | Effect |
+|---|---|
+| `ON DELETE RESTRICT` (or the default `NO ACTION`) | The delete fails. You must deal with the children first. |
+| `ON DELETE CASCADE` | The children are deleted too. |
+| `ON DELETE SET NULL` | The children's foreign key becomes NULL (fails if the column is `NOT NULL`). |
+| `ON DELETE SET DEFAULT` | The children's foreign key is set to the column's default. |
+
+Choose per relationship, by asking what the business wants:
+
+- A **profile** means nothing without its user: `CASCADE`.
+- **Tasks** belong to their project: `CASCADE`.
+- A **project owner** shouldn't vanish by accident and take every project with them: `RESTRICT`, so ownership has to be transferred first.
+- A task's **assignee** leaving shouldn't delete the task: `SET NULL`, so the task becomes unassigned.
+
+<Callout kind="warn">
+`CASCADE` is convenient and dangerous. One `DELETE FROM users WHERE id = ...` can remove thousands of rows across several tables. Use it where the children truly can't outlive the parent.
+</Callout>
+
+## Constraints
+
+Constraints are rules the database enforces on every write, no matter which service, script or person is writing:
+
+| Constraint | Guarantees | Example |
+|---|---|---|
+| `PRIMARY KEY` | Unique, not null, identifies the row | `id`, or `(project_id, user_id)` |
+| `FOREIGN KEY` | The referenced row exists | `tasks.project_id` |
+| `UNIQUE` | No duplicates | `users.email` |
+| `NOT NULL` | A value is always present | `tasks.title` |
+| `CHECK` | A custom condition holds | `priority BETWEEN 1 AND 5` |
+
+Application validation gives users friendly error messages. Database constraints are the safety net that still holds when someone runs a script, a background job has a bug, or two requests race each other.
+
+## Seeding
+
+In production, data arrives through real user flows. In development you need realistic data to click around and test queries. **Seeding** means inserting that test data, commonly from a separate migration or a dedicated seed script that only runs in development.
+
+Plain SQL can do this neatly with **CTEs** (common table expressions, the `WITH` clause) and `RETURNING`, which hands back the generated IDs so later inserts can use them:
+
+```sql
+WITH new_users AS (
+  INSERT INTO users (email, full_name, password_hash)
+  VALUES ('jane@example.com', 'Jane Smith', 'x'),
+         ('john@example.com', 'John Doe',   'x'),
+         ('alice@example.com','Alice Brown','x')
+  RETURNING id, email
+)
+INSERT INTO user_profiles (user_id, bio)
+SELECT id, 'Bio for ' || email
+FROM new_users
+WHERE email <> 'john@example.com';   -- leave John without a profile on purpose
+```
+
+<Callout kind="warn">
+Keep seed data out of production. If your tool runs every migration in every environment, put seeds in a separate script rather than a migration.
+</Callout>
+
+## Writing queries for APIs
+
+Most of your database work as a backend engineer follows one loop: read the request's params and body, build a query from them, pass user values safely, run it and shape the result into the response.
+
+### Joins
+
+`GET /v1/users` should return each user with their profile embedded, so the frontend doesn't need a second request. A tip for writing the query: start from the `FROM` clause, so you know where the data comes from, then fill in the `SELECT`.
+
+```sql
+SELECT u.*, to_jsonb(up.*) AS profile
+FROM users u
+LEFT JOIN user_profiles up ON u.id = up.user_id
+ORDER BY u.created_at DESC;
+```
+
+- `u` and `up` are **aliases**, short names for the tables.
+- `to_jsonb(up.*)` turns the profile row into a JSON object, so each result row has a nested `profile` field.
+- **LEFT JOIN, not INNER JOIN.** An `INNER JOIN` keeps only rows that match on both sides, so any user who has never filled in a profile disappears from the list. A `LEFT JOIN` keeps every user and fills the profile columns with NULL where there's no match.
+- **Always `ORDER BY` in list queries.** SQL makes no promise about row order without one. The order you see today can change after an update, a vacuum or a new index. Default to newest first.
+
+<SqlJoinLab />
+
+### Parameterized queries
+
+`GET /v1/users/:userId` needs the ID from the URL inside the query. Never build that with string concatenation:
+
+```ts
+// Vulnerable: the input becomes part of the SQL text
+db.query(`SELECT * FROM users WHERE email = '${email}'`);
+// email = "x' OR '1'='1"  → returns every user
+
+// Safe: the input is sent separately, as a value
+db.query("SELECT * FROM users WHERE email = $1", [email]);
+```
+
+With a **parameterized query**, the SQL text has placeholders (`$1`, `$2` in Postgres) and the values travel separately. The database parses the SQL first and only then plugs in the values, so a value can never change the structure of the query. Text like `'; DROP TABLE users; --` is just an odd email address. Every driver and ORM supports this; use it for every value that comes from outside.
+
+The request passes through the usual layers: the route calls a handler, the handler calls a service, the service calls a repository, and the repository runs the parameterized query and returns rows to be serialized as JSON.
+
+### Filtering sorting and pagination
+
+List endpoints take optional query parameters. Decide a default for each:
+
+| Param | Default | Rule |
+|---|---|---|
+| `page` | 1 | 1-based for API users |
+| `limit` | 10 or 20 | Cap it (say, 100) so nobody requests a million rows |
+| `search` / `letter` | none | If absent, leave the `WHERE` condition out entirely |
+| `sortBy` | `created_at` | Only allow values from a **whitelist** |
+| `sortOrder` | `desc` | Only `asc` or `desc` |
+
+Given `?letter=j&sortBy=email&sortOrder=asc&page=2&limit=10`, the repository builds:
+
+```sql
+SELECT u.*, to_jsonb(up.*) AS profile
+FROM users u
+LEFT JOIN user_profiles up ON u.id = up.user_id
+WHERE u.full_name ILIKE $1 || '%'   -- $1 = 'j'
+ORDER BY u.email ASC                -- from the whitelist, not a parameter
+LIMIT $2 OFFSET $3;                 -- $2 = 10, $3 = (2 - 1) * 10 = 10
+```
+
+- **`ILIKE`** is a case-insensitive `LIKE`; `'j' || '%'` means "starts with j".
+- **Column names and `ASC`/`DESC` can't be bound as parameters.** Parameters only carry values. Map the user's `sortBy` to a known column name in code (`{ email: "u.email", name: "u.full_name" }`) and reject anything else. Pasting it in directly would reopen SQL injection.
+- **`OFFSET` is zero-based** while pages are one-based, so `offset = (page - 1) * limit`.
+- **Paginate every list endpoint** unless a specific screen truly needs everything.
+
+<Callout kind="tip">
+`OFFSET` gets slower on deep pages, because the database still walks past every skipped row. For infinite scroll over large tables, **keyset pagination** (`WHERE created_at < $last_seen ORDER BY created_at DESC LIMIT 20`) stays fast at any depth.
+</Callout>
+
+### Inserts and partial updates
+
+Creating a user returns the new row in one round trip with `RETURNING`:
+
+```sql
+INSERT INTO users (email, full_name, password_hash)
+VALUES ($1, $2, $3)   -- the hash is computed in application code
+RETURNING *;
+```
+
+For `PATCH /v1/users/:userId/profile`, the body is partial. The user might send only `bio` and `phone`. The service checks which **allowed** fields are present and builds the `SET` clause from just those, so untouched fields keep their values:
+
+```sql
+UPDATE user_profiles
+SET bio = $1, phone = $2
+WHERE user_id = $3
+RETURNING *;
+```
+
+Run that and look at `updated_at`: it hasn't changed. Nothing told the database to update it. That's the next section.
+
+## Triggers
+
+You could add `updated_at = now()` to every `UPDATE` in application code, but someone will forget. A **trigger** is a rule inside the database: when an event happens on a table, run a function. Here, before any row is updated, set its `updated_at`:
+
+```sql
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER users_set_updated_at
+  BEFORE UPDATE ON users
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+-- repeat for user_profiles, projects, tasks, project_members
+```
+
+`NEW` is the row as it's about to be written; the function changes it and returns it. Triggers are named, so a down migration can `DROP TRIGGER users_set_updated_at ON users` cleanly. Now every update, from any code path, keeps `updated_at` honest.
+
+<Callout kind="tip">
+Triggers are perfect for small, mechanical rules like timestamps and audit columns. Keep business logic out of them: logic hidden in the database is hard to find, test and debug.
+</Callout>
+
+## Indexes
+
+A book's index tells you chapter 4 starts on page 54, so you jump there instead of flipping through every page. A database index does the same.
+
+Rows are stored on disk in no useful order. Without an index, `SELECT * FROM tasks WHERE project_id = $1` has to do a **sequential scan**: read every row and check it. That's fine for ten rows and painful for ten million.
+
+An **index** is a separate, sorted structure mapping a column's values to the locations of the matching rows. Postgres's default index type is a **B-tree**, which keeps keys sorted in a shallow tree, so finding a value takes a handful of page reads even for very large tables.
+
+Two properties make indexes useful:
+
+1. **Fast lookup.** Find the value in the sorted index, then jump straight to the row.
+2. **Order.** Because an index is sorted, a query that sorts by the indexed column (`ORDER BY created_at DESC LIMIT 20`) can read rows in index order and stop after 20, instead of sorting the whole table.
+
+<PgIndexScanLab />
+
+### When to add an index
+
+A column is a good candidate when it appears in a **frequently run** query as:
+
+1. a **`JOIN` condition**,
+2. a **`WHERE` filter**, or
+3. an **`ORDER BY`** sort.
+
+**Primary keys** (and `UNIQUE` columns) get an index automatically. **Foreign keys do not.** In `projects JOIN tasks ON projects.id = tasks.project_id`, `projects.id` is already indexed, but `tasks.project_id` isn't, and "list the tasks of this project" is probably one of your hottest queries.
+
+```sql
+-- migrate:up
+CREATE INDEX idx_users_created_at      ON users (created_at DESC);
+CREATE INDEX idx_tasks_project_id      ON tasks (project_id);
+CREATE INDEX idx_tasks_assigned_to     ON tasks (assigned_to);
+CREATE INDEX idx_tasks_status          ON tasks (status);
+CREATE INDEX idx_project_members_user  ON project_members (user_id);
+
+-- migrate:down
+DROP INDEX idx_project_members_user;
+DROP INDEX idx_tasks_status;
+DROP INDEX idx_tasks_assigned_to;
+DROP INDEX idx_tasks_project_id;
+DROP INDEX idx_users_created_at;
+```
+
+Note what's **not** there: no index on `users.email` (the `UNIQUE` constraint already created one) and none on `project_members.project_id` alone (it's the first column of the composite primary key, whose index already serves lookups by `project_id`).
+
+To check whether a query actually uses an index, prefix it with `EXPLAIN ANALYZE`. A `Seq Scan` on a large table in a hot path is a red flag; an `Index Scan` is what you want. On a tiny table the planner may rightly choose a sequential scan anyway, because reading a few pages directly is cheaper than going through an index.
+
+### The cost of indexes
+
+Indexes aren't free:
+
+- Every `INSERT`, `UPDATE` or `DELETE` must also update **every** index on the table, so writes get slower with each index you add.
+- Indexes take disk space and memory.
+
+So don't index every column that ever appears in a `WHERE`. Index what your frequent queries need, measure with `EXPLAIN ANALYZE` and your monitoring, and **drop indexes that aren't used** (Postgres tracks index usage in `pg_stat_user_indexes`).
+
+<Callout kind="warn">
+On a busy production table, plain `CREATE INDEX` blocks writes until it finishes. Use `CREATE INDEX CONCURRENTLY` there; it takes longer but lets traffic continue. Note that it can't run inside a transaction, so check how your migration tool handles that.
+</Callout>
+
+## Cheat sheet
+
+- **Persistence**: data outlives the process. Databases live on disk; caches live in RAM.
+- A **DBMS** organises data and provides access, integrity and security.
+- Avoid **lost updates**: atomic `UPDATE ... SET x = x + 1`, `SELECT ... FOR UPDATE`, or stricter isolation with retries.
+- **Transactions** are ACID; Postgres defaults to **Read Committed**.
+- Relational means strict schema and integrity; document stores are flexible but push integrity into your code. Postgres **JSONB** covers most "we need flexible data" cases.
+- Money is **`NUMERIC`**, timestamps are **`TIMESTAMPTZ`**, text is **`TEXT`**, JSON is **`JSONB`**.
+- Every schema change is a new **migration** in version control, with up and (usually) down.
+- Most columns should be **`NOT NULL`**; use **`UNIQUE`**, **`CHECK`**, **enums** and **foreign keys** so bad data can't get in.
+- 1:1 means FK as PK; 1:N means FK column on the child; M:N means junction table with a composite PK.
+- Choose `ON DELETE` per relationship: **CASCADE**, **RESTRICT** or **SET NULL**.
+- **LEFT JOIN** for optional related rows; always **ORDER BY** and **paginate** lists; **parameterize** every value and **whitelist** sort columns.
+- Index frequent **JOIN / WHERE / ORDER BY** columns; foreign keys aren't indexed automatically; every index slows writes.

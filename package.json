@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test": "vitest run"
+    "test": "vitest run",
+    "content:registry": "node scripts/gen-registry.mjs"
   },
   "dependencies": {
     "@mdx-js/loader": "^3.1.1",

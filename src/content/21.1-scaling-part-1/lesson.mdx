@@ -1,0 +1,488 @@
+import { LatencyPercentiles } from "@/components/widgets/LatencyPercentiles";
+import { UtilizationCurve } from "@/components/widgets/UtilizationCurve";
+import { NPlusOneCounter } from "@/components/widgets/NPlusOneCounter";
+
+## What performance means
+
+"Make it faster" and "make it scale" are some of the most common requests a backend engineer gets, and some of the vaguest. This lesson turns them into things you can measure and reason about. It builds up in layers:
+
+1. **What to measure**: latency, percentiles, throughput and utilization.
+2. **How to find the slow part**: measuring, profiling and tracing.
+3. **The usual fixes, in order**: database work (N+1 queries, indexes, connection pools), then caching.
+4. **Adding capacity**: making one machine bigger, or adding more machines.
+
+The goal isn't a list of tricks. It's a way of thinking that works on any system: when something is slow, you'll know which questions to ask and in what order.
+
+## Latency
+
+Follow one click in a shop app. The user taps "View product":
+
+1. The browser sends a request across the internet to your server.
+2. Your server runs its code: it queries the database, maybe calls an external API (a pricing service, an email provider).
+3. It sends back JSON.
+4. The browser parses it and renders the product card.
+
+**Latency** is the time this takes. For the user it's the time from the click until the result appears. On the backend we usually measure the slice we control: from the request arriving to the response leaving. When a user says "the app is slow", they're describing latency, whether or not they use the word.
+
+Latency isn't one number. Two identical requests can take 40 ms and 400 ms:
+
+- The fast one was answered from a cache close to the user. The slow one went all the way to the database.
+- The fast one arrived when the server was idle. The slow one arrived while the server was busy with 50 other requests, and waited its turn.
+
+So the real question is never "what is our latency?" but "what does our latency **distribution** look like?"
+
+## Why averages lie
+
+Suppose you serve 1,000 requests and the average is 100 ms. Sounds fine. Now look closer: 990 of them finished in about 50 ms, and 10 took about 5 seconds each. The average blends those into a number that describes **no actual request**.
+
+Scale it up. At a million requests a day, a 1% slow tail is **10,000 people a day** staring at a spinner for 5 seconds. The average says you're doing great; the users say otherwise.
+
+Averages are fine for many things (cost per month, average order value). For latency they hide exactly the part you care about: the variation, and especially the slow end.
+
+## Percentiles
+
+A **percentile** answers: "what latency do X% of requests beat?" Sort every request by duration and read off the value at that position.
+
+| Metric | Meaning | What it tells you |
+|---|---|---|
+| **p50** (median) | 50% of requests finish at or under this | The typical experience |
+| **p90** | 90% finish at or under this; the slowest 10% take longer | The start of the slow end |
+| **p95** | 95% at or under; the slowest 5% take longer | A common SLO target |
+| **p99** | 99% at or under; the slowest 1% take longer | The tail: where pain hides |
+
+A quick trick: **100 minus the percentile** is the share of requests that are **slower** than it. "p99 is 2 s" means 1% of requests take longer than 2 s. It does **not** mean "1% of users see exactly 2 s".
+
+<LatencyPercentiles />
+
+Notice in the widget that a small slow tail barely moves p50 and can even hide just past p99. That's why teams track several percentiles and alert on the high ones.
+
+### Why the tail matters most
+
+It's tempting to ignore the slowest 1% as "outliers". Don't, for two reasons:
+
+- **The tail is where the hard work lives.** Requests that hit the most complex business logic, the heaviest queries, several services and external APIs are the ones that end up slow. In a shop, that's checkout and payment, not browsing.
+- **Those users are often your most valuable.** The person placing a big order or upgrading a plan triggers far more work than someone scrolling. Slow tails hit exactly the requests that earn money.
+
+<Callout kind="remember">
+Report latency as percentiles (p50, p95, p99), never just an average. Backend teams usually set targets and alerts on p95 or p99.
+</Callout>
+
+## Throughput
+
+**Latency** is how long one request takes. **Throughput** is how many requests the system handles per unit of time, usually **requests per second (RPS)**.
+
+They're connected. An API might answer in 150 ms at 10 RPS and in 2 s at 1,000 RPS. The code didn't get slower; the machine got busier. Throughput questions are the ones the business actually asks:
+
+- Will we survive a sale day, or a launch email to 200,000 people?
+- What happens if a popular newsletter links to us?
+- How many concurrent users can we take before we need more hardware?
+
+As throughput rises, latency rises too: slowly at first, then very sharply past a certain point. The next section explains why.
+
+## Utilization and queueing
+
+Picture an ice-cream shop with one person serving. Each cone takes 2 minutes to make.
+
+- **Quiet evening:** you walk in, order, and get your cone in 2 minutes.
+- **Busy lunchtime:** there are eight people ahead of you. The server is exactly as fast as before (2 minutes a cone), but you wait 18 minutes.
+
+The **work time didn't change. The waiting time did.** Servers behave the same way. When a request arrives at an idle CPU, it's handled immediately. When the CPU, the database or a connection pool is busy, requests **queue** and wait for the ones ahead of them.
+
+**Utilization** is the share of a resource's capacity that's in use: 0% is idle, 100% is completely saturated.
+
+### The curve is not a straight line
+
+Intuition says latency grows in proportion to utilization. It doesn't. It stays almost flat for a long time and then shoots up as you approach 100%. In the simplest queueing model, average response time is roughly `service time / (1 - utilization)`:
+
+| Utilization | Response time (50 ms of work) |
+|---|---|
+| 50% | 100 ms |
+| 80% | 250 ms |
+| 90% | 500 ms |
+| 95% | 1,000 ms |
+| 99% | 5,000 ms |
+
+People often call this growth "exponential". Strictly it's hyperbolic (it heads to infinity as utilization approaches 100%), but the lesson is the same: the last 20% of capacity costs far more latency than the first 80%.
+
+A highway behaves the same way. At 50% capacity traffic flows and arrival times are predictable. At 80% you slow down and plan lane changes. At 90% it becomes **unpredictable**: one driver braking sends a ripple back for kilometres. At 100% nobody moves.
+
+<UtilizationCurve />
+
+### Keep headroom
+
+Two consequences follow:
+
+- **You can't run at 100% and expect to perform.** Production systems typically target **60–80%** utilization and keep the rest as a buffer.
+- **Traffic is bursty.** It doesn't arrive at a steady rate. A quiet minute is followed by a spike when a push notification goes out. An average of 50% can still mean moments over 100%, and without headroom those moments become timeouts and crashes.
+
+<Callout kind="tip">
+When someone says "CPU is only at 70%, we're fine", ask about the peaks and the p99 latency, not the average utilization.
+</Callout>
+
+## Find the bottleneck first
+
+"The system is slow" always means **some specific part** is slow. That part is the **bottleneck**, and finding it is the first job. It sounds obvious, yet the most common mistake in performance work is to skip it and reach for a familiar fix:
+
+- "Add a cache."
+- "Upgrade the database version."
+- "Add more servers."
+
+Sometimes that works by luck. Often you spend a week solving a problem you don't have, while the real one stays.
+
+### A worked example
+
+`GET /products/:id` in the shop takes about 550 ms. The team assumes "it's always the database" and spends a week putting Redis in front of the product query. They deploy. It still takes about 540 ms.
+
+Then someone adds **timing logs** around each step:
+
+| Step | Time |
+|---|---|
+| Database query | 10 ms |
+| Redis lookup (the new cache) | 1 ms |
+| Sending a log event to a remote logging service, **synchronously** | 500 ms |
+| Serializing the response | 5 ms |
+
+The database was never the problem. A logging call was **blocking** the request: the handler waited for the log service to acknowledge before responding. The fix is to send logs in the background (buffered, or through an agent) so the request never waits on them. Concurrency is covered properly in the next lecture.
+
+Other non-obvious culprits turn up all the time:
+
+- **Serialization**: turning big objects into JSON or XML is real CPU work.
+- **Huge payloads**: the code is fast, but sending 4 MB over a mobile network isn't.
+- **An external API called inside a loop.**
+
+<Callout kind="remember">
+Never guess, always measure. Find the slowest step with numbers before you change anything.
+</Callout>
+
+## Profiling and flame graphs
+
+Timing logs work when you suspect a few steps. When you don't know where time goes inside your code, use a **profiler**. A profiler attaches to the running program and samples it many times a second, recording which function is executing. Over thousands of samples it builds a picture of where CPU time is spent.
+
+The raw output (thousands of functions, each with tiny numbers) is hard to read, so profilers draw a **flame graph**:
+
+- Each bar is a function. Bars **stacked on top** are functions it called.
+- The **width** of a bar is the share of time spent in it (including its children). **Wide bars are where to look.**
+- The x-axis is not time order; it's sorted so identical call paths merge.
+
+```text
+[ handleRequest ...................................................... ]
+[ loadProduct ..... ][ renderJson ...................................... ]
+[ db.query ]          [ JSON.stringify ......................... ][ gzip ]
+```
+
+Here the surprise is that serializing the response is wider than the database call. The first profile of a real system almost always surprises you like this.
+
+## CPU-bound vs IO-bound work
+
+To pick the right tool, know what kind of slow you're dealing with.
+
+| | CPU-bound | IO-bound |
+|---|---|---|
+| Time spent | Computing: executing instructions | Waiting: on the database, network, disk, other services |
+| Examples | Image resizing, encryption, compression, JSON serialization of huge objects | SQL queries, HTTP calls to other APIs, reading files, queues |
+| Typical in | Media processing, ML, analytics | **Most SaaS backends** |
+| Best tool to find it | **CPU profiler** | **Distributed tracing** |
+
+Note that serialization is CPU work, even though it often happens right next to IO. A CPU profiler is great at showing CPU hot spots, but it's poor at explaining time spent **waiting**, because a waiting thread isn't on the CPU. Since most backends spend most of their time waiting, tracing is usually the more useful tool.
+
+## Distributed tracing
+
+**Distributed tracing** follows **one request** through every component it touches and records a timed **span** for each step: the handler, each database query, each call to another service. The result is a waterfall:
+
+```text
+GET /products/5                                 812 ms
+├─ auth middleware                                 2 ms
+├─ SELECT ... FROM products WHERE id = 5         796 ms
+└─ serialize response                              4 ms
+```
+
+At a glance you know the query is the problem, not your code. Tracing tools (OpenTelemetry with a backend such as Jaeger, Tempo or a hosted vendor) let you sort endpoints by p95 and drill into the slowest traces.
+
+## Why the database is usually involved
+
+The database deserves its reputation as the usual suspect, because it does the hardest work in the system:
+
+- **Durability**: data is written to disk so it survives crashes and restarts.
+- **Consistency**: many clients read and write at once, so it locks and coordinates.
+- **Complex queries** over millions or billions of rows.
+
+That doesn't mean "blame the database" by default. It means that once tracing points at a query, there are three well-known, cheap fixes to check before anything fancy: **N+1 queries, missing indexes and connection overhead.**
+
+## N plus one queries
+
+The shop's blog page lists 20 posts with each author's name. The code fetches the posts, then loops over them and fetches each author:
+
+```ts
+const posts = await db.query("SELECT id, title, author_id FROM posts LIMIT 20"); // 1 query
+for (const post of posts) {
+  // 1 query per post: 20 more
+  post.author = await db.query("SELECT name FROM users WHERE id = $1", [post.author_id]);
+}
+```
+
+That's **1 query for the list plus N queries for the details**: the **N+1 problem**. The number of queries grows with the number of items: 21 for 20 posts, 1,001 for 1,000.
+
+### Why it hurts
+
+Every query pays a fixed overhead, however small the query:
+
+- a **network round trip** between app server and database,
+- a **TCP connection** setup if connections aren't pooled,
+- **parsing, planning and executing** the SQL, and sending results back.
+
+At 5 ms of overhead each, 1,000 queries is 5 seconds of loading spinner, for data that one query could return in a few milliseconds.
+
+### The fix
+
+Fetch related data **in bulk**, so the query count is constant however many items you show:
+
+```sql
+-- Option 1: two queries total
+SELECT id, title, author_id FROM posts ORDER BY created_at DESC LIMIT 20;
+SELECT id, name FROM users WHERE id IN (7, 14, 21);
+
+-- Option 2: one query with a join
+SELECT p.id, p.title, u.name AS author
+FROM posts p
+JOIN users u ON u.id = p.author_id
+ORDER BY p.created_at DESC
+LIMIT 20;
+```
+
+N+1 is especially sneaky with **ORMs**, because the loop looks like ordinary code. Nothing on screen says "this line is a network call". Every ORM has a way to load relations eagerly:
+
+| Tool | Eager-loading primitive |
+|---|---|
+| Django | `select_related` (foreign keys, uses a JOIN), `prefetch_related` (many-to-many and reverse relations, uses a second query) |
+| Rails | `includes` |
+| Prisma, Drizzle and other TypeScript ORMs | `include` / `with` for relations, or an explicit join |
+| Raw SQL | `JOIN`, or `WHERE id IN (...)` |
+
+<Callout kind="tip">
+Turn on your ORM's SQL logging in development. If one page load prints a wall of near-identical queries, you've found an N+1.
+</Callout>
+
+<NPlusOneCounter />
+
+The same pattern exists between frontend and backend: a page that calls `/posts` and then `/users/:id` for every post is an N+1 over HTTP. The fix is the same: an endpoint that returns what the page needs in one go.
+
+## Indexes
+
+The most common database performance problem is a **missing index**.
+
+Imagine a library with a million books shelved in no particular order, and no catalogue. Someone asks for every book by a particular author. You have to walk every aisle and check every book. Next time someone asks, you do it all again. That's a **sequential scan** (or full table scan): the database reads every row and checks the condition.
+
+Now add a catalogue sorted by author, where each entry says which shelf the book is on. You look up the author, get the locations, and walk straight there. That catalogue is an **index**.
+
+### What an index is
+
+An index is a separate data structure, usually a **B-tree** (others exist, such as hash and GIN indexes). It stores the values of one or more columns **in sorted order**, each with a pointer to the row it came from. Because it's sorted, the database can find a value in a handful of steps instead of scanning millions of rows.
+
+```sql
+CREATE INDEX idx_posts_author_id ON posts (author_id);
+```
+
+On a large table, a lookup that took seconds as a scan can take a few milliseconds through an index.
+
+### Indexes aren't free
+
+- **Storage**: the index is a copy of the column values plus pointers, and grows with the table.
+- **Slower writes**, which matters more: every `INSERT`, `UPDATE` and `DELETE` must also update **every index** on the table. Index every column and your writes crawl.
+
+### When to add one
+
+- The **primary key** is indexed automatically.
+- Index **obvious access paths** when you create the table, such as a foreign key you'll filter or join on (`posts.author_id`).
+- For anything less obvious, **wait and measure**: let tracing show you a slow endpoint and query, then index for it. Columns used in `WHERE`, `JOIN` and `ORDER BY` are the candidates.
+- Be deliberate rather than generous.
+
+### Composite indexes
+
+A **composite index** covers several columns, such as `(user_id, created_at)`. It's ideal for "this user's orders, newest first". Column order matters, because the index is sorted by the first column, then the second within it. This is the **leftmost prefix** rule:
+
+| Query filters on | Uses the `(user_id, created_at)` index? |
+|---|---|
+| `user_id` and `created_at` | Yes |
+| `user_id` only | Yes |
+| `created_at` only | No (efficiently, at least) |
+
+Put the column you always filter by first.
+
+### Covering indexes
+
+If an index contains **every column a query needs**, the database can answer from the index alone without visiting the table: an **index-only scan**. If a `departments` table has 100 columns but a dropdown only needs `id` and `name`, an index on `(name)` that also includes `id` serves that query entirely. The trade-off is a bigger index, so use it for hot queries.
+
+```sql
+CREATE INDEX idx_departments_name ON departments (name) INCLUDE (id);
+```
+
+### Reading a query plan
+
+Don't guess which index a query needs. Ask the database:
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM orders WHERE user_id = 42 ORDER BY created_at DESC LIMIT 20;
+```
+
+`EXPLAIN ANALYZE` runs the query and shows the real plan: which tables were read, in what order, which indexes were used, and how long each step took. Look for a **Seq Scan** on a large table. Add an index, run it again, and confirm it now shows an **Index Scan** (or Index Only Scan) and a much lower time.
+
+The full workflow: **tracing finds the slow query, the query plan finds the missing index, you add it, and you measure again.**
+
+## Connection pooling
+
+On your laptop, opening a database connection feels instant. In production it's expensive. Each new connection needs:
+
+1. A **TCP handshake**.
+2. **TLS negotiation** if the connection is encrypted.
+3. **Authentication**.
+4. **Session setup** on the database side.
+5. **Memory** on the database server (in Postgres, each connection is a separate process using several megabytes).
+
+That creates two problems if you connect per request:
+
+- **Latency**: you pay that setup cost on every request.
+- **Connection limits**: databases cap concurrent connections. Postgres ships with `max_connections = 100` by default; it can be raised to a few hundred, limited by memory. A traffic spike that opens a connection per request quickly hits the cap, and new requests fail.
+
+A **connection pool** keeps a set of connections open. A request **borrows** one, runs its queries and **returns** it, and the next request reuses it. Setup cost is paid once, and the pool size puts a ceiling on how many connections you ever open.
+
+```text
+App ──borrow──▶ [ pool: 20 open connections ] ──▶ Postgres
+    ◀─return──
+```
+
+If every connection in the pool is busy, the next request **waits** for one to be returned. A pool that's too small becomes its own queue, so pool wait time is worth measuring too.
+
+### Internal vs external pools
+
+| | Internal pool | External pooler |
+|---|---|---|
+| Where | Inside each app process, provided by the database driver | A separate service in front of the database, such as **PgBouncer** for Postgres |
+| Total connections | Pool size **times** the number of app instances | One shared limit, whatever the number of app instances |
+| Risk | Autoscaling multiplies connections. 3 instances with 150 each is 450 against a database that allows 300 | One more component to run |
+| Best for | Simple setups with a fixed number of servers | Production systems that autoscale or see spikes |
+
+<Callout kind="warn">
+Internal pools are per instance. When an autoscaler adds servers during a spike, each one brings its own pool, and the total can blow past the database's connection limit exactly when load is highest.
+</Callout>
+
+To recap the database checklist: **fix N+1 queries, index for your real access patterns, and pool connections** (externally once you scale out).
+
+## Caching
+
+If the queries are tuned and the database is still the bottleneck, **cache** the results. The idea is simple: keep the result of expensive work somewhere fast. On the next request, check the cache first; on a hit, return immediately. A product page that took 800 ms can come back in a few milliseconds.
+
+### Invalidation
+
+Caching is easy. Keeping the cache **correct** when the underlying data changes is the hard part, especially with several layers (browser, CDN, reverse proxy, application cache).
+
+| Strategy | How it works | Downside |
+|---|---|---|
+| **Time-based (TTL)** | Each entry expires after a fixed time, such as 5 minutes | Data can be stale for up to the TTL. Picking the TTL needs knowledge of each endpoint |
+| **Event-based** | Whenever the data changes, the code that wrote it deletes the cache entry | Every write path must remember to invalidate. Miss one and you serve stale data indefinitely |
+
+Many systems combine them: invalidate on writes, and keep a TTL as a safety net.
+
+### Local vs distributed caches
+
+| | Local (in-process) cache | Distributed cache |
+|---|---|---|
+| What | A map in the server's own memory | A separate service: **Redis**, **Valkey**, **Memcached** |
+| Speed | Microseconds, no network | A network round trip, typically well under a millisecond in the same data center |
+| Problem | Every instance has its own copy, so 10 servers can disagree | Extra hop, extra service to run |
+
+A common design is **tiered caching**: a small local cache for the very hottest keys (evicted with LRU or LFU), in front of a shared Redis, in front of the database.
+
+### Caching patterns
+
+| Pattern | Read | Write | Trade-off |
+|---|---|---|---|
+| **Cache-aside** (lazy loading) | Check the cache. On a miss, read the DB, store the result, return it | Write the DB, then delete the cache entry | The most common pattern. First read after a change is a miss |
+| **Write-through** | Read from the cache | Write the DB **and** the cache before responding | Reads after writes always hit. Writes are slower |
+| **Write-behind** | Read from the cache | Write the cache, respond, write the DB **later** | Fastest writes. If the background write fails, cache and DB disagree, and data can be lost |
+
+```ts
+async function getProduct(id: string) {
+  const cached = await redis.get(`product:${id}`);
+  if (cached) return JSON.parse(cached); // hit
+  const product = await db.products.findById(id); // miss
+  await redis.set(`product:${id}`, JSON.stringify(product), { EX: 300 });
+  return product;
+}
+```
+
+### Hit rate
+
+**Hit rate** is the share of reads served from the cache. Around 90% is healthy. Around 20% means the cache is mostly overhead: something is wrong with what you're caching or how. Three things drive it:
+
+- **TTL**: longer TTLs mean more hits but staler data. A week-long TTL usually means you're fighting stale data.
+- **Cache size**: more memory holds more keys, so fewer get evicted.
+- **Access patterns**: caching works when a small set of keys is read often. Knowing which endpoints are hot, and when, is what gets you to a high hit rate.
+
+## Vertical scaling
+
+Eventually the machine itself runs out of capacity. There are two ways to get more. **Vertical scaling** (scaling up) means replacing the server with a bigger one:
+
+- more **CPU cores**,
+- more **RAM** (so more data fits in memory and caches),
+- bigger and faster **disks** (NVMe SSDs),
+- a faster **network card**.
+
+### Why it's attractive
+
+- **Simplicity**: no code or architecture changes. You change the instance size and restart.
+- **Roughly linear gains** for many workloads: twice the cores handles roughly twice the requests, up to a point.
+- **No distributed-system problems**: no load balancer, no shared state, one machine to secure, back up and monitor.
+- One big machine is often cheaper to operate than many small ones once you count the operational overhead.
+
+### Its hard limits
+
+- **A ceiling**: there's always a largest machine you can buy or rent.
+- **A single point of failure**: if that one powerful server goes down for two hours, so does your product. Standbys and automatic failover reduce the risk but don't remove it.
+- **One location**: if the server is in Virginia and 40% of your users are in India, they always pay the round-trip latency, however powerful the machine.
+
+<Callout kind="tip">
+Vertical scaling is underrated. For many products, a well-indexed database on one large machine, plus a standby, goes much further than people expect.
+</Callout>
+
+## Horizontal scaling
+
+**Horizontal scaling** (scaling out) means running **more copies** of the same server and spreading requests across them.
+
+### What it promises
+
+- **Capacity that grows with machines**: if one instance handles 1,000 RPS, five handle about 5,000. For a big campaign, add instances. There's no fixed ceiling.
+- **Redundancy**: if one instance dies, the others keep serving.
+- **Geographic reach**: put instances in several regions and route users to the nearest one.
+
+These are real, but in practice capacity grows *roughly* linearly only until a shared component (usually the database) becomes the bottleneck.
+
+### What it costs
+
+The moment there's a second instance, new questions appear:
+
+- **Who decides which instance gets each request?** You need a **load balancer** and a routing algorithm.
+- **How do instances share state?** If a user's session or uploaded file lives on instance 1, what happens when the next request lands on instance 2?
+- **What if the network between components fails?** Instances can make conflicting decisions.
+- **What if an instance dies?** Something must notice, stop sending it traffic, and notice again when it recovers.
+
+All of these have well-known answers, which the next lecture covers: statelessness, load balancers, health checks and scaling the database.
+
+<Callout kind="remember">
+Distributed systems don't remove problems; they trade one set of problems for another. Choosing an architecture means choosing which set you'd rather solve.
+</Callout>
+
+## Cheat sheet
+
+- **Latency** is time per request; report it as **percentiles** (p50, p95, p99), never just the average.
+- "p99 = 2 s" means the slowest **1%** of requests take longer than 2 s.
+- **Throughput** is requests per second. Latency rises with it, slowly and then sharply.
+- Latency explodes as **utilization** nears 100% because of **queueing**. Run at 60–80% and keep headroom for bursts.
+- **Measure before you fix.** Timing logs, a **profiler** with flame graphs for CPU, **distributed tracing** for IO.
+- **N+1**: one list query plus one per item. Fix with a JOIN or a bulk `IN` query, or the ORM's eager loading.
+- **Indexes** speed reads and slow writes. Index real access patterns; check with `EXPLAIN ANALYZE` (Seq Scan vs Index Scan).
+- **Composite** indexes follow the leftmost prefix rule; **covering** indexes answer from the index alone.
+- **Pool** connections. With many instances, use an **external pooler** like PgBouncer to stay under the DB's limit.
+- **Cache** after tuning queries: cache-aside is the default; invalidate on writes and keep a TTL; aim for a high hit rate.
+- **Vertical** scaling is simple but has a ceiling, a single point of failure and one location.
+- **Horizontal** scaling adds capacity and redundancy but brings load balancing, shared state and failure detection.

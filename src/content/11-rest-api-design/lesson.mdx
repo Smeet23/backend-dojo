@@ -1,0 +1,500 @@
+import { EndpointDesigner } from "@/components/widgets/EndpointDesigner";
+import { PaginationExplorer } from "@/components/widgets/PaginationExplorer";
+
+## Why API design matters
+
+Backend engineers spend a surprising amount of their time not on algorithms but on **interfaces**: which URL, which method, which fields, which status code. Your API is the contract every frontend, mobile app and partner integration is built against. A good one is guessable; a bad one is a stream of Slack questions.
+
+This lesson is about designing the **interface** of a REST API, not the code behind it. Everything here is language- and framework-agnostic. Other styles exist (RPC and gRPC, GraphQL), but REST is still the most widely used, and its ideas show up everywhere.
+
+Even experienced developers argue about the same questions:
+
+- Should path segments be **plural or singular**?
+- Update with **PATCH or PUT**?
+- What about an action that isn't create, read, update or delete, like "archive" or "send invoice"?
+- Which **status code** fits which situation?
+
+Part of the confusion is historical. REST's ideas were written down when the web was mostly **multi-page applications (MPAs)**: the server rendered a full HTML page for every click. Today most products are **single-page applications (SPAs)** that download JavaScript once, route on the client, and talk to the backend only through JSON APIs. The principles still hold, but how you apply them has shifted. The goal here isn't to invent new rules; it's to distil the existing standards into a **consistent set of guidelines** you can apply without second-guessing, so you can spend your energy on the business logic.
+
+## Where REST came from
+
+### The web's growing pains
+
+In 1990, Tim Berners-Lee started the World Wide Web project at CERN to share documents between researchers. Within about a year he had created the building blocks we still use: **URIs** (to name things), **HTTP** (to fetch them), **HTML** (to describe pages), the first **web server**, and the first **web browser**, which included a WYSIWYG editor.
+
+Then the web took off. Its user base grew exponentially, far faster than the original design anticipated, and it faced a real scalability problem. The protocols needed clearer rules so that millions of independent clients, servers, proxies and caches could cooperate.
+
+### Fielding's constraints
+
+**Roy Fielding**, one of the co-founders of the Apache HTTP Server project, worked on that problem through the mid-1990s. He co-authored the HTTP/1.0 and **HTTP/1.1** specifications with Berners-Lee and others, and in **2000** described the architectural style behind the web in his PhD dissertation. He called it **REST: Representational State Transfer**.
+
+REST is defined by a set of **constraints**. A system that follows them gains scalability, simplicity and the ability to evolve.
+
+| Constraint | Meaning | Why it helps |
+|---|---|---|
+| **Client–server** | UI concerns live on the client; data and business logic live on the server | Each side can evolve and scale independently |
+| **Stateless** | Every request carries everything needed to process it; the server keeps no client session between requests | Any server behind a load balancer can handle any request |
+| **Cacheable** | Responses must label themselves cacheable or not | Clients and proxies can reuse responses, cutting load and latency |
+| **Layered system** | Components only see the layer they talk to | You can add load balancers, proxies and gateways without clients noticing |
+| **Uniform interface** | One standard way for all components to interact (see below) | Clients and servers stay decoupled |
+| **Code on demand** *(optional)* | Servers may send executable code (like JavaScript) to extend the client | Flexibility; rarely the focus for APIs |
+
+### The uniform interface
+
+The uniform interface is the heart of REST. It has four parts:
+
+1. **Resource identification**: every resource has an identifier, a URI like `/projects/42`.
+2. **Manipulation through representations**: clients change a resource by sending a representation of it (for example, a JSON body), not by calling server functions directly.
+3. **Self-descriptive messages**: each message carries enough to be understood on its own, via its method, headers like `Content-Type`, and status code.
+4. **HATEOAS** (hypermedia as the engine of application state): responses include links to related actions and resources, so a client can navigate the API like a user follows links on a web page.
+
+Most real-world "REST" APIs follow the first three closely and HATEOAS only loosely or not at all. That's fine; knowing the full picture helps you understand why the rest works the way it does.
+
+<Callout kind="tip">
+Fielding's dissertation (search "Fielding dissertation chapter 5 REST") is readable and short on the REST part. It explains where these conventions came from better than any summary.
+</Callout>
+
+## What REST means
+
+Break the name into its three words.
+
+| Word | Meaning | Example |
+|---|---|---|
+| **Representational** | A resource is exposed through a **representation** in some format: JSON, XML, HTML. The same resource can have several representations. | A user `{ id, name, createdAt }` served as JSON to the mobile app and as an HTML profile page to a browser |
+| **State** | The resource's current data and condition | A shopping cart's state is its items, their quantities and the total |
+| **Transfer** | Representations move between client and server over a standard protocol, HTTP, using its methods | A `GET /carts/me` transfers the cart's current state to the client; a `PATCH` sends a change back |
+
+Put together: in REST, clients and servers exchange **representations** of resources, and through those exchanges the **state** of resources is **transferred** and changed, all under constraints that keep the system scalable.
+
+## Anatomy of an API URL
+
+A web address has distinct parts:
+
+```
+https://shop.example.com/blog/summer-sale?tag=shoes#sizes
+\___/   \______________/\_______________/\_______/\____/
+scheme      authority          path         query  fragment
+```
+
+- **Scheme**: `http` or `https` (always HTTPS for APIs).
+- **Authority**: the domain, possibly with a subdomain and port.
+- **Path**: which resource you want. The `/` expresses **hierarchy**.
+- **Query**: key–value parameters, mostly for filtering, sorting and pagination.
+- **Fragment**: tells the browser to scroll to a section. It's never sent to the server.
+
+APIs usually follow a recognisable convention (not a hard rule):
+
+```
+https://api.example.com/v1/projects
+https://api.example.com/v1/projects/8f3c2a
+https://api.example.com/v1/projects/8f3c2a/tasks
+```
+
+- An **`api.`** subdomain, separate from the website.
+- A **version** prefix such as `/v1`, so you can ship breaking changes as `/v2` without breaking existing clients.
+- Then the **resources**.
+
+### Plural resource names
+
+Use **plural nouns** for collections, and keep them plural even when addressing a single item:
+
+| Good | Avoid |
+|---|---|
+| `GET /projects` | `GET /project` |
+| `GET /projects/42` | `GET /project/42` |
+| `POST /projects` | `POST /createProject` |
+
+Read the path as a hierarchy: `/projects` is the **collection**; `/projects/42` is **one member of that collection**. The collection's name doesn't change just because you picked one item from it. Mixing `/project/42` with `/projects` forces every integrator to remember which endpoints are singular.
+
+And keep **verbs out of paths** for CRUD. The method already says what you're doing: `POST /projects`, not `/projects/create`.
+
+### Readable URLs and slugs
+
+URLs should be lowercase and readable: **no spaces, no underscores, no mixed case**. Spaces get encoded as `%20`, underscores disappear under link underlines, and case sensitivity differs between systems.
+
+When you want a human-friendly identifier, use a **slug**: take a name, lowercase it, and replace spaces (and punctuation) with hyphens.
+
+```
+"Harry Potter and the Goblet of Fire"  →  harry-potter-and-the-goblet-of-fire
+GET /books/harry-potter-and-the-goblet-of-fire
+```
+
+Slugs are great for public, shareable pages. Make sure they're **unique**, and consider keeping the stable ID available too, because names (and therefore slugs) can change.
+
+### Nesting
+
+The path's hierarchy can express ownership:
+
+```
+GET /projects/42/tasks        tasks belonging to project 42
+GET /projects/42/tasks/7      task 7 within project 42
+```
+
+Keep nesting **shallow**, one or two levels. Once a task has its own unique ID, `GET /tasks/7` is often simpler than a deep chain like `/organizations/1/projects/42/tasks/7`. A common middle ground is to nest for **listing and creating** children and use top-level routes for individual items.
+
+## Methods and idempotency
+
+A request is **idempotent** if sending it once or many times leaves the server in the **same state**. That property matters because networks fail: a client that times out and retries must know whether retrying is safe.
+
+| Method | Use | Idempotent? |
+|---|---|---|
+| **GET** | Read a resource or collection | Yes, and **safe**: no side effects at all |
+| **PUT** | **Replace** a resource with the full representation sent | Yes: same body, same final state |
+| **PATCH** | **Partially** update a resource | Not guaranteed; usually yes in practice |
+| **DELETE** | Remove a resource | Yes: after the first call it's gone; repeats may return 404 but change nothing |
+| **POST** | Create a resource, or perform a **custom action** | No: each call can create another resource |
+| **HEAD** | Like GET, but headers only | Yes |
+| **OPTIONS** | Ask what's allowed (used in CORS preflights) | Yes |
+
+Two subtleties are worth getting exactly right.
+
+**Idempotency is about state, not identical responses.** If someone else creates a project between your two `GET /projects` calls, the second response differs, but *your* GET still caused no change. Likewise a repeated DELETE returns 404 the second time, yet the server state is the same.
+
+**PATCH is not idempotent by definition.** A PATCH that **sets** a field (`{ "status": "active" }`) is idempotent in effect: the second call leaves it unchanged. But a PATCH can also describe a **relative** change, such as "append this tag" or "increment the counter by 1", and repeating that changes state each time. The HTTP spec therefore doesn't promise idempotency for PATCH. Design your PATCH bodies as "set these fields to these values" and they'll be safe to retry.
+
+<Callout kind="remember">
+POST isn't idempotent, so `POST /projects` sent three times creates three projects (each with its own server-generated ID). Unless a business rule like "project names are unique" makes the later calls fail with 409, retries need care. That's what idempotency keys are for.
+</Callout>
+
+### PUT vs PATCH
+
+Take a project `{ id, name, status, description, createdAt }`, and say you want to rename it.
+
+```http
+PATCH /projects/42
+Content-Type: application/json
+
+{ "name": "Website relaunch" }
+```
+
+```http
+PUT /projects/42
+Content-Type: application/json
+
+{ "name": "Website relaunch", "status": "active", "description": "Q3 marketing site" }
+```
+
+With **PATCH** you send only what changes. With **PUT** you send the **whole** representation, and anything you leave out is, by the semantics, removed or reset. Accidentally PUTting `{ "name": "…" }` could wipe the description.
+
+In modern JSON APIs, **PATCH is the everyday choice**: screens edit a few fields at a time, and partial updates express that directly. PUT fits when the client genuinely owns the entire document (for example, saving a settings object or uploading a file to a known path). Some teams treat the two as interchangeable internally, but for any API others integrate with, **honour the semantics**, because integrators will rely on them.
+
+### POST for custom actions
+
+Not every operation is create, read, update or delete. "Send an invoice", "archive an organization", "clone a project", "retry a payment": these are **actions**. POST is the open-ended method for operations that don't fit the others, so the convention is:
+
+```
+POST /<resources>/<id>/<action>
+POST /invoices/9/send
+POST /organizations/3/archive
+POST /projects/42/clone
+```
+
+The path still reads as a hierarchy: the collection, then one item, then an action on that item. Action names are verbs, and that's the **one place** a verb belongs in the path.
+
+## Design first
+
+A REST API should be **designed before it's coded**. Why bother with standards and design at all? Because an integrator facing an inconsistent API has only two ways to learn it: **read your source code** (if they even can) or **trial and error** with methods and payloads. Both are slow and lead to wrong assumptions and bugs.
+
+If your API follows widely known conventions, even 80% of the time, integrators can **guess correctly**: fewer bugs, faster integration and fewer "how does this endpoint work?" meetings.
+
+### From wireframes to resources
+
+Start where the product starts: the **wireframes and designs** (from Figma or wherever your designers work) and the requirements. They show how **end users** interact with the data, which is ultimately what your API serves.
+
+```
+End users  →  Frontend  →  Your API  →  Database
+```
+
+A good rule of thumb for finding resources is to **look for nouns**. For a project-management tool like Jira or Linear, the screens are full of them: **organizations, projects, tasks, users, tags, comments**. Each noun is a likely resource and a likely table.
+
+### From resources to actions
+
+Then follow a simple workflow:
+
+1. **Identify resources** (the nouns) from designs and requirements.
+2. **Design the database schema** for them. Here: organizations have many projects, and projects have many tasks.
+3. **List the actions** each screen needs. Start from the CRUD template (list, get one, create, update, delete), then add custom actions the UI requires.
+4. **Design the interface**: routes, methods, payloads, responses and status codes.
+
+Do step 4 in a tool, not in code: an **OpenAPI (Swagger)** editor, or an API client such as Postman, Insomnia or Bruno. You'll see the API as a consumer sees it before you've committed to an implementation.
+
+## CRUD endpoints
+
+Here's the full design for **organizations**, with fields `id`, `name`, `status`, `description`, `createdAt` and `updatedAt`.
+
+| Action | Method | Route | Body | Success |
+|---|---|---|---|---|
+| List organizations | GET | `/organizations` | none (query params) | **200** with a page of items |
+| Create an organization | POST | `/organizations` | JSON | **201** with the new entity |
+| Get one organization | GET | `/organizations/:id` | none | **200** with the entity |
+| Update an organization | PATCH | `/organizations/:id` | partial JSON | **200** with the updated entity |
+| Delete an organization | DELETE | `/organizations/:id` | none | **204**, empty body |
+| Archive an organization | POST | `/organizations/:id/archive` | none | **200** with the archived entity |
+
+Notice the shape: there are really only **two routes**, the collection (`/organizations`) and the item (`/organizations/:id`). The **method** decides which handler runs. The router sends `GET /organizations` to the list handler and `POST /organizations` to the create handler, even though the path is identical.
+
+### Create
+
+The client sends only the fields **it** controls. Fields the server or database owns, such as `id`, `createdAt` and `updatedAt`, are **not accepted** in the payload (reject or ignore them), so clients can't forge timestamps or choose IDs.
+
+```http
+POST /organizations
+Content-Type: application/json
+
+{ "name": "Acme", "description": "Rocket-powered gadgets" }
+```
+
+```http
+HTTP/1.1 201 Created
+Location: /organizations/5b1e9f
+Content-Type: application/json
+
+{ "id": "5b1e9f", "name": "Acme", "status": "active", "description": "Rocket-powered gadgets",
+  "createdAt": "2025-11-05T10:12:00Z", "updatedAt": "2025-11-05T10:12:00Z" }
+```
+
+Return the **created entity**, including the server-generated fields, so the client doesn't need a follow-up GET. Note that `status` wasn't sent; the server applied a sane default.
+
+### Get, update and delete
+
+```http
+GET /organizations/5b1e9f            → 200 with the organization
+PATCH /organizations/5b1e9f          → 200 with the updated organization
+  { "status": "inactive" }
+DELETE /organizations/5b1e9f         → 204 No Content (empty body)
+GET /organizations/5b1e9f            → 404 Not Found
+```
+
+An update returns **200**, not 201, because nothing new was created; include the updated entity. A delete returns **204**: it succeeded, and there's nothing to say.
+
+<EndpointDesigner />
+
+## Status codes per action
+
+| Situation | Status |
+|---|---|
+| List or get succeeded | 200 OK |
+| Created a resource (including via a custom action) | 201 Created, plus a `Location` header |
+| Updated, or ran an action that created nothing | 200 OK |
+| Deleted, nothing to return | 204 No Content |
+| Malformed or invalid input | 400 Bad Request (or 422) |
+| Not authenticated | 401 Unauthorized |
+| Authenticated but not allowed | 403 Forbidden |
+| That specific resource doesn't exist | 404 Not Found |
+| Conflicts with current state (duplicate name, already archived) | 409 Conflict |
+
+### Not found vs empty list
+
+Use **404** only when the client asked for a **specific resource** that doesn't exist: `GET /organizations/does-not-exist`.
+
+A **list** that matches nothing is not an error. It's a perfectly good answer: "there are zero of those".
+
+```http
+GET /organizations?status=banana
+
+HTTP/1.1 200 OK
+{ "data": [], "total": 0, "page": 1, "totalPages": 0 }
+```
+
+Returning 404 here would make clients treat "no results" as a failure and show an error screen. The one exception is a nested list whose **parent** doesn't exist: `GET /projects/does-not-exist/tasks` can reasonably return 404, because the project itself is missing.
+
+## Custom actions
+
+### Archive
+
+Archiving an organization looks like `PATCH { "status": "archived" }`. But in a real product, archiving usually means **more** than flipping a field: archive or lock all its projects and tasks, revoke API keys, email its members. A PATCH that silently triggers all of that is surprising, and a client can't safely do those steps itself. So model it as an action:
+
+```http
+POST /organizations/5b1e9f/archive
+
+HTTP/1.1 200 OK
+{ "id": "5b1e9f", "name": "Acme", "status": "archived", … }
+```
+
+It returns **200**: an existing resource changed, and nothing new was created.
+
+### Clone
+
+Requirement: users can **clone** a project. Why not let the frontend `GET` the project and `POST /projects` with the same values? Because the client doesn't know what "clone" means on the server. It might also copy all the tasks, reset their statuses, notify the owner, or record where the copy came from. That knowledge belongs in the backend, behind one endpoint:
+
+```http
+POST /projects/42/clone
+Content-Type: application/json
+
+{ "name": "Website relaunch (copy)" }      ← optional overrides
+
+HTTP/1.1 201 Created
+Location: /projects/77
+{ "id": "77", "name": "Website relaunch (copy)", … }
+```
+
+This one returns **201**, because it created a new resource. If project 42 doesn't exist, it returns **404**.
+
+<Callout kind="warn">
+**Don't assume POST means 201.** The status code describes **what happened**, not which method was used. Archive (changed something) is 200; clone (created something) is 201; a "send email" action that queues work could even be 202 Accepted.
+</Callout>
+
+## List endpoints
+
+Every list endpoint should support three things: **pagination, sorting and filtering**. All three are controlled with **query parameters**, because a GET has no body.
+
+### Pagination
+
+Returning every row is tempting until there are 50,000 of them. A huge response means slow database queries, expensive JSON serialization, large network transfers and slow parsing on the client, all to show the 20 items that fit on the screen. Users feel that as a multi-second spinner.
+
+Instead, return one **page** at a time. With **page-based (offset) pagination**, the client sends:
+
+- `page`: which page (starting at 1);
+- `limit`: how many items per page.
+
+And the response wraps the items in an envelope:
+
+```json
+{
+  "data": [ { "id": "o5", "name": "org 5" }, { "id": "o4", "name": "org 4" } ],
+  "total": 5,
+  "page": 1,
+  "totalPages": 3
+}
+```
+
+| Field | Purpose |
+|---|---|
+| `data` | The items on this page |
+| `total` | How many items match overall, so the UI can show "showing 1–2 of 5" |
+| `page` | Which page this is |
+| `totalPages` | When to stop: infinite scroll ends when `page` equals `totalPages` |
+
+Under the hood, page-based pagination is SQL `LIMIT` and `OFFSET`:
+
+```sql
+SELECT * FROM organizations
+ORDER BY created_at DESC
+LIMIT 2 OFFSET 2;   -- page 2 with limit 2: skip (2 - 1) * 2 = 2 rows
+```
+
+### Offset vs cursor pagination
+
+Offset pagination is simple and lets users jump to page 37, but it has two weaknesses on large or busy tables:
+
+- **Shifting rows**: if a new item is inserted at the top while a user is scrolling, every item moves down one place. Page 2 then repeats the last item of page 1. Deletions cause the opposite: an item is skipped.
+- **Deep pages get slow**: `OFFSET 100000` makes the database walk past 100,000 rows just to throw them away.
+
+**Cursor (keyset) pagination** fixes both. Instead of "skip N rows", the client says "give me items **after this one**", using an opaque cursor that encodes the last item's sort key:
+
+```http
+GET /tasks?limit=20&cursor=eyJjcmVhdGVkQXQiOiIyMDI1LTExLTA1In0
+```
+
+```sql
+SELECT * FROM tasks
+WHERE (created_at, id) < ($1, $2)       -- the cursor's values
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+The response returns a `nextCursor` (or `null` at the end) instead of `totalPages`. The trade-off: you can't jump to an arbitrary page, and computing an exact `total` is often skipped. Use **offset** for small admin tables with page numbers, and **cursor** for feeds, infinite scroll and large tables.
+
+<PaginationExplorer />
+
+### Sorting
+
+Let clients choose the order with two parameters:
+
+```http
+GET /organizations?sortBy=name&sortOrder=asc
+```
+
+- `sortBy`: the field (`name`, `createdAt`, `status`…), checked against an **allowlist** of sortable fields.
+- `sortOrder`: `asc` or `desc`.
+
+**Always sort, even when the client doesn't ask.** A relational database makes **no promise about row order** without `ORDER BY`. The same query can return rows in different orders after updates, vacuuming or a different query plan, which makes pagination skip and repeat items. The natural default is **`sortBy=createdAt`, `sortOrder=desc`**: newest first. If the client sends `sortBy` but no `sortOrder`, still default the order. And add a unique tie-breaker such as `id` so items with equal values keep a stable order.
+
+### Filtering
+
+Filter by passing the **field name as a query parameter**:
+
+```http
+GET /organizations?status=archived
+GET /projects?organizationId=5b1e9f&status=active
+GET /tasks?assigneeId=u_17&sortBy=dueDate&sortOrder=asc&page=2&limit=20
+```
+
+Filters, sorting and pagination combine freely. As with sorting, only accept **known** filter fields and validate their values. Range filters and search are often expressed with clear names, such as `createdAfter=2025-01-01` or `q=launch`.
+
+## Payloads and naming
+
+### Server-owned fields
+
+The client never sends `id`, `createdAt` or `updatedAt`. The server generates IDs (UUIDs or sequences) and timestamps. Accepting them would let clients collide IDs or backdate records. Similarly, never accept the **owner** of a resource from the body; take it from the authenticated user.
+
+### camelCase keys
+
+JSON keys in request and response bodies should use **camelCase**: `organizationId`, `createdAt`, `totalPages`. It's the dominant convention for JSON APIs and maps naturally onto JavaScript clients. Your database may use `snake_case` columns (`organization_id`); translate at the boundary. (Some ecosystems choose snake_case for JSON; that's acceptable **if** it's used everywhere.)
+
+### Consistency above all
+
+Consistency is the single most valuable property of an API. Once a frontend engineer has integrated one endpoint, they **assume** every other endpoint works the same way, and that assumption is what makes integration fast.
+
+| Inconsistency | What it costs |
+|---|---|
+| `description` on organizations, `desc` on projects | A confusing validation error and a trip to the docs |
+| `/organizations` plural, `/project` singular | Wrong URLs, 404s |
+| `page`/`limit` on one list, `offset`/`size` on another | A second pagination implementation on the client |
+| Errors as `{ "error": "…" }` here and `{ "message": "…" }` there | Error handling that breaks on some endpoints |
+
+Pick conventions, ideally the widely known ones in this lesson, write them down, and **apply them to every resource**. If you must deviate from global standards, deviate **consistently**.
+
+### No abbreviations
+
+Write `description`, not `desc` or `dsc`; `quantity`, not `qty`. You know what your abbreviation means; integrators don't share your context. Readable names cost a few bytes and save hours.
+
+## Sane defaults
+
+A good API asks the client for as little as possible:
+
+- **List endpoints**: `page=1`, `limit=20` (with a maximum such as 100), `sortBy=createdAt`, `sortOrder=desc`. A plain `GET /organizations` should just work, not return a validation error.
+- **Create endpoints**: require only what's genuinely needed. Creating an organization might require just `name`; `status` defaults to `"active"`, and `description` is optional.
+
+Defaults belong in the validation and transformation step, so the rest of the code never handles "missing".
+
+## Errors
+
+Errors deserve the same consistency as successes. Use one shape everywhere:
+
+```json
+{
+  "error": {
+    "code": "VALIDATION_FAILED",
+    "message": "Request body is invalid",
+    "details": [ { "field": "name", "message": "Required" } ]
+  }
+}
+```
+
+A stable machine-readable `code` lets clients branch on the error without parsing messages; `details` points at specific fields. Many APIs adopt the standard **Problem Details** format (RFC 9457, `application/problem+json`) for exactly this.
+
+## Documentation
+
+Ship **interactive documentation** from day one. **OpenAPI** (formerly Swagger) describes every route, parameter, body, response and error in a machine-readable file. Tools render it as a browsable playground where integrators can send real requests, generate typed clients from it, and validate requests against it.
+
+Keeping the spec accurate as the API evolves is a discipline, and it's one of the clearest signs of a professional backend engineer. A design-first workflow makes it natural: you write the OpenAPI document **before** the code, review it with frontend engineers, then implement to match.
+
+<Callout kind="remember">
+Design first, code second. Spend a session in an OpenAPI editor or API client shaping routes, payloads and status codes the way a consumer will use them. It's much cheaper to change a design than a deployed API.
+</Callout>
+
+## Cheat sheet
+
+- REST (Fielding, 2000): **client–server, stateless, cacheable, layered, uniform interface**, optional code on demand.
+- URLs: `https://api.example.com/v1/projects/:id`, with **plural nouns**, lowercase, hyphenated **slugs**, and no verbs for CRUD.
+- Two routes per resource: **collection** (list, create) and **item** (get, update, delete); the **method** picks the handler.
+- GET, PUT and DELETE are idempotent; **POST isn't**; PATCH is only if it **sets** values.
+- Prefer **PATCH** for partial updates; PUT replaces the **whole** resource.
+- Custom actions: **POST /resources/:id/action**, returning 200 if it changed something and 201 if it created something.
+- Create **201** plus the entity; get, list and update **200**; delete **204**; missing item **404**.
+- An empty list is **200 with `data: []`**, never 404.
+- Lists need **pagination, sorting and filtering** via query params; use **cursor** pagination for feeds and big tables.
+- **Always apply a default sort** (`createdAt desc` plus an `id` tie-breaker); databases don't guarantee order.
+- Never accept `id`, `createdAt`, `updatedAt` or the owner from the client; use **camelCase**, no abbreviations.
+- **Consistency** and **sane defaults** beat cleverness; document everything in **OpenAPI**, designed first.

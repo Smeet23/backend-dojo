@@ -1,0 +1,390 @@
+import { TestDoublePicker } from "@/components/widgets/TestDoublePicker";
+import { CoverageMutationLab } from "@/components/widgets/CoverageMutationLab";
+
+## What a test is
+
+Strip away the frameworks and jargon and a test is simple: **a second program that runs your program and makes claims about what happened.** Call a function, compare the result to what you expected, complain if they differ. Every tool in this lesson (runners, mocks, coverage, mutation testing) is a variation on that idea.
+
+```ts
+// A test with no framework at all
+const fee = shippingFee(20, "IN");
+if (fee !== 5) throw new Error(`shippingFee(20, "IN") = ${fee}, want 5`);
+```
+
+Why write that second program? People give many reasons: tests document behaviour, guide design, and let you practise test-driven development. The most important reason is more practical: **catching regressions**. A feature you shipped six months ago should still behave the way it did when you first checked it, even after forty other features have been piled on top.
+
+<Callout kind="warn">
+A bad test is worse than no test. A rushed or incomplete suite that passes gives the team **false confidence**: everyone believes the code is checked when it isn't. A missing test is at least an honest gap.
+</Callout>
+
+This lesson covers the testing a backend engineer writes and runs personally, which is most of the testing a team does. It skips manual QA processes, test-management tools and browser automation. The examples use a small online shop: orders, payments, emails and a Postgres database.
+
+## Test runners and assertions
+
+You could write every test like the snippet above, but you'd quickly end up rebuilding the same plumbing: find all the test functions, run them, count failures, print a report. That's what a **test runner** does. Every mainstream language ships one (`go test`, `pytest`, JUnit, Vitest, Jest) and frameworks add conveniences on top.
+
+A runner is less magic than it looks. Go's runner, for example, scans your package for functions named `TestXxx`, **generates a `main` function** that lists them all, compiles that into a binary (`orders.test`) and executes it. Run `go test -work` and you can see the generated `_testmain.go` file you never wrote. Every runner, in any language, does the same two jobs: **create an entry point that calls your tests, and collect the results**.
+
+An **assertion** is the part of a test that complains: a check that fails the test when a condition is false. Most ecosystems provide helpers like `expect(x).toBe(y)` or `assertEquals`. Go deliberately has none in its standard library, so you write the `if` yourself:
+
+```go
+if got := order.Status; got != "paid" {
+    t.Errorf("Pay(): order status = %q, want %q", got, "paid")
+}
+```
+
+Whatever the style, **write failure messages for the person who will read them at 2 a.m.** "Expected true, got false" says nothing. "Pay(): order status = pending, want paid" points straight at the problem, with the function, the field, what happened and what should have happened.
+
+## Regressions and CI
+
+A **regression** is a bug you already fixed that comes back. It's not a sign of carelessness. Someone changes a function signature, tweaks a shared helper or reorders some logic, which is normal team life, and an old behaviour quietly breaks.
+
+Tests catch regressions at the cheapest possible moment when they run in **continuous integration (CI)**. A service like GitHub Actions runs the whole suite on every pull request **before** it can merge into the main branch. A red build means "this change reintroduces a known bug", and you fix it before any user notices.
+
+The real payoff is speed. A deterministic suite that enforces "every bug we've fixed stays fixed" is what lets a team **add features quickly without fear**.
+
+## Kinds of tests
+
+The classic way to classify tests is by **scope**: how much of the system a test exercises.
+
+### Unit tests
+
+A **unit test** checks one unit in isolation. What counts as a "unit" (a function, a class, a module, a whole service) has **no universal definition**, and teams argue about it endlessly. If `placeOrder` calls three helper functions, you can let it call the real helpers or hand it replacements. Both are reasonably called unit tests.
+
+Here's an instructive experiment. Test the same behaviour ("moving an order to *shipped* notifies subscribers") four ways:
+
+| Variant | Runtime |
+|---|---|
+| Order service with a fake event bus that just records what was published | about 0 s |
+| Real event bus and real subscriber hub, all in memory | about 0 s |
+| A real HTTP server on a real port, a real POST, the real response parsed | about 0 s |
+| The same flow against a real Postgres in a container | about 10 s, almost all container start-up |
+
+The full HTTP stack cost nothing measurable. **Cost isn't about how much of your logic a test exercises. It's about whether the test leaves the process.**
+
+### Integration tests
+
+An **integration test** checks two or more parts working together, usually your code plus something **you didn't write**: a database, a cache, a message broker. "Does my repository's SQL actually work against Postgres?" is an integration question.
+
+### End-to-end tests
+
+An **end-to-end (E2E) test** walks through the system **the way a real user would**: sign up, log in, keep that session, add to cart, check out, see the confirmation. The key difference from an integration test is that E2E tests **can't take shortcuts**. An integration test may skip the auth middleware and insert an order directly; an E2E test must follow the real journey.
+
+### The test pyramid
+
+The **test pyramid** suggests a wide base of unit tests, fewer integration tests and a small cap of E2E tests. The shape is about **cost**: the higher you go, the slower, more fragile and more expensive (CPU, memory, wall-clock time) each test becomes. Lots of cheap tests, a few expensive ones.
+
+## Test sizes
+
+Because nobody agrees on what a "unit" is, a more useful model asks a different question: **what is this test allowed to touch?** This is how Google classifies tests:
+
+| Size | Allowed to touch |
+|---|---|
+| **Small** | One process only. No network, no database, no file system, no sleeping |
+| **Medium** | Anything on the same machine, such as Postgres or Redis in local containers. No internet |
+| **Large** | Anything |
+
+The big advantage is that it's **enforceable by a machine**. You can't detect whether a test is "really a unit test", but you can detect whether it opened a socket or touched the disk. The rule stops being an opinion.
+
+It also maps directly onto **flakiness**. A **flaky** test passes or fails depending on its environment rather than your code. Most flakiness comes from the outside world: networks, other services, their clocks and their outages. The more a test stays inside one process or one machine, the more deterministic it becomes.
+
+## Other kinds of testing
+
+You'll hear many other names. They aren't new scopes; they answer different questions:
+
+| Name | Question it answers |
+|---|---|
+| **Regression test** | Does this specific past bug stay fixed? |
+| **Functional test** | Does the feature meet its spec? Often written from the spec before building it |
+| **Performance test** | Is it fast enough, and how much memory and CPU does it use? |
+| **Security test** | Can someone bypass auth, reach data they shouldn't, or break isolation? |
+
+These combine freely with scope: a regression test can be a small unit test, and a security test can be a large E2E test. Know the vocabulary, but when designing a suite, "what does this touch?" is the question that matters most.
+
+## Test doubles
+
+Here's why many people never write tests. A realistic `checkout` handler validates the cart, writes the order to Postgres, **charges a card through a payment provider**, publishes an event and **sends a confirmation email**. How do you test that without charging real cards?
+
+You hand the code something that **looks and acts like** the real dependency: a **test double**, named after stunt doubles in films who do the dangerous scenes while looking like the actor. People casually call all of them "mocks", but there are five distinct kinds, a vocabulary that comes from Gerard Meszaros' book *xUnit Test Patterns*:
+
+| Double | What it does | Shop example |
+|---|---|---|
+| **Dummy** | Passed only because a signature requires it. **Never used** | A no-op logger given to `new OrderService(repo, logger)` |
+| **Stub** | Returns a **canned answer**, however and however often it's called | An exchange-rate client that always returns 0.9 |
+| **Spy** | A stub that also **records the calls** made to it, for the test to inspect later | A mailer that stores every email it was asked to send |
+| **Mock** | Has **expectations set up front** and fails the test itself if they aren't met | "`save` must be called exactly once with order 42" |
+| **Fake** | A **working but simplified** implementation with the same inputs and outputs | A user repository backed by an in-memory `Map` instead of Postgres |
+
+```ts
+// A fake: real behaviour, simplified storage
+class InMemoryUsers implements UserRepo {
+  private rows = new Map<string, User>();
+  async save(u: User) { this.rows.set(u.id, u); }
+  async findById(id: string) { return this.rows.get(id) ?? null; }
+}
+```
+
+<TestDoublePicker />
+
+## State vs interaction
+
+There are two ways to check what happened:
+
+- **State verification** asks the system what it looks like now. "Is the order status *paid*?" "Did stock go down by one?"
+- **Interaction verification** asks a double what it saw. "Was `publish` called exactly twice with `order.*` events?"
+
+Now imagine a teammate refactors checkout to publish **one combined event instead of two**. From the outside nothing changed: every subscriber ends up with the same data. The state test still passes. The interaction test fails, because the call count changed. That's a **change-detector test**: it breaks whenever the implementation changes, even when behaviour doesn't, and teams quickly learn to ignore it.
+
+<Callout kind="remember">
+**Assert what the system is, not how it got there.** Use interaction checks only when the interaction *is* the behaviour, such as "the receipt email is sent exactly once".
+</Callout>
+
+## Do not mock what you do not own
+
+A very common mistake goes like this. You mock the payment provider's SDK so `charge()` returns `{ success: true, newBalance: 120 }`. Tests pass. You deploy. Production fails, because the real response is shaped differently, uses other field names, reports duplicate charges another way and formats errors differently. **Every detail in your mock was your own guess**, and the test only echoed it back.
+
+The fix has two parts:
+
+1. **Wrap the third party** in a small interface you own, with your own success, failure and error types. Production code depends only on the wrapper. Because you own the interface, you may freely fake or mock it.
+2. Write **a few tests of the wrapper against the provider's sandbox** to prove your request and response shapes match reality. These run against test-mode APIs and never touch real money.
+
+```ts
+// You own this interface; the Stripe-specific code lives behind it
+interface PaymentGateway {
+  charge(orderId: string, amountCents: number): Promise<
+    { ok: true; chargeId: string } | { ok: false; reason: "declined" | "duplicate" | "unavailable" }
+  >;
+}
+```
+
+## Designing for testability
+
+Code is often hard to test because it **creates its own dependencies**. A handler that connects to Postgres and Redis inside its constructor leaves nothing a test can swap out.
+
+**Dependency injection** fixes this: pass dependencies in instead of creating them. DI frameworks exist, but at heart they all do this one thing.
+
+```ts
+// Hard to test: builds its own connections
+class CheckoutHandler {
+  private db = new Pool({ connectionString: process.env.DATABASE_URL });
+  private payments = new StripeGateway(process.env.STRIPE_KEY!);
+}
+
+// Testable: dependencies come from outside
+class CheckoutHandler {
+  constructor(private orders: OrderRepo, private payments: PaymentGateway, private mailer: Mailer) {}
+}
+```
+
+A helpful way to structure a whole service is **functional core, imperative shell**:
+
+- The **core** holds decisions, calculations and business rules as **pure functions**: values in, values out. Pricing, discounts, "can this order be cancelled?" There is nothing to mock, so testing is trivial.
+- The **shell** is a thin layer that talks to the outside world (database, payment provider, email). It's harder to test, but there's very little of it.
+
+Arrange code this way and you'll find you actually write the tests, because most of the logic is easy to test.
+
+## Real databases in tests
+
+The instinct is to replace the slow database with an in-memory fake, or with a different embedded database such as H2 in Java. You gain speed and lose **fidelity**. Look at the bugs that live in the data layer:
+
+- a misspelled column name
+- a missing index that makes a query slow
+- a forgotten unique constraint
+- a transaction that doesn't isolate what you thought it did
+- a JSON operator that exists in Postgres but not in the fake
+
+Every one of these lives in **exactly the layer you replaced**. So the better answer is: **use a real database in tests, and make it cheap.** Two techniques do that:
+
+1. **Transaction per test.** Open a transaction at the start, run the test inside it, **roll back** at the end. The database is clean for the next test and nothing is ever committed. This requires your code to accept a *transaction handle*, not just a database handle, which is dependency injection again.
+2. **Template databases.** Postgres can create a database as a copy of another. Run migrations once on a template, then give each test its own fresh copy in milliseconds. Because tests don't share a database, they can **run in parallel**.
+
+```sql
+-- once, after migrations ran on shop_template
+CREATE DATABASE test_42 TEMPLATE shop_template;
+```
+
+**Testcontainers** (available for most languages) starts a real Postgres container from your test code and hands you its connection string. A typical package pays about 7 seconds once to start Postgres, then each of its tests clones the template in milliseconds. That's a real database for roughly the cost of a coffee sip.
+
+## Faking the network
+
+For third-party APIs, wrap them in your own interface and fake that, as above. Sometimes, though, you want to test **the HTTP call itself**: that your client sets the right headers, retries properly or parses errors correctly.
+
+- Go's `net/http/httptest` starts a **real HTTP server on a real local port** inside the test. Point your client at it and the request travels over TCP exactly as in production. Node and Python have equivalent libraries.
+- In Node, **MSW (Mock Service Worker)** **intercepts requests at the network layer**, so you don't swap your client at all.
+
+The same tools let you test **your own handlers from the outside**, by sending real requests to them.
+
+## Controlling time
+
+A classic test: trigger some background work, `sleep(100)`, then check the result. It passes locally and in code review, then fails in CI, because the busy CI machine took 110 ms. The logic was fine; **the clock** was the problem. Raising the sleep to 500 ms only delays the next failure and slows every run.
+
+Two real fixes:
+
+1. **Wait for a condition, not a duration.** Have the work signal when it's done (a channel in Go, a promise or callback in Node) and wait for that signal.
+2. **Inject the clock.** Let code read the time from a clock object you pass in. In tests, you control it: jump forward an hour and check that the reservation expired, instantly.
+
+```ts
+interface Clock { now(): Date }
+function isExpired(reservation: Reservation, clock: Clock) {
+  return clock.now() > reservation.expiresAt;
+}
+```
+
+## Hermetic tests
+
+A **hermetic** test brings its own world. It doesn't need a database someone set up by hand or a service that must already be running; it starts everything it needs and tears it down afterwards. *Hermetic* means sealed. Only hermetic tests run the same on your laptop, a colleague's laptop and a CI runner.
+
+You've already seen the pieces: **Testcontainers makes a test hermetic about the database**, and **an injected clock makes it hermetic about time**.
+
+## Test-driven development
+
+**TDD** is a **workflow**, not a kind of test. You write the same unit or integration tests, just *before* the code.
+
+### Red green refactor
+
+| Stage | What you do | Why it matters |
+|---|---|---|
+| **Red** | Write a test for code that doesn't exist yet. Run it. It **must fail** | **Design.** You use the API before it exists. If the test is awkward to write, the interface is wrong, and you learn that in minutes |
+| **Green** | Write the **smallest** code that passes. Ugly is allowed | **Proof.** Seeing red turn green proves the test checks something. A test written after the code usually passes first time, so you can't tell whether the code is right or the test is empty |
+| **Refactor** | Clean up the code. Run the tests. Still green | The step people skip. It's **mandatory**, because green allowed ugly code on the promise you'd come back |
+
+### A worked example
+
+Requirement: an order can't jump from *pending* straight to *shipped*; it must be *paid* first.
+
+**Red.** Write a test that tries pending to shipped and expects an error. Run it: the move succeeds, so the test fails.
+
+```ts
+it("refuses to ship an unpaid order", () => {
+  const order = newOrder({ status: "pending" });
+  expect(() => order.moveTo("shipped")).toThrow("order must be paid first");
+});
+```
+
+**Green.** Add one `if` to `moveTo`. The test passes.
+
+**Refactor.** That `if` is a business rule sitting inside a method that also bumps a version number and appends to a history log. Extract it into a pure function, `canTransition(from, to)`, rerun the suite, and confirm it's still green. Now the rule is in the functional core where it belongs.
+
+### The TDD debate
+
+TDD has been argued about for two decades, and a few contributions are worth knowing:
+
+- **Ian Cooper's talk "TDD, Where Did It All Go Wrong"** argues that teams took "unit" to mean *class*: one test class per production class, everything else mocked. Every refactor then broke hundreds of tests, so people gave up. His point: **the unit is the behaviour**, tested through the module's **public interface**. Then internals can be rearranged freely. That's "assert state, not implementation" again.
+- **David Heinemeier Hansson (creator of Rails), "TDD is dead. Long live testing." (2014)** pushed back on test-first dogma and on bending designs around mockability, which led to a public series of conversations with Kent Beck and Martin Fowler.
+- **Kent Beck**, who popularised TDD, published **"Canon TDD"** in 2023 to restate what the loop actually is, because so many arguments were about different things.
+
+### When TDD fits
+
+TDD shines when **you know what the answer looks like but not yet how to produce it**: parsers (string in, structure out), pricing and tax rules, state machines like the order lifecycle above. Writing the expectations is easy and keeps you focused.
+
+It's a weaker fit when **you don't know the answer yet**: exploring an unfamiliar API, comparing designs, iterating on a feature whose shape is still unclear. A lot of backend feature work is like that, so treat TDD as a sharp tool for specific jobs, not a religion.
+
+## Flaky tests
+
+A **flaky test** passes and fails on the **same code** with no changes. Flaky tests are more harmful than missing ones because they **change team behaviour**: "it's just flaky, rerun it" becomes a reflex. Then one day a real failure appears, and the first instinct is to rerun instead of investigate.
+
+A 2014 study by Luo and colleagues examined 201 fixes to flaky tests in open-source projects. The top three causes:
+
+1. **Async wait**: starting work and waiting for it the wrong way, usually with a fixed sleep. Fix: wait for a condition.
+2. **Concurrency**: two things inside the test racing each other. Fix: proper synchronisation; Go, for example, now ships `testing/synctest` for testing concurrent code deterministically.
+3. **Test order dependency**: test B only passes if test A ran first, because A left behind a row, a global variable or a file. It works until someone adds a test in between or turns on parallel runs.
+
+What to do with a flaky test:
+
+| Option | Verdict |
+|---|---|
+| **Delete it** | Often fine. It wasn't protecting you anyway |
+| **Quarantine it** | Move it out of the blocking suite into one that still runs, tagged with an **owner, a date and a reason**, so someone is responsible for fixing it |
+| **Auto-retry it** | Avoid. It hides real failures, including real race conditions in production code |
+
+## Code coverage
+
+**Code coverage** is the percentage of your code that **executed** while the tests ran. Tools measure it by rewriting your code before building it: each function is split into **basic blocks** (straight runs with no branches), a counter is inserted at the top of each block, the tests run, and the counters are read. A counter still at zero marks code that never ran.
+
+The catch is in that definition: coverage records that code **ran**, not that anything **checked** it. A test that calls every function and asserts nothing scores 100%.
+
+### Line vs branch coverage
+
+Coverage isn't one number:
+
+- **Line coverage**: did each line run?
+- **Branch coverage**: was each direction of each decision taken?
+
+A function with one `if` and no `else`, tested only with the condition true, has **100% line coverage** but only **50% branch coverage**: the "condition false" path was never exercised.
+
+### Does coverage measure quality
+
+Everyone quotes 80%. The evidence is less flattering. Inozemtseva and Holmes (ICSE 2014) generated thousands of test suites for large Java programs and measured coverage against how many seeded faults each suite caught. The raw correlation looked strong, but mostly because **bigger suites both cover more and catch more**. Comparing suites of the **same size**, the correlation between coverage and effectiveness was only **low to moderate**. A coverage target alone does not give you an effective suite.
+
+Practical takeaways:
+
+1. Rough reference points, from Google's published guidance: **60% acceptable, 75% commendable, 90% exemplary**. No single number fits every product.
+2. **What's not covered matters more than what is.** The value of a coverage report is in its red lines: "nobody tests the refund path" is actionable; "we're at 78%" isn't.
+3. Mandate 100% and engineers write **low-value tests to hit the number**, then stop improving the suite.
+
+## Mutation testing
+
+If coverage can't tell you whether tests check anything, how do you test your tests? **Mutation testing** deliberately damages your code and sees whether the tests notice.
+
+- Each damaged copy is a **mutant**: `>` becomes `>=`, `+` becomes `-`, a return value becomes `0`, a condition becomes `true`.
+- Run the suite against each mutant. If any test fails, the mutant is **killed** (good). If everything still passes, it **survived**: your tests don't really check that code.
+- The **mutation score** is the percentage of mutants killed.
+
+A telling example: a pagination helper whose tests only assert "returns an array", "doesn't throw" and "length is greater than zero". Line coverage is 100%. Stryker, a popular mutation tool for JavaScript and other languages, generates 19 mutants and only 10 are killed, a score of about 53%. One survivor changes the loop condition from `i <= end` to `i < end`, so every page returns one item fewer, and **every test still passes**.
+
+Try the same thing on a shipping-fee function:
+
+<CoverageMutationLab />
+
+Mutation testing is slow (the suite runs once per mutant), so teams usually run it nightly or on critical modules rather than on every commit.
+
+## Complexity metrics
+
+Beyond measuring tests, tools can measure the code itself. Two complexity metrics are common.
+
+### Cyclomatic complexity
+
+**Cyclomatic complexity**, introduced by Thomas McCabe in 1976, counts the **independent paths** through a function. Formally, draw the function as a control-flow graph and compute **M = E − N + 2** (edges minus nodes plus two). The shortcut is **1 + the number of decision points**: each `if`, loop, `case`, `&&` and `||` adds one. A function with no branches scores 1; one `if` makes it 2.
+
+The usual guidance is **10 or less** per function, a threshold McCabe himself called reasonable but not magical. He also noted the obvious exception: a flat `switch` over 20 independent cases scores 21 yet is perfectly readable.
+
+It's also a hint for testing: a function with complexity 8 needs at least 8 test cases to cover every path.
+
+### Cognitive complexity
+
+**Cognitive complexity**, created by SonarSource, tries to measure **how hard code is to understand** rather than count paths. A flat `switch` adds very little. **Nesting** is what it punishes: an `if` inside a loop inside another `if` is hard to hold in your head, while three `if` statements in a row aren't.
+
+| Code shape | Cyclomatic | Cognitive |
+|---|---|---|
+| Long flat switch | High | Low |
+| Three levels of nesting | Moderate | High |
+
+Trust **neither number blindly**. Treat them as **flags** that point you at code worth reading, then decide as a team whether it needs work.
+
+## Static checks
+
+Some problems can be found **without running the code at all**:
+
+| Tool | What it does | What it doesn't do |
+|---|---|---|
+| **Linter** | Flags known-bad patterns: an ignored error return, a condition that's always true | Check syntax (the compiler's job) or prove logic correct |
+| **Formatter** | Rewrites code into one standard layout | Never changes behaviour |
+| **Type checker** | Flags type misuse, such as arithmetic on a string. Built into Go, Rust and TypeScript, usually live in the editor | |
+| **Static analysis** | An advanced linter that **follows values through the program** without running it, e.g. "this nullable value reaches a dereference" | |
+
+None of these settles "is this code high quality?". Quality is partly subjective, and no deterministic tool decides it. Linters such as ESLint or Go's analysers encode a community's hard-won rules, which helps, but the final judgement stays with the team.
+
+## Cheat sheet
+
+- A test is a second program that runs your program and makes claims; its main job is catching regressions in CI before merge.
+- Classify tests by what they touch: small (one process), medium (one machine), large (anything). Leaving the process is what costs time.
+- Dummy is unused, stub returns canned answers, spy records calls, mock enforces expectations, fake is a working simplified implementation.
+- Assert state, not interactions, unless the interaction is the behaviour (such as an email sent exactly once).
+- Don't mock what you don't own: wrap third parties in your own interface, plus a few sandbox contract tests.
+- Inject dependencies; keep business rules in a pure functional core behind a thin imperative shell.
+- Use a real database in tests, made cheap with transaction rollback, template databases and Testcontainers.
+- Never sleep in tests: wait for a condition or inject a clock. Hermetic tests bring their own world.
+- TDD is red (design), green (proof), refactor (mandatory). Great for known answers, weak for exploration.
+- Flaky tests: async waits, concurrency, order dependence. Delete or quarantine with owner, date and reason; don't auto-retry.
+- Coverage shows what ran, not what was checked; branch coverage beats line coverage; read the red lines.
+- Mutation score tells you whether tests notice broken code; complexity metrics and linters are flags, not verdicts.

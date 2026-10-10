@@ -1,0 +1,344 @@
+import { OpenApiPlayground } from "@/components/widgets/OpenApiPlayground";
+
+## Three copies of the same truth
+
+Take a small task board API. One of its endpoints, `POST /api/move`, moves a task between columns. It expects a JSON body with `taskId`, `to` and an optional `actor`. It returns `200` on success, `400` for a malformed body, `404` if the task doesn't exist and `502` if the move worked but couldn't be broadcast to other users.
+
+Where does that knowledge live? In three places:
+
+1. the **backend handler**, which parses the body
+2. the **frontend** code that calls `fetch` or axios
+3. a **document** (a wiki page, a README) written by whoever built the endpoint
+
+### How the copies drift
+
+1. A teammate decides `column` is a clearer name than `to`.
+2. They update the backend and the frontend together, because otherwise validation would fail.
+3. Nothing forces them to update the wiki, so they forget.
+4. Months later, a new engineer integrates the same endpoint on another page. They trust the document, send `to`, and get a validation error.
+
+### Why the network makes it worse
+
+Inside one codebase, a function has a **signature**. Rename a struct field or change a parameter from string to integer, and **every caller fails to compile**. You find the problem in seconds, on your own machine.
+
+Across an HTTP boundary there is **no signature**. The client and server are separate programs, possibly in different languages, and a renamed field or changed type is only discovered **at runtime**, often by a user.
+
+What's needed is a way to give remote calls a signature: a precise, **machine-readable** description of every route, parameter, body field and type, and every possible response, that tools can **enforce** rather than humans remembering to update. That's what **OpenAPI** is.
+
+## What OpenAPI is
+
+An **OpenAPI description** is just a file, written in **JSON or YAML**, that lists every endpoint of an HTTP API along with its **inputs, outputs and behaviour**.
+
+### Where it came from
+
+In 2010 a small startup called **Wordnik** had customers asking for client libraries in Python, PHP, JavaScript and more, each needing its own documentation. Engineer **Tony Tam** summed up the problem: teams code faster than they can document. His idea was to have the server **describe itself in a JSON file** and let programs do the rest. One program renders human-friendly docs from the file; another generates a client library in any language. The file is language-neutral; all it needs is the promise that it's true about your backend.
+
+Why a structured format instead of prose? Because software can **parse, search, transform and validate** it.
+
+### What one file gives you
+
+| Use | What you get |
+|---|---|
+| **Documentation** | Static or **interactive** docs (Swagger UI, Scalar, Redoc): read an endpoint, paste a body, add your token, send a real request and see the response |
+| **Client generation** | Typed functions for every endpoint in TypeScript, Python, Go and more, with no hand-written request code |
+| **Server generation** | Interfaces and boilerplate your handlers must implement, kept in sync with the contract |
+| **Request validation** | Middleware or gateways that check path params, query params and bodies against the spec, so you don't write validation twice |
+
+For the effort involved, few things you can add to a codebase pay back as much, whether you work on the backend, the frontend or infrastructure.
+
+### The definition in three parts
+
+The specification describes itself as a standard, **language-agnostic** interface to HTTP APIs that lets **both humans and computers** understand a service **without access to source code, documentation or network traffic inspection**. Each phrase matters:
+
+| Phrase | Meaning |
+|---|---|
+| Language-agnostic | Go, Node, Python, Java or PHP behind it makes no difference. It describes behaviour, not implementation |
+| Humans and computers | People read rendered docs; programs parse it to generate code and validators with no human involved |
+| Without source code, docs or traffic inspection | Nobody has to read handler code, trust a stale wiki or reverse-engineer the Network tab. The file is enough |
+
+## Four terms people mix up
+
+| Term | What it is |
+|---|---|
+| **OpenAPI Specification (OAS)** | The **rules**: which fields a description may contain and what they mean |
+| **OpenAPI Description (OAD)** | **Your file**, which follows those rules. Usually `openapi.yaml` or `openapi.json` |
+| **OpenAPI Initiative (OAI)** | The **organisation** that maintains the spec, part of the Linux Foundation |
+| **Swagger** | The **original name** of the spec. Today it's a family of tools, such as Swagger UI. "A Swagger file" usually means an OAD |
+
+### JSON or YAML
+
+Both formats are fully supported and interchangeable, and tools accept either. Most people write **YAML**, because it's less noisy and, unlike JSON, **allows comments**. YAML 1.2 is designed as a superset of JSON, so a JSON description is generally also valid YAML.
+
+### A short history
+
+| Year | What happened |
+|---|---|
+| 2010 | Wordnik describes its API in JSON and renders a UI from it; the project is named **Swagger** |
+| 2011 | Swagger 1.0 is open-sourced |
+| 2014 | Swagger 2.0 ships and adoption takes off |
+| 2015 | SmartBear acquires Swagger and donates the specification to a new Linux Foundation project, with founding members including Google, Microsoft, IBM and PayPal |
+| 2016 | The spec is renamed **OpenAPI**. Content unchanged, so OpenAPI 2.0 is Swagger 2.0 |
+| 2017 | OpenAPI 3.0 restructures the format (components, request bodies, servers) |
+| 2021 | OpenAPI 3.1 aligns schemas fully with JSON Schema |
+| 2025 | OpenAPI 3.2 is released |
+
+<Callout kind="tip">
+Check your tools before choosing a version. Many renderers and generators lag behind the newest release, so **3.1.x** is often the practical choice even when a newer version exists.
+</Callout>
+
+## Anatomy of a description
+
+### The minimum valid file
+
+```yaml
+openapi: 3.1.1          # version of the OpenAPI specification this file follows
+info:
+  title: Task Board API
+  version: 1.4.0        # version of YOUR API
+paths: {}
+```
+
+Notice the **two different versions**. `openapi` is the version of the *specification*, which tells tools how to read the file. `info.version` is the version of *your API*, which you bump as the API evolves.
+
+The required root fields are `openapi` and `info` (with `title` and `version`), plus **at least one** of `paths`, `components` or `webhooks`. Common optional root fields are:
+
+- **`servers`**: where the API lives
+- **`security`**: the authentication that applies to every operation by default
+- **`tags`**: named groups used to organise endpoints in the docs
+- **`components`**: reusable schemas, parameters, responses and security schemes, referenced with `$ref`
+
+### Servers
+
+`servers` is a **list**, because the same API usually runs in several places. Paths are written relative to these base URLs.
+
+```yaml
+servers:
+  - url: http://localhost:8080
+    description: Local
+  - url: https://api.taskboard.dev
+    description: Production
+```
+
+### Paths and operations
+
+`paths` is a map whose keys are endpoint paths, each **starting with a slash**. Each value is a **path item**: everything you can do at that address, with **one entry per HTTP method** (`get`, `post`, `put`, `patch`, `delete`, plus `head`, `options` and `trace`). Dynamic segments use curly braces, such as `/api/tasks/{taskId}`.
+
+Each method entry is an **operation**, with these common fields:
+
+| Field | Purpose |
+|---|---|
+| `summary` | One-line description |
+| `description` | Longer explanation; supports Markdown, including tables |
+| `tags` | Groups the operation in rendered docs |
+| `operationId` | A **unique** name across the whole file. Write it like a function name, such as `moveTask`, because generators turn it into the function you call |
+| `parameters` | Path, query, header and cookie inputs |
+| `requestBody` | The body and its media types |
+| `responses` | Every status code the operation can return |
+
+### Parameters
+
+A parameter has a `name`, an `in` (where it lives: **`path`, `query`, `header` or `cookie`**), a `required` flag and a `schema`.
+
+```yaml
+/api/events:
+  get:
+    operationId: listEvents
+    parameters:
+      - name: since
+        in: query
+        required: false
+        schema: { type: integer, minimum: 0 }
+        description: Last sequence number the client has seen
+      - name: Last-Event-ID
+        in: header
+        required: false
+        schema: { type: string }
+        description: Sent automatically by the browser when an event stream reconnects
+```
+
+**Path parameters must always be `required: true`.** If a path segment were optional, `/api/tasks/7` and `/api/tasks/` would be two different routes, which is something you model as two paths instead.
+
+### Request bodies
+
+`requestBody.content` maps a **media type** (the value of the `Content-Type` header) to a schema:
+
+| Media type | Typical use |
+|---|---|
+| `application/json` | Ordinary JSON APIs |
+| `multipart/form-data` | File uploads |
+| `application/x-www-form-urlencoded` | Classic HTML form posts |
+
+### Responses
+
+Responses are keyed by **status code, in quotes** (`"200"`, `"404"`), because YAML would otherwise read them as numbers. Range keys like `"5XX"` are also allowed. Each response needs a `description` and usually a `content` map in the same shape as request bodies.
+
+Here's the whole move operation. It documents, without anyone reading backend code, that `taskId` and `to` are required, that `actor` is optional and defaults to `guest`, and what every outcome looks like.
+
+```yaml
+paths:
+  /api/move:
+    post:
+      operationId: moveTask
+      summary: Move a task to another column
+      tags: [tasks]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [taskId, to]
+              properties:
+                taskId: { type: integer }
+                to:     { type: string, enum: [todo, doing, done] }
+                actor:  { type: string, default: guest }
+      responses:
+        "200":
+          description: Task moved
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Event" }
+        "400":
+          description: Invalid request body
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: No task with that ID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: Task moved, but the event could not be published to the message bus
+```
+
+### Schemas
+
+Schemas describe the shape of data, and they're what clients rely on most. Since 3.1 they are standard **JSON Schema**.
+
+| Type | Useful keywords |
+|---|---|
+| `string` | `minLength`, `maxLength`, `pattern`, `format` (e.g. `email`, `date-time`), `enum` for a fixed set |
+| `number`, `integer` | `minimum`, `maximum`, `exclusiveMinimum`, `multipleOf` |
+| `boolean` | |
+| `array` | `items` (the schema of each element), `minItems`, `maxItems` |
+| `object` | `properties`, `required`, `additionalProperties` |
+| `null` | Used with other types to allow null, e.g. `type: [string, "null"]` |
+
+Nest and combine these and you can describe practically any payload. Reusable shapes go under `components.schemas` and are referenced with `$ref`:
+
+```yaml
+components:
+  schemas:
+    Event:
+      type: object
+      required: [seq, type, taskId]
+      properties:
+        seq:    { type: integer }
+        type:   { type: string, enum: [task.moved, task.created] }
+        taskId: { type: integer }
+        actor:  { type: string }
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+security:
+  - bearerAuth: []
+```
+
+The `securitySchemes` and `security` blocks describe **authentication**: here, every operation expects a bearer JWT in the `Authorization` header unless an operation overrides it.
+
+<OpenApiPlayground />
+
+## Spec first or code first
+
+There are two ways to get an OpenAPI description, and the difference is **which one is the source of truth**.
+
+| Approach | How it works | Source of truth |
+|---|---|---|
+| **Code-first** | Write handlers first, then **derive** the description from code: annotations, comments, or the types and schemas you already wrote | The code. The file is a by-product |
+| **Design-first** (contract-first) | Write the description **before** implementing, then build the server, client, mocks and tests from it | The contract |
+
+Swagger itself started code-first, because Wordnik already had a working server to describe. Over time its authors argued that designing the contract first makes more sense, and many teams reach the same conclusion. Design-first lets **frontend and backend work start in parallel**, because the behaviour is agreed before either side writes code. The same applies when splitting work between people or automated coding tools: agree the contract once, then have one stream build the server and another the client without blocking each other.
+
+A sensible rule of thumb: when adding OpenAPI to an existing server, go code-first; when starting something new, go design-first.
+
+## Code-first in practice
+
+There are two flavours of code-first:
+
+- **Annotation-based**: special comments or decorators on each handler are parsed into a spec. Easy to bolt on, but comments aren't checked by the compiler, so they drift.
+- **Schema-in-code**: you define request and response shapes as real code, and a library produces the spec from them. Because the same objects also validate requests at runtime, the spec can't silently disagree with behaviour.
+
+A TypeScript example of the second flavour uses **Zod** for the shapes and **ts-rest** to attach them to routes:
+
+```ts
+const MoveTask = z.object({
+  taskId: z.number().int(),
+  to: z.enum(["todo", "doing", "done"]),
+  actor: z.string().default("guest"),
+});
+
+export const contract = c.router({
+  moveTask: {
+    method: "POST",
+    path: "/api/move",
+    body: MoveTask,
+    responses: { 200: Event, 400: ErrorBody, 404: ErrorBody },
+  },
+});
+
+// generateOpenApi(contract, { info: { title: "Task Board API", version: "1.4.0" } })
+```
+
+You never hand-write `openapi.json`. You only think about three things per endpoint: **the path, its inputs** (path and query params, headers, body) **and its responses** (status codes and schemas). The server, even if written in another language like Go, can simply serve the generated file for docs and tooling.
+
+Some frameworks are code-first by design. Python's **FastAPI** reads your handler signatures and type annotations and serves a complete `openapi.json` with no extra comments at all.
+
+## A design-first toolchain
+
+For a new project, here's a complete design-first pipeline in which one file drives every stage:
+
+| Stage | Tool | What it does |
+|---|---|---|
+| **1. Lint** | **Spectral** | Like ESLint for API descriptions. Flags missing descriptions, operations without an `operationId`, responses without schemas, missing `info.contact` and custom house rules |
+| **2. Mock** | **Prism** | Serves fake responses from the spec's examples and validates incoming requests, so the frontend can build before the backend exists |
+| **3. Client** | **openapi-typescript** with **openapi-fetch** | Generates TypeScript types for every path, parameter and body; calls are type-checked, so a misspelled field or wrong type is a **compile error** |
+| **4. Server** | **oapi-codegen** (Go), and equivalents in other languages | Generates the interface your handlers must implement. Change the spec without updating a handler and **the build fails** |
+| **5. Docs** | **Swagger UI**, **Redoc**, **Scalar** | Render interactive documentation with a "try it" button, from the same file |
+| **6. Contract tests** | **Schemathesis** | Generates many valid and invalid requests from the schemas, sends them to the **real server** and flags any response that breaks the contract |
+
+```bash
+npx @stoplight/spectral-cli lint openapi.yaml
+npx @stoplight/prism-cli mock openapi.yaml          # mock server on :4010
+npx openapi-typescript openapi.yaml -o src/api/schema.d.ts
+oapi-codegen -generate types,std-http-server -package api openapi.yaml > api/gen.go
+schemathesis run openapi.yaml --url http://localhost:8080
+```
+
+Look at what happens to the drift story from the start of the lesson. The teammate renames `to` to `column` **in the spec** and regenerates code. The Go server no longer compiles until the handler reads `column`. The TypeScript client no longer compiles anywhere the old name is used. The docs update themselves. Schemathesis would catch a server that still accepted the old field. **The drift is now impossible to miss.**
+
+<Callout kind="remember">
+The pipeline is: write the spec (by hand or from code), **lint** it, **mock** it, **generate** the client, **generate** server interfaces, **test** the server against it and **render** docs. One file is the single source of truth at every step. API gateways can also validate traffic against the same file.
+</Callout>
+
+## The industry standard
+
+OpenAPI is how the industry describes HTTP APIs. Large platforms publish their full descriptions so anyone can generate clients and docs from them. GitHub's and Stripe's are each hundreds of thousands of lines long, a sign of how big and long-lived those APIs are.
+
+A newer use: **tools for AI agents**. When an agent needs to call an HTTP API, an OpenAPI description tells it exactly which operations exist, what inputs they accept and what comes back, the same information a generated client needs.
+
+## Cheat sheet
+
+- Across a network boundary nothing enforces a signature, so API knowledge copied into backend, frontend and docs drifts.
+- OpenAPI is a JSON or YAML file describing every endpoint's inputs, outputs, types and auth, readable by humans and tools.
+- OAS is the rules, an OAD is your file, the OAI is the Linux Foundation body, and Swagger is the old name, now a tool family.
+- Root needs `openapi` (spec version) and `info` (title plus your API's version) plus paths, components or webhooks.
+- Paths start with a slash, use braces for dynamic segments, and have one operation per HTTP method.
+- Give every operation a unique, function-style `operationId`; generators turn it into the function name.
+- Parameters live in path, query, header or cookie; path parameters are always required.
+- Request bodies map media types to schemas; responses are keyed by quoted status codes, each with a description.
+- Schemas are JSON Schema: types, required lists, enums, bounds, nested objects and arrays, shared via `$ref`.
+- Code-first derives the file from code (Zod plus ts-rest, FastAPI); design-first makes the file the contract and lets teams work in parallel.
+- Design-first pipeline: Spectral lint, Prism mock, openapi-typescript client, oapi-codegen server, Scalar or Swagger UI docs, Schemathesis contract tests.

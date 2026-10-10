@@ -1,0 +1,266 @@
+import { CircuitBreakerLab } from "@/components/widgets/CircuitBreakerLab";
+import { ErrorHandlerMapper } from "@/components/widgets/ErrorHandlerMapper";
+
+## Errors are normal
+
+It's tempting to treat errors as rare accidents: the "exception" in exception handling. In a real backend they're routine. Database queries fail. External APIs time out. Users send malformed data. Business logic meets an edge case nobody imagined. Across millions of requests, every one of these happens every day.
+
+So the useful question is not *whether* your system will hit errors but **what it does when it does**. A **fault-tolerant mindset** means asking, for each piece of the system: how can this fail, how bad would it be, how would we find out, and what should happen next? This lesson is mostly about that way of thinking, with one concrete pattern, the global error handler, that every backend should have.
+
+## Kinds of errors
+
+### Logic errors
+
+A **logic error** is code that runs without crashing but **does the wrong thing**. These are the most dangerous kind precisely because nothing looks broken: no stack trace, no 500, no alert.
+
+Picture a shop where a coupon is applied twice under certain conditions, pushing the shipping cost negative. Every order goes through. Customers are happy. The company quietly loses money on each one, and nobody notices for weeks until someone reads the finance report.
+
+Common causes:
+
+- **Misunderstood requirements.** A rule from a product discussion is written down slightly wrong and then implemented faithfully.
+- **Incorrect algorithms.** A discount engine based on purchase history has an off-by-one in its tiers.
+- **Unconsidered edge cases.** What happens when a refund arrives for an order that was partly cancelled?
+
+The defences are good tests around business rules, careful review of money and security paths, and **business metrics** in monitoring (more on that below), because error rates won't reveal a logic bug.
+
+### Database errors
+
+Almost every request touches the database, so database errors can take down the whole system.
+
+| Kind | What it looks like | Typical handling |
+|---|---|---|
+| **Connection errors** | Database unreachable, overloaded, or the app's **connection pool is exhausted** (every pooled connection busy, new requests wait and time out) | Retry briefly, alert, scale or fix slow queries holding connections |
+| **Unique constraint violation** | Creating a user with an email that already exists | Translate into a clear `409 Conflict`: "an account with this email already exists" |
+| **Foreign key violation** | Creating an order with a `customer_id` that doesn't exist | Translate into a 4xx: the request references something missing |
+| **Query errors** | A typo in a table or column name, or a query so heavy it hits the statement timeout | Bugs to fix; return a generic 500 to the client |
+| **Deadlocks** | Two transactions each hold a lock the other needs, so neither can continue. The database kills one | Retry the killed transaction; keep lock order consistent |
+
+Some of these could be caught earlier by validation (an obviously malformed id), but **uniqueness can only be checked by the database**: two signups for the same email can pass your "does it exist?" check at the same moment. So the constraint is the real guard, and your job is to turn its error into a friendly response instead of letting it surface as a 500.
+
+### External service errors
+
+Modern products lean on other companies' services: payments (Stripe), email (Resend), object storage (S3), caches (a managed Redis), authentication (Auth0, Clerk). Rebuilding them yourself isn't realistic, so accept that each one is a **failure point you don't control**, and plan for it.
+
+- **Network problems**: connection timeouts, DNS failures, network partitions.
+- **Authentication errors**: expired or rotated API keys, missing permissions. Using a hosted auth provider doesn't make you secure by default; your own backend can still leak user data, for example through logs.
+- **Rate limiting**: providers cap how fast you can call them. A traffic spike or a bug that loops on an API call gets you `429 Too Many Requests`. Back off and retry, respecting the `Retry-After` header if the provider sends one.
+- **Outages**: even the largest cloud providers have incidents and maintenance windows. Have **fallbacks** for critical paths: if the cache is down, read from the database (more slowly); if the primary email provider fails, switch to a secondary.
+
+### Validation errors
+
+**Input validation errors** happen when a client sends data that breaks your rules:
+
+- **Format**: an email, phone number or date in the wrong shape.
+- **Range**: a quantity of -3, a title of 700 characters when the limit is 500, an array with 0 items when at least 1 is required.
+- **Required fields**: a missing `name`.
+
+These are the **easiest errors to handle** because you define the rules. A validation layer at the entry point rejects bad input early with a `400 Bad Request` (or `422`) and a list of field errors the client can show. It's also your first line of defence against malicious input.
+
+### Configuration errors
+
+**Configuration errors** appear when code moves between environments. A developer adds `OPENAI_API_KEY` to their local `.env`, the feature merges, and nobody adds the key to production.
+
+- **Bad outcome:** the app starts fine. Hours later, the first user who triggers the AI feature gets a 500.
+- **Good outcome:** the app **validates all required config at startup** and refuses to start, with a clear message about the missing key. With a rolling or blue-green deployment, the old version keeps serving traffic because the new one never becomes healthy, so users see nothing.
+
+<Callout kind="remember">
+**Fail fast at startup, not slowly in front of users.** A missing setting should stop the deploy, not wait for a customer to find it.
+</Callout>
+
+## Detecting problems early
+
+The best error handling starts **before** an error reaches a user. The goal is to notice trouble while it's small: a slowing query, a provider getting flaky, a cache that didn't warm up.
+
+### Health checks
+
+Expose an endpoint such as `/health` that load balancers, orchestrators and uptime monitors call every few seconds. They look at the **status code**, not the body: `200` means healthy, anything else means pull this instance out of rotation or alert someone.
+
+It's useful to distinguish two kinds:
+
+- **Liveness**: is the process alive and responsive? Cheap, and a failure means "restart me".
+- **Readiness**: can this instance do useful work right now? Config loaded, database reachable, required caches warmed. A failure means "don't send me traffic yet".
+
+### Checking that things actually work
+
+Being up isn't the same as working. Deeper checks, usually run on a schedule rather than on every health probe, catch the slow decay before it becomes an outage:
+
+| Area | What to check |
+|---|---|
+| **Database** | Connectivity, and the timing of a **representative query**. If a query that usually takes 50 ms now takes 2 s, something is wrong even though nothing has failed |
+| **Payments** | A periodic test transaction in the provider's test mode |
+| **Email** | Send a test message to an internal inbox and confirm it arrives |
+| **Auth** | Obtain and validate a test token against the provider |
+| **Core app state** | Config loaded, required caches populated, internal data consistent |
+
+## Monitoring and observability
+
+Monitoring gets its own lesson later; here is the mindset. You want to learn about errors quickly, as they happen, with **enough context to debug** them.
+
+- **Track errors from every source**: HTTP status codes, database errors, external-service failures, business-logic failures.
+- **Track performance, not just errors.** Rising latency, CPU, memory and falling throughput are often the **early warning** before failures start.
+- **Track business metrics.** A sudden drop in successful checkouts or logins can expose a problem when error rates look perfectly normal. That's how you catch logic errors.
+- **Log in a structured format** (JSON), with fields like `request_id`, `user_id`, `route` and `duration_ms`, so logs can be searched, filtered and aggregated in tools such as Grafana Loki or the ELK stack.
+
+```json
+{"level":"error","msg":"payment declined","request_id":"req_8f2c","user_id":4812,"provider":"stripe","code":"card_declined","duration_ms":412}
+```
+
+## Responding to errors
+
+### Recoverable vs non-recoverable
+
+The first response to an error largely decides whether it stays a blip or becomes an incident.
+
+| Error | Strategy | Examples |
+|---|---|---|
+| **Transient (recoverable)** | **Retry with exponential backoff and jitter**, a bounded number of times | Network blip, provider 503, connection pool briefly exhausted, deadlock victim |
+| **Persistent (non-recoverable for now)** | **Contain and degrade gracefully** | Serve cached data, hide a non-essential feature, show "recommendations unavailable" while the product page still works |
+
+Graceful degradation means the system **does less, but keeps doing the important things**. If the recommendations service is down, the product page should still render and checkout should still work.
+
+### Don't make it worse
+
+Retries have a dark side. If a downstream service is struggling and every caller retries three times, its load just quadrupled. That's a **retry storm**, and it can turn a partial slowdown into a full outage.
+
+Defences:
+
+- Cap retries, use backoff with jitter, and only retry errors that are actually transient.
+- Set **timeouts** on every outbound call, so a hung dependency doesn't tie up your threads and connections forever.
+- Use a **circuit breaker**. It wraps calls to a dependency and counts failures. After too many in a row it **opens**: calls fail immediately without touching the dependency, giving it room to recover. After a cool-down it goes **half-open** and lets a single trial call through. If that succeeds, it **closes** and normal traffic resumes; if not, it opens again.
+
+<CircuitBreakerLab />
+
+### Recovery
+
+Once the immediate response is in place, the system has to get back to normal.
+
+- **Automatic recovery** handles common failures without a human: restart a crashed process, rebuild a corrupted cache, fail over to a replica database or a secondary provider. Design these carefully, because an over-eager automatic action (a restart loop, a failover that flaps back and forth) can make things worse. Test them deliberately, by pushing services toward failure in a controlled way and seeing what happens.
+- **Manual recovery** covers what needs judgment. Write **runbooks**: documented, step-by-step procedures for known incidents, so anyone on call (including someone who joined last month) can act calmly. Then rehearse them; a runbook nobody has tried tends to fail at 3 a.m.
+
+**Data integrity comes first.** Servers can be rebuilt and code redeployed, but users, orders and payments are irreplaceable. Take regular backups, test restoring them, and keep transaction logs (such as Postgres write-ahead logs) so you can recover to a point in time.
+
+### Propagation
+
+Not every error should be handled where it occurs. A repository function that gets "no rows" doesn't know whether that's a 404 for the user or a bug; the code higher up has the context to decide. So errors often need to **propagate** upward.
+
+The skill is propagating them **in a controlled way**: catch low-level errors, **wrap** them with context ("loading book 123 for user 7"), and rethrow or return a higher-level error. The top of the chain then has a precise cause, the context, and a stack trace, and can log properly and choose the response.
+
+```go
+book, err := repo.GetBook(ctx, id)
+if err != nil {
+    return nil, fmt.Errorf("get book %d: %w", id, err) // wrap, keep the cause
+}
+```
+
+### Error boundaries
+
+An **error boundary** is a point where errors stop spreading. Inside one process, the global handler (next section) is a boundary that keeps one bad request from crashing the server. Between services, boundaries come from **timeouts** on every call, **separate processes** so one crash doesn't take others down, circuit breakers, and **message queues** for asynchronous work, so a failing consumer delays work instead of breaking the producer.
+
+## The global error handler
+
+Of all the patterns in this lesson, this one pays off most for the least effort. You set it up once, and it becomes the **final safety net** for every request.
+
+### The layers of a request
+
+A typical backend splits request handling into layers:
+
+```
+Request → Router → Handler → Service → Repository → Database
+```
+
+- The **router** picks a handler for the method and path.
+- The **handler** parses the body, validates it, and calls a service.
+- The **service** holds business logic and orchestrates one or more repository calls (fetch a user, then their books).
+- The **repository** functions each perform one database operation.
+
+An error can start in any of these layers.
+
+### The pattern
+
+Instead of handling errors in every layer, each layer lets them **bubble up**: by throwing in exception-based languages like TypeScript or Python, or by returning them up the call chain in Go. At the top sits a **global error-handling middleware** that sees every failed request.
+
+The middleware inspects the error's **type** and maps it to an HTTP response. You define a small set of error types (validation error, not found, conflict, unauthorized) and teach the middleware to recognize raw database errors too.
+
+```ts
+app.use((err, req, res, next) => {
+  if (err instanceof ValidationError)
+    return res.status(400).json({ message: "Invalid input", errors: err.fields });
+  if (err instanceof NotFoundError || err.code === "NO_ROWS")
+    return res.status(404).json({ message: err.message ?? "Not found" });
+  if (err.code === "23505") // Postgres unique_violation
+    return res.status(409).json({ message: "Already exists" });
+  if (err.code === "23503") // Postgres foreign_key_violation
+    return res.status(422).json({ message: "Referenced record does not exist" });
+
+  logger.error({ err, requestId: req.id }, "unhandled error");
+  return res.status(500).json({ message: "Internal server error" });
+});
+```
+
+### Worked examples
+
+For a book catalogue API:
+
+| Request | Where it fails | Raw error | Response |
+|---|---|---|---|
+| `POST /books` with a 700-character title (limit 500) | Handler | Validation error | `400` with field errors |
+| `POST /books` with a title that already exists | Repository insert | Unique violation | `409 Conflict`, "A book with this title already exists" |
+| `GET /books/123` for a book that doesn't exist | Repository select | "No rows" | `404`, "Book 123 not found" |
+| `POST /books` with an `author_id` that doesn't exist | Repository insert | Foreign key violation | `422` (some APIs use `404`), "Author does not exist" |
+| Anything unrecognized | Anywhere | Unknown | `500`, "Internal server error" |
+
+A consistent error body makes clients' lives easier:
+
+```json
+{
+  "code": 400,
+  "message": "Invalid input",
+  "errors": [{ "field": "title", "message": "must be at most 500 characters" }]
+}
+```
+
+<ErrorHandlerMapper />
+
+### Why it's worth it
+
+1. **You can't forget a case.** Without a central handler, every repository method needs its own "was that a unique violation?" check. Miss one and users see a confusing 500 instead of "already exists". With the global handler, the mapping exists once and covers every route.
+2. **Less duplication.** The same translation logic isn't copy-pasted into dozens of places, each a chance for a bug.
+3. **Safer by default.** Anything unrecognized falls through to a generic 500, so raw internals never leak by accident.
+
+## Security in error handling
+
+### Don't leak internals
+
+Raw database errors contain table names, column names, constraint names and sometimes fragments of SQL. Sending those to clients hands attackers a map of your schema, which makes SQL injection and other attacks much easier to craft. It also damages user trust.
+
+The rule: **every message a client sees is one you wrote.** The default branch of the global handler says "Internal server error" and nothing more. The details go into your logs, tagged with a request id that you can also return to the client so support can find the matching log line.
+
+### Login error messages
+
+Authentication is one of the most attacked parts of any app, and the **OWASP Cheat Sheet Series** has specific guidance for each auth flow. One rule applies to login: don't reveal which part failed.
+
+- Bad: "No account with this email" and "Incorrect password".
+- Good: "Invalid email or password" for both.
+
+With distinct messages, an attacker can run a list of emails against your login form and learn which ones have accounts, called **user enumeration**. Then they focus password guessing on known-valid accounts. The same thinking applies to "forgot password" (always say "if an account exists, we've sent an email") and signup flows.
+
+### Don't log sensitive data
+
+Logs travel further than you think. Busy systems generate huge volumes of them, ship them to third-party storage and analysis tools, and keep them for months. Logs have been the source of many real data breaches.
+
+Never log **passwords, API keys, tokens, full card numbers**, or personal data like email addresses and phone numbers unless you truly must. Log a **user id** and a **request or correlation id** instead; that's enough to trace what happened without exposing anyone.
+
+## Cheat sheet
+
+- Errors are routine; design every component around **how it fails**.
+- **Logic errors** don't crash; catch them with tests and **business metrics**.
+- Map DB errors: unique violation to **409**, missing row to **404**, foreign key to **422 or 404**, unknown to **500**.
+- Validation errors are the easiest: reject early with **400** and field errors.
+- **Validate config at startup** and refuse to start if anything required is missing.
+- **Liveness** says "restart me"; **readiness** says "don't route to me yet".
+- Retry **transient** errors with backoff and jitter; **degrade gracefully** on persistent ones.
+- Set **timeouts** on every outbound call and use **circuit breakers** to stop retry storms.
+- Wrap errors with context as they propagate; stop them at **error boundaries**.
+- One **global error handler** maps error types to responses; the default is a generic 500.
+- Login failures say "**invalid email or password**" to prevent user enumeration.
+- Never log secrets or personal data; log **user ids and request ids**.

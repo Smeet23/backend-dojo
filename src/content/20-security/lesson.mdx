@@ -1,0 +1,534 @@
+import { SqlInjectionLab } from "@/components/widgets/SqlInjectionLab";
+import { PasswordHashLadder } from "@/components/widgets/PasswordHashLadder";
+import { LoginRateLimiter } from "@/components/widgets/LoginRateLimiter";
+
+## What this lesson covers
+
+"Security" spans several layers, and each has its own body of knowledge:
+
+| Context | What it covers |
+|---|---|
+| **Browser security** | Cookies, local storage, what scripts on a page may do |
+| **Network security** | Transport: TLS, certificates, what an eavesdropper can see |
+| **Server security** | The operating system and infrastructure your process runs on |
+| **Backend security** | Weaknesses created by **your application code** |
+
+This lesson is about the last one: the mistakes backend engineers make in their own code, and the habits that prevent them. It won't make any app perfectly secure, because none is. Libraries change, new attack techniques appear, and every feature adds surface area. The real goal is a **mindset**: a healthy paranoia that runs in the back of your head every time you write a handler, a query or a cookie.
+
+## Think like an attacker
+
+Attackers don't care which framework or language you chose. They ask one question about your system:
+
+> **Where did the developer make an assumption?**
+
+Almost every vulnerability in this lesson traces back to an assumption that felt reasonable under a deadline:
+
+- The input from the form will be **clean** and in the expected shape.
+- The user is **who they claim to be**.
+- The request came from **our own frontend**.
+- Nobody will open the network tab, copy a request and **change its parameters**.
+
+When you build a feature you think about the **happy path**: users fill in forms correctly and click the buttons you designed. Attackers do the opposite. They poke at every boundary, send every input you didn't expect, and test every assumption one by one.
+
+<Callout kind="remember">
+The habit to build: every time you write code that touches outside input, ask **"what could go wrong here, security-wise?"** That one question prevents more bugs than any checklist.
+</Callout>
+
+## Injection
+
+Injection attacks are decades old, still common, and all share one root cause. Understand that cause once and a whole family of bugs makes sense.
+
+### Your app speaks many languages
+
+A backend constantly talks to other systems, each in its own language:
+
+| Talking to | Language | Special characters include |
+|---|---|---|
+| Database | SQL | `'` (string quote), `;` (end statement), `--` (comment) |
+| Browser | HTML and JavaScript | `<`, `>`, `"`, `&` |
+| Operating system | Shell commands | `;`, the pipe character, `&`, backticks, `$( )` |
+
+Each language has its own grammar and its own way of separating **commands** from **data**. Users talk to you in one context (a form field), and their input travels into another (a SQL query, an HTML page, a shell command). A character that is harmless text in one context can be **syntax** in another. That's where injection comes from.
+
+### SQL injection
+
+Picture a login handler for a notes app. It looks the user up by email, and it builds the query by **pasting** the input into a string:
+
+```ts
+// VULNERABLE: user input concatenated into SQL
+const sql = "SELECT * FROM users WHERE email = '" + email + "'";
+const rows = await db.query(sql);
+```
+
+On the happy path, Alice types `alice@notes.dev`, the query becomes `WHERE email = 'alice@notes.dev'`, and the database returns her row.
+
+Now someone types this into the email field instead: `' OR '1'='1' --`
+
+```sql
+SELECT * FROM users WHERE email = '' OR '1'='1' --'
+```
+
+Look at what each piece did:
+
+| Piece | Effect |
+|---|---|
+| The leading `'` | Closes the string your code opened, so `email = ''` becomes a complete (false) condition |
+| `OR '1'='1'` | Adds a condition that is always true. With `OR`, one true side makes the whole `WHERE` true |
+| `--` | Starts a SQL comment, hiding your leftover closing quote so the query is still valid |
+
+The result is effectively `SELECT * FROM users`: every row in the table, including password hashes, phone numbers and addresses. None of those characters is dangerous on its own. They become dangerous **because your code glued them into SQL**.
+
+It gets worse. The same trick can end your statement and start a new one, or use `UNION` to read other tables (payment details, API keys). Depending on the database and its configuration, attackers have used injection to read server files or even run OS commands. That's why SQL injection has been one of the most damaging bug classes for decades.
+
+### Code vs data
+
+Here's the root cause of every injection attack, in one sentence:
+
+> **Something that was meant to be data got interpreted as code.**
+
+String concatenation silently assumes the input contains no quotes, semicolons, comment markers or keywords. You can never guarantee that, and not only because of attackers: a perfectly honest customer named O'Brien will break that query too.
+
+### Parameterized queries
+
+The fix is to never mix the two in the first place. A **parameterized query** (also called a **prepared statement**) sends the **structure** and the **values** to the database separately:
+
+```ts
+// SAFE: structure and data travel separately
+const rows = await db.query("SELECT * FROM users WHERE email = $1", [email]);
+```
+
+The database parses `SELECT * FROM users WHERE email = $1` as code, sees `$1` as a **slot**, and fills it with the value from the second argument. Whatever is in that value is treated **purely as a string**. A quote inside it is just a character; it can't close anything. The attack input becomes a weird email address that matches no rows.
+
+The placeholder syntax varies (`$1`, `?`, `:email`), but the idea is universal, and **every modern driver supports it and every ORM uses it by default**. In practice you're vulnerable only when you deliberately bypass that, for example by building a raw query string with template literals.
+
+<SqlInjectionLab />
+
+Parameterization is the real fix, but it shouldn't be the only line. **Input validation** should have rejected `' OR '1'='1' --` long before it reached the query, because it doesn't look like an email. Validation is your first filter; parameterization is the guarantee that holds when validation misses something.
+
+<Callout kind="warn">
+Placeholders work for **values**, not for identifiers. You can't parameterize a table or column name. If users choose a sort column, map their choice through an **allowlist** (`{ "date": "created_at", "title": "title" }`) and never paste their string into the query.
+</Callout>
+
+### Least privilege for the database
+
+Suppose an injection bug slips through anyway. How much damage can it do? That depends on what the **database user** your app connects as is allowed to do.
+
+- Your app needs **DML**: `SELECT`, `INSERT`, `UPDATE`, `DELETE`.
+- It almost never needs **DDL**: `CREATE`, `ALTER`, `DROP`. Run migrations with a separate, more privileged account.
+
+With least privilege, an injected `DROP TABLE` simply fails. Many modern drivers also refuse to run **stacked statements** (several statements separated by `;` in one call) by default, which blocks the "end the query and start a new one" trick. Old drivers and some configurations don't, so don't rely on it.
+
+### NoSQL injection
+
+"We use MongoDB, so SQL injection doesn't apply" is true only in the narrowest sense. Mongo queries are objects, such as `{ email: "alice@notes.dev" }`, and those objects can contain **operators**: keys starting with `$` that mean things like "not equal" or "greater than".
+
+If your handler takes JSON from the request body and drops it straight into a query, an attacker can send an **object** where you expected a **string**. Instead of `"password": "hunter2"` they send a password field whose value is an operator object meaning "anything that isn't empty", and the query matches every user.
+
+It's the same root cause: the attacker controls the **structure** of the query, not just a value. The fix is the same idea too: validate that each field has the type you expect (a string is a string, not an object), and build queries from known fields rather than passing user objects through.
+
+### Command injection
+
+Same mechanism, different target: the operating system. Say your shop lets sellers upload product photos, and your handler calls an image tool through the shell, using a filename from the request:
+
+```ts
+// VULNERABLE: one string handed to a shell
+exec(`convert upload.png -resize 800x800 ${outputName}`);
+```
+
+A shell treats `;` as "run another command", a pipe as "send output to another program", and `&` as "run in the background". If `outputName` contains those, the shell runs whatever follows, with your server's permissions. Each shell has its own extra special characters, so trying to escape them by hand is a losing game.
+
+The fix mirrors parameterized queries: **pass the command and its arguments separately**, with no shell in between:
+
+```ts
+// SAFE: arguments go directly to the program, not through a shell
+execFile("convert", ["upload.png", "-resize", "800x800", outputName]);
+```
+
+Node's `execFile`/`spawn`, Go's `exec.Command`, and Python's `subprocess.run` with a list all work this way. The program receives `outputName` as one literal argument, whatever characters it contains. Better still, generate the output filename yourself instead of accepting it from the user.
+
+### The injection rule
+
+| Context | Safe API |
+|---|---|
+| SQL | Parameterized queries / prepared statements |
+| NoSQL | Typed validation, queries built from known fields |
+| OS commands | Command plus argument array, no shell |
+| HTML | Context-aware output encoding (see XSS below) |
+
+<Callout kind="remember">
+**Paranoia trigger:** whenever you build a string that **another system will interpret**, and it contains **user input**, stop. There is almost always an API that keeps structure and data separate. Use it.
+</Callout>
+
+## Authentication
+
+**Authentication** answers "who is making this request?", which in practice means "which row in the users table is this?". Get it wrong and attackers can impersonate users, read private data and act on their behalf. Account-takeover bugs make the news every week.
+
+### Consider an auth provider
+
+A basic login (check password, sign a token, verify it on each request) fits in an afternoon. Production-grade authentication is much bigger:
+
+- **Session management:** list every device a user is signed in on, and revoke one or all of them instantly, from the user's settings or from your admin panel.
+- **Social login:** "Sign in with Google/GitHub" means OAuth flows with redirects across frontend and backend.
+- **Account linking:** someone who signed up with email and password and later clicks "Sign in with Google" with the same email must land in the **same** account.
+- Password resets, email verification, MFA, suspicious-login detection, and many more edge cases.
+
+Each of these takes real time, and teams under pressure cut corners, hurting either security or user experience. A dedicated **auth provider** is a company whose whole job is this. It handles edge cases you haven't thought of, patches new attacks quickly, and often includes roles and permissions. For most early products the trade-off is worth it. Many teams revisit it later, when the bill grows large and they have the people to run auth themselves.
+
+Even with a provider, you still need to understand how authentication works, because you configure it, integrate it and decide what to trust. And you'll still meet the topics below.
+
+## Storing passwords
+
+Let's build password storage up from the naive version, fixing one attack at a time.
+
+### Plain text
+
+Store the password as typed, compare on login. It works, and it's a disaster:
+
+- **Breaches happen constantly**, through bugs, stolen backups, compromised vendors or a disgruntled insider. A leak exposes every password instantly.
+- **People reuse passwords.** A large share of users use the same email and password on many sites. Attackers take leaked pairs and try them on banks, shops and email providers. This is **credential stuffing**, and victims often never learn where the leak came from.
+- **Insiders** (developers, DBAs, contractors with database access) can read every password.
+
+### Hashing
+
+A **hash function** takes input of any length and produces a fixed-length output. It's **deterministic** (the same input always gives the same output) and **one-way** (you can't feasibly recover the input from the output).
+
+So: on signup, store `hash(password)`. On login, hash what the user typed and compare the hashes. A breach now leaks hashes, not passwords. Problem solved? Not yet.
+
+### Rainbow tables and salting
+
+Because hashing is deterministic, `hash("123456")` is the same in every database in the world. Attackers **precompute** huge tables mapping common passwords to their hashes for popular algorithms (these lookup tables are known as **rainbow tables**). After a breach, they just look each hash up. Every user with a common password is exposed in seconds, and two users with the same password have the same hash, which gives them away too.
+
+The fix is a **salt**: a random value, generated per user with a **cryptographically secure random number generator (CSPRNG)**, and stored next to the hash. You store `hash(salt + password)`.
+
+- Two users with the password `123456` now have completely **different** hashes.
+- A precomputed table is useless, because it would have to be rebuilt for every individual salt.
+
+The salt is not a secret; it sits in the same row. Its job is to make every hash unique.
+
+### Slow hashes
+
+Salting stops precomputation, but not targeted guessing. With a stolen database, an attacker can take one user's salt, hash millions of likely passwords with it, and compare. General-purpose hashes like **MD5** and **SHA-256** are designed to be **fast** (they're meant for checking file integrity), and a single rented GPU can compute **billions** of them per second. At that speed, every short password and every common pattern falls within days.
+
+So for passwords, use a hash that is **deliberately slow**: **Argon2id** (the current recommendation), **scrypt**, or **bcrypt** (the long-time default, still fine). They have a **cost** (or work) factor you tune so one hash takes a noticeable amount of time on your hardware, and Argon2id and scrypt also demand lots of memory, which makes GPUs far less effective.
+
+| | Fast hash (SHA-256) | Slow hash (Argon2id, ~250 ms) |
+|---|---|---|
+| Your login endpoint | Microseconds | A quarter of a second, which users don't notice |
+| Attacker guessing one user | Billions of guesses per second | A handful of guesses per second, per core |
+| Cracking an 8-character password | Days | Centuries |
+
+You don't manage the salt yourself with these libraries: `argon2.hash(password)` generates a salt and returns a single string containing the algorithm, cost settings, salt and hash, and `argon2.verify(stored, attempt)` checks it.
+
+<PasswordHashLadder />
+
+<Callout kind="tip">
+For a deeper, practical walkthrough of building auth correctly, the OWASP Password Storage and Authentication cheat sheets are excellent and kept up to date.
+</Callout>
+
+## Sessions
+
+Users shouldn't type their password on every request, so after a successful login you **remember** that they authenticated. That memory is a **session**.
+
+On successful login, the server:
+
+1. **Generates a session ID** with a CSPRNG, at least **128 bits** of randomness. That's so many possibilities that guessing a valid ID is hopeless. A predictable ID would let an attacker **hijack** someone else's session.
+2. **Stores it** in Redis (fast) or the main database, along with metadata: which user it belongs to, when it was created, when it expires (say 7 days), and the IP address and User-Agent at login. That metadata powers a "your devices" page and helps spot suspicious logins.
+3. **Sends the ID to the browser in a cookie.** The browser attaches it to every later request; the server looks it up, finds the user, and knows who's calling.
+
+Logging out, or "sign out everywhere", is simply deleting session rows.
+
+### Cookie flags
+
+Always set these on session cookies in production:
+
+| Flag | What it does | Protects against |
+|---|---|---|
+| **HttpOnly** | JavaScript can't read the cookie | An XSS bug stealing the session. (This is also why storing session IDs or tokens in localStorage is discouraged: any script on the page can read localStorage) |
+| **Secure** | Sent only over HTTPS | Someone on the same café Wi-Fi, a compromised router or a hostile network reading the cookie in transit |
+| **SameSite** | Controls whether the cookie is sent on cross-site requests | Cross-site request forgery (CSRF) |
+
+### SameSite
+
+| Value | Behaviour |
+|---|---|
+| **Strict** | Sent only on requests that originate from your own site. Even clicking a link to you from another site arrives without it |
+| **Lax** | Also sent when the user **navigates** to your site from elsewhere with a top-level GET (clicking a link), but **not** on cross-site POSTs, or on images, iframes and scripts embedded in other sites |
+| **None** | Sent on every request, including all cross-site ones. Requires Secure |
+
+For session cookies, use **Lax** or **Strict**, and never None unless you truly need cross-site cookies. Strict is the safest, but it means a user clicking a link to your app from an email arrives logged out on that first page, which is why Lax is the common choice.
+
+## JWTs
+
+A **JSON Web Token** takes the opposite approach to sessions. Instead of the server storing session data and handing out an ID, the server hands the **session data itself** to the client, signed so it can't be altered.
+
+### Structure
+
+A JWT is three Base64URL-encoded parts joined by dots: `header.payload.signature`.
+
+| Part | Contents |
+|---|---|
+| **Header** | Token type and signing algorithm, such as HS256 |
+| **Payload** (claims) | Standard claims like `sub` (subject: the user ID), `iat` (issued at) and `exp` (expiry), plus your own, such as `role` |
+| **Signature** | Computed over the header and payload with a secret key (or a private key) |
+
+The flow: the user logs in (with the same password hashing as before), the server builds a payload, signs it with a secret from an environment variable, and returns the token. The client sends it back in the `Authorization: Bearer` header on every request. The server **verifies the signature**; if it's valid, the payload hasn't been changed since the server signed it, so it can be trusted without a database lookup.
+
+That last part is the appeal: no session store to query, which makes it easy for many servers to authenticate requests independently.
+
+### The payload is readable
+
+Base64 is an **encoding**, not encryption. Anyone holding a JWT can decode the payload and read every claim. What they **can't** do is change it: edit "role" to "admin", and the signature no longer matches, so verification fails.
+
+So: **never put secrets or sensitive personal data in a JWT payload.** A user ID and a role are fine. An email might be acceptable. A password hash, a national ID number or internal notes are not.
+
+### Revocation
+
+With sessions, you revoke access by deleting a row. A JWT lives on the client, and a valid signature stays valid until `exp`. If a user's account is compromised and they ask you to "sign me out everywhere", pure stateless JWTs can't do it.
+
+The common mitigations:
+
+- **Short-lived access tokens plus refresh tokens.** Access tokens expire in 5–15 minutes. When one expires, the API returns `401` and the client exchanges a longer-lived **refresh token** for a new pair. Refresh tokens are stored server-side so they can be revoked, and are rotated on each use. A stolen access token is only useful for minutes.
+- **A denylist** of revoked token IDs checked on each request. This works, but it brings back exactly the server-side lookup JWTs were meant to avoid.
+
+### Where to keep the token
+
+- **localStorage** is common, but any JavaScript on your page can read it, so one XSS bug leaks every token.
+- An **HttpOnly, Secure cookie** keeps it away from scripts. But at that point you have most of the machinery of a cookie session anyway.
+
+### Sessions or JWTs
+
+For most web apps and SaaS products, **server-side sessions are the simpler, safer default**: revocation is instant, nothing sensitive sits on the client, and a shared store like Redis handles many servers without trouble. JWTs earn their place when separate services must verify identity without calling a central store, or for short-lived service-to-service tokens.
+
+If you do use JWTs: keep expiry short (minutes, not days), use a refresh flow with server-side storage and rotation, keep them in HttpOnly cookies, and verify the algorithm you expect rather than trusting the header.
+
+## Rate limiting
+
+Without rate limiting, nothing stops someone sending millions of login attempts. Two things go wrong: they eventually **guess a password** and take over an account, and the flood itself can **knock your server over**. Rate limiting is mandatory on authentication endpoints (login, signup, password reset, OTP checks) and useful everywhere. Make it **strict on auth endpoints** and more generous elsewhere.
+
+No single limit is enough, because attackers adapt. Layer them:
+
+| Layer | Example rule | Stops | Weakness |
+|---|---|---|---|
+| **Per IP** | 10 login attempts per minute per IP | Simple scripts from one machine | Attackers rotate IPs through botnets and proxies; offices and universities share one IP |
+| **Per account** | 5 failures in 15 minutes locks or slows that account | Many IPs hammering **one** account | **Password spraying**: one common password tried once against thousands of accounts |
+| **Global** | Alert when failed logins across the system exceed a baseline | Spraying across many accounts and IPs | A last resort; it triggers a response rather than blocking precisely |
+
+When the global layer trips, respond: alert the team, block abusive IP ranges, and show **CAPTCHAs** to separate humans from bots.
+
+<LoginRateLimiter />
+
+<Callout kind="warn">
+Hard account lockouts can be turned against your users: an attacker can deliberately fail logins to lock someone out. Prefer temporary, escalating delays or a CAPTCHA step, and make sure the real owner can always recover through a password reset.
+</Callout>
+
+## Authorization
+
+**Authentication** asks *who* you are. **Authorization** asks what you're **allowed to do**. Nobody confuses the definitions. The trouble is that implementations quietly assume that passing the first means passing the second.
+
+### The false sense of security
+
+A typical request passes through layers: **routing → handler** (parse and validate) **→ service → repository** (database). An auth middleware sits at the routing layer: it checks the session or token and rejects the request with `401` if it's missing or invalid. Often a permission check sits there too, for example "this user has `read:invoices`".
+
+Once a request is past those checks, it's tempting to treat it as fully trusted all the way down. That's the trap.
+
+Your SaaS app lets users fetch an invoice with `GET /invoices/5`. The user is logged in and has `read:invoices`, so the middleware lets them through. The repository then runs:
+
+```sql
+-- Vulnerable: any logged-in user can read any invoice
+SELECT * FROM invoices WHERE id = $1;
+
+-- Correct: scoped to the caller
+SELECT * FROM invoices WHERE id = $1 AND account_id = $2;
+```
+
+Invoice 5 belongs to a different customer, and the first query hands it over anyway. "Logged in with `read:invoices`" never meant "may read **every** invoice". The fix is to put the authenticated user (from the request context, set by the auth middleware) **into the query itself**.
+
+### BOLA
+
+That bug has a name: **Broken Object Level Authorization (BOLA)**. Authentication was checked, but not access to the specific **object**. It's devastating because it scales: a script can walk through `/invoices/1` to `/invoices/100000` and download every customer's billing data, or, on an update endpoint, rewrite their bank details.
+
+The fix is to carry authorization **all the way to the point of access**. Every query that reads or changes user data asks for "this record, **if this user may access it**". That applies to `SELECT`, `UPDATE`, `DELETE`, and `INSERT` (don't let users create records inside someone else's account).
+
+### 404 instead of 403
+
+A common pattern is to fetch the record first, then check the owner:
+
+```ts
+const invoice = await repo.findById(id);
+if (invoice.accountId !== ctx.accountId) return res.status(403).end();
+```
+
+That's correct, but it **leaks existence**. A `403` says "this invoice exists, it just isn't yours". Attackers can enumerate IDs, map what exists, and use that knowledge for follow-up attacks, including **social engineering** (calling support with a real invoice number).
+
+Do the scoped query instead. If it returns no rows, respond **404 Not Found**. From the outside, "doesn't exist" and "not yours" look identical.
+
+### BFLA
+
+**Broken Function Level Authorization (BFLA)** is about **functions** rather than individual records, typically admin features.
+
+Say your app has `GET /admin/invoices`, which returns every invoice across all customers. That's legitimate for support staff, so it's correctly unscoped. But the only thing protecting it is that the URL isn't linked anywhere in the normal UI. Admins and members log in the same way, and the route only checks "logged in". Any user who spots the URL (in a JavaScript bundle, in network traffic, by guessing) gets everything.
+
+Hiding something and hoping nobody finds it is **security through obscurity**, and it isn't security. The fix: admin functions require an explicit **role check** (`role = admin`) on top of authentication and permissions.
+
+### Predictable IDs
+
+Sequential IDs (`/invoices/1041`, `/invoices/1042`) make enumeration trivial and reveal business information, such as how many invoices you issue each month. Random identifiers like **UUIDs** make guessing impractical. They have trade-offs (larger, and fully random ones index less efficiently than sequential keys, which time-ordered UUIDv7 largely fixes), but they're a sensible default for anything exposed in URLs.
+
+<Callout kind="warn">
+Unguessable IDs are a **second layer**, not a fix. IDs leak through shared links, logs and screenshots. The scoped query is what actually protects the data.
+</Callout>
+
+### Horizontal vs vertical
+
+| Direction | Meaning | Examples |
+|---|---|---|
+| **Horizontal** | User A reaches user B's data, at the same privilege level | BOLA, and **IDOR** (Insecure Direct Object Reference), an older name for the same idea |
+| **Vertical** | A user reaches functions above their role | BFLA, privilege escalation to admin |
+
+### Building authorization that holds
+
+1. **Centralize it.** Put authorization rules in one clear layer or library that every request passes through, rather than ad-hoc checks scattered across handlers where one is easily forgotten.
+2. **Default deny.** Anything not explicitly allowed is refused. A new endpoint you forget to configure is locked, not open.
+3. **Test the negative cases.** Write automated tests that user A **can't** read user B's notes, a member **can't** call admin endpoints, and an anonymous request **can't** reach protected routes. Run them in CI so future changes can't silently break them.
+4. **Keep audit logs.** Record access to sensitive functions (who, what, when), and log **every failed authorization check**. A burst of failures from one account is someone probing your system, and you want to know early.
+
+## XSS
+
+**Cross-site scripting (XSS)** is when an attacker gets **their JavaScript running in another user's browser, on your site**. Because the script runs with your page's privileges, it can:
+
+- read anything on the page, including private data
+- make API requests **as the logged-in user** (the browser attaches their cookies)
+- read localStorage and any cookie that isn't HttpOnly
+- redirect to a convincing phishing page, or rewrite the page to trick the user
+
+### Stored XSS
+
+Your notes app lets users share notes publicly and comment on them in Markdown. To display a comment, the Markdown is converted to HTML and inserted into the page as raw HTML.
+
+If the conversion lets raw HTML through, someone can write a comment containing a `<script>` element (or an image tag with an `onerror` handler). It's stored in your database and served to **everyone who opens that note**, running in each of their browsers. It can quietly send their data to the attacker or act as them.
+
+Rendering user markup as HTML isn't wrong in itself; it's the only way to show formatted comments. But it's exactly where you must be careful. React makes the risk explicit: the only way to inject raw HTML is a prop called `dangerouslySetInnerHTML`. The name is a warning.
+
+### Reflected and DOM-based XSS
+
+| Type | Where the payload lives |
+|---|---|
+| **Stored** | Saved in your database and served to every viewer |
+| **Reflected** | In the request (often a URL parameter) and echoed straight back into the response, such as a search page printing "results for" plus the raw query |
+| **DOM-based** | Never touches the server; client-side code takes something like the URL fragment and writes it into the page with `innerHTML` |
+
+All three share the injection root cause: **user content treated as code** instead of data. This time the "other language" is HTML and JavaScript in the browser.
+
+### Defending against XSS
+
+1. **Encode output by default.** When you put user text into HTML, escape it so `<` becomes `&lt;` and so on. Modern templating engines and frameworks like React do this automatically for normal text. Most XSS appears exactly where that default is switched off.
+2. **Sanitize HTML you must render.** When you genuinely need user-supplied HTML (from Markdown, a rich-text editor), run it through a well-maintained **allowlist sanitizer** that keeps safe tags (`p`, `ul`, `a` with safe URLs) and strips everything else: scripts, event-handler attributes, `javascript:` links. Don't write your own with regular expressions; there are too many tricks. Sanitize on the server before storing (or at render time), and validate all user input along the way.
+3. **Content Security Policy (CSP).** A response header that tells the browser which scripts it may run: only from your own domain, and no inline scripts. Even if a script tag slips into the page, the browser refuses to execute it.
+4. **HttpOnly cookies**, so a successful XSS at least can't steal the session cookie itself.
+
+<Callout kind="remember">
+CSP is the **last line of defense**, not the fix. Fix the root cause with encoding and sanitizing; CSP catches what slips through.
+</Callout>
+
+More generally: every piece of user input deserves suspicion about **how you handle it**, **what it can reach**, and **how many resources it can consume**. A search query, a chunk of HTML and a 4 GB upload are all user input.
+
+## CSRF
+
+**Cross-site request forgery (CSRF)** abuses the fact that browsers attach cookies automatically.
+
+You're logged in to your bank, so your browser holds its session cookie. You then visit a malicious page. It contains a hidden form that auto-submits a POST to the bank's "transfer money" endpoint. Your browser sends that request, and because it's going to the bank's domain, it **attaches the bank's cookie**. The bank sees a valid session and performs the transfer. The attacker never saw your cookie; they just got your browser to use it.
+
+With modern defaults, CSRF is much less common than it used to be, but legacy apps and careless cookie settings still expose it. The defenses:
+
+1. **SameSite cookies.** With Lax or Strict, the browser doesn't attach your session cookie to a cross-site POST, which defeats the classic attack. Several major browsers (Chrome and Edge, for example) now treat cookies without a SameSite attribute as Lax, but set it explicitly rather than relying on browser defaults.
+2. **Never change state with GET.** Lax still sends cookies on top-level GET navigations, so a GET that deletes or transfers something is still exploitable.
+3. **CSRF tokens** for cookie-authenticated forms, especially in older server-rendered apps: a random per-session value embedded in each form and checked on submit. A foreign site can't read it, so it can't forge a valid request.
+4. **Check the Origin header** on state-changing requests and reject ones from origins you don't recognize.
+
+<Callout kind="warn">
+**CORS is not a CSRF defense.** CORS controls whether JavaScript on another origin can **read** your responses. A plain cross-site form submission is sent anyway, and the server still acts on it. A strict CORS policy helps a little (it blocks cross-origin JSON requests that need a preflight), but don't count on it.
+</Callout>
+
+APIs authenticated with an `Authorization` header (not cookies) are naturally immune to CSRF, because browsers don't attach that header automatically.
+
+## Misconfiguration
+
+Plenty of breaches involve no clever attack at all, just something left in the wrong state.
+
+### Secrets
+
+**Secrets** are API keys, database passwords, signing keys and encryption keys.
+
+- **Never commit them to source control.** Anyone with access to the repository, now or in future, can reach your database and third-party accounts. Public repositories are scanned for leaked keys within minutes.
+- Load them from **environment variables** or a **secret manager** (AWS Secrets Manager or Parameter Store, HashiCorp Vault, your platform's equivalent).
+- If one is committed by accident, **deleting the file is not enough**: it's still in the Git history and in every clone. **Rotate it immediately**: revoke the old key and issue a new one.
+
+### Debug mode in production
+
+In development you want everything: full stack traces in error responses, raw SQL in the logs, connection-pool details, request payloads. In production, all of that is a gift to an attacker: stack traces reveal file names, function names and libraries; logs may hold personal data.
+
+Set the log level deliberately per environment (DEBUG locally, INFO in production), turn off framework debug modes, and return generic error messages to clients while logging the details internally.
+
+### Security headers
+
+| Header | What it does |
+|---|---|
+| **Content-Security-Policy** | Limits where scripts, styles and other resources may load from; blocks inline scripts |
+| **X-Frame-Options** (or CSP `frame-ancestors`) | Stops other sites embedding your pages in an iframe, which prevents **clickjacking** (tricking users into clicking hidden buttons on your site) |
+| **Strict-Transport-Security** | Tells browsers to always use HTTPS for your domain |
+| **X-Content-Type-Options: nosniff** | Stops browsers guessing file types, so an "image" upload can't be run as a script |
+
+You rarely need to set these by hand. Most frameworks have a well-maintained security-headers middleware (helmet for Express, built-in middleware in Django, Echo and others) that applies sensible defaults in one line.
+
+## Boundaries and defense in depth
+
+Step back, and every vulnerability in this lesson (and thousands that aren't) has the same shape: **data crossing a boundary** between systems, languages, users or privilege levels.
+
+| Vulnerability | Boundary crossed |
+|---|---|
+| SQL injection | User input into the database's query language |
+| Command injection | User input into the shell |
+| XSS | User content into HTML and JavaScript in another user's browser |
+| Broken authorization | One user's request into another user's data or a higher role's functions |
+| CSRF | Another site's page into your authenticated session |
+
+Ask three questions whenever you write code at a boundary:
+
+1. **Where is data crossing a boundary here?**
+2. **What am I assuming about that data?**
+3. **What happens if that assumption is wrong?**
+
+### Defense in depth
+
+No single defense is perfect, so stack independent layers. An attacker then has to beat **all** of them at once.
+
+| Layer | Its job |
+|---|---|
+| 1. **Input validation** | Right after routing, strictly check every field's type, format and size, so handlers only see data in the exact expected shape |
+| 2. **Safe APIs** | Parameterized queries, argument arrays, auto-escaping templates. Never string-concatenate user input into another language |
+| 3. **Authorization at the point of access** | Scope every query to what the caller may touch, not just a check several layers up |
+| 4. **Headers and policies** | CSP, cookie flags, CORS and security headers limit the damage when something slips through |
+| 5. **Monitoring and logging** | Log failed logins and failed authorization checks, alert on unusual patterns, and respond early |
+
+Security isn't a feature you finish. It's a habit: thinking about boundaries and assumptions on every line you write.
+
+## Going further
+
+- **PortSwigger Web Security Academy:** free, thorough lessons with hands-on labs for every class of web vulnerability (SQL injection, XSS, CSRF, clickjacking, SSRF, authentication, OAuth, JWT attacks and more), from the makers of the Burp Suite testing tool.
+- **OWASP Top 10:** a regularly updated list of the most critical web application risks. **Broken Access Control** sits at the top, with Injection and Security Misconfiguration also on the list.
+- **OWASP Cheat Sheet Series:** short, practical guides per topic. Start with Authentication, Session Management, Password Storage and Authorization.
+
+## Cheat sheet
+
+- Attackers look for your **assumptions**: clean input, real identity, your own frontend, an unopened network tab.
+- Injection = **data interpreted as code**. Fix with APIs that keep structure and data apart.
+- SQL: parameterized queries always; allowlist identifiers; app DB user gets DML only.
+- Shell: command plus argument array, never one interpolated string.
+- Passwords: per-user salt plus a slow hash (Argon2id, scrypt or bcrypt); never MD5 or SHA-256.
+- Sessions: 128+ bit CSPRNG IDs in HttpOnly, Secure, SameSite=Lax or Strict cookies.
+- JWT payloads are readable; keep them short-lived, revocable via refresh tokens, and free of secrets.
+- Rate-limit logins per IP, per account and globally; alert and CAPTCHA when the global limit trips.
+- Scope every query to the caller (BOLA); role-check admin functions (BFLA); return 404, not 403.
+- XSS: encode output, sanitize HTML with an allowlist library, add CSP as the last line.
+- CSRF: SameSite cookies, no state changes on GET, CSRF tokens or Origin checks. CORS isn't a defense.
+- Secrets out of Git (rotate if leaked), INFO logs in production, security headers via middleware.

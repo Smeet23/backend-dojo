@@ -1,0 +1,200 @@
+import { ValidationPipeline } from "@/components/widgets/ValidationPipeline";
+
+## Why this matters
+
+Validation isn't a big theory topic like HTTP or databases. It's a set of habits that decide whether your API stays **correct** (no garbage in the database) and **safe** (no attacker-shaped input reaching your logic). Every byte that arrives from outside your server is untrusted, and validation is how you turn "anything at all" into "exactly what my code expects".
+
+Transformation is its partner: reshaping incoming data, such as converting `"20"` into `20` or lowercasing an email, so the rest of your code receives one predictable format.
+
+## Where validation runs
+
+A typical backend splits request handling into three layers:
+
+| Layer | Responsibility |
+|---|---|
+| **Controller** (handler) | HTTP concerns: read the input, **validate and transform it**, call the service, pick the status code, shape the response |
+| **Service** | Business logic: orchestrate repository calls, send emails, call webhooks and other APIs |
+| **Repository** | Talk to the data store: build and run queries against Postgres, Redis and so on |
+
+The flow is: request, then **route matching**, then the controller, then the service, then (maybe) the repository, then a response back out.
+
+Validation belongs at a precise spot: **after the route has matched** (so you know which endpoint, and therefore which rules, apply) and **before any meaningful work happens**: before calling a service, opening a transaction or touching the database. If the input is wrong, nothing expensive should have run yet.
+
+<Callout kind="remember">
+Validate at the **edge** of your system. Once data has passed the pipeline, the inner layers can trust its shape and stop re-checking it.
+</Callout>
+
+## What to validate
+
+Clients all over the world send you data in four places, and **all four** need checking:
+
+- the **JSON body**
+- **query parameters** (`?page=2&limit=20`)
+- **path parameters** (`/notes/:id`)
+- **headers** (`Authorization`, `Content-Type`, custom headers)
+
+Say the shop's "create product" endpoint requires a `name` that is a **string of 5 to 100 characters**. The check goes in order of strictness:
+
+1. Is `name` present at all? If not: "name is required".
+2. Is it a string, and not a number, array or boolean? If not: "expected string, received number".
+3. Is its length between 5 and 100? A 2-character name or a whole paragraph is rejected.
+
+You almost never write these checks by hand. Instead you describe the rules once as a **schema**, and a reusable piece of code (a middleware or utility) runs every incoming request against it. In TypeScript that might be Zod, in Python Pydantic, in Go struct tags with a validator library.
+
+```ts
+const CreateProduct = z.object({
+  name: z.string().min(5).max(100),
+  price: z.number().positive(),
+  tags: z.array(z.string()).max(10).default([]),
+});
+```
+
+## What happens without it
+
+Suppose the endpoint skips validation and a client sends this:
+
+```json
+{ "name": 0 }
+```
+
+The controller passes it to the service, which passes it to the repository, which runs an insert:
+
+```sql
+CREATE TABLE products (
+  name TEXT NOT NULL
+);
+
+INSERT INTO products (name) VALUES (0);  -- or a type error from the driver
+```
+
+Depending on the driver, one of two things happens. The database or driver **rejects the value**, the error bubbles up unhandled, and the client gets **500 Internal Server Error**: "something went wrong on our side". Or, worse, the value is **silently coerced** to the text `"0"` and stored, and now you have a product called "0". Either way the client gets no useful feedback, and your logs fill with noise.
+
+With validation, the request is rejected at the door with **400 Bad Request** and a precise message: "name: expected string, received number". The client knows exactly what to fix, and your service and database never saw the bad data.
+
+<Callout kind="tip">
+Some APIs return **422 Unprocessable Content** for input that is well-formed JSON but breaks the rules, and keep 400 for malformed syntax. Either is fine. Pick one convention and use it everywhere.
+</Callout>
+
+## Kinds of validation
+
+These categories aren't a strict taxonomy, but they help you think about **how strict** each field should be.
+
+### Type validation
+
+Does the value have the right **data type**: string, number, boolean, array or nested object? Types go all the way down: an array can require that **every element** is a string, and a nested object has its own typed fields.
+
+```json
+{ "tags": [1, 2] }
+```
+
+This fails with "tags[0]: expected string, received number", even though `tags` itself is an array.
+
+### Syntactic validation
+
+Does the value follow the required **structure**?
+
+- **Email**: a local part, an `@`, a domain and a top-level domain (`.com`, `.in`, `.dev` and thousands more).
+- **Phone number**: a country code plus the right number of digits for that country.
+- **Date**: a fixed format such as `YYYY-MM-DD`.
+- **IDs**: a UUID really looks like a UUID.
+
+### Semantic validation
+
+The value is well-formed, but does it **make sense**?
+
+- A date of birth **can't be in the future**.
+- An age of 365 is a valid number but nonsense; a sensible range is roughly 1 to 120.
+- A discount can't exceed 100%, and an order quantity can't be negative.
+
+### Complex validation
+
+Some rules involve **more than one field**:
+
+- **Relationship rules**: two fields must agree. `passwordConfirmation` must equal `password`, and `endDate` must be after `startDate`.
+- **Conditional rules**: one field's requirements depend on another. If `shippingMethod` is `"delivery"`, then `address` is required; if it's `"pickup"`, `address` is optional.
+
+## Transformations
+
+A **transformation** changes incoming data into the form your server needs. It can run **before** validation (so the validation can work at all) or **after** it (to tidy data for the service layer).
+
+### Casting query params
+
+Every query parameter arrives as a **string**. There's no such thing as a number in a URL.
+
+```http
+GET /products?page=2&limit=20
+```
+
+Your rules say `page` must be a number from 1 to 500, and `limit` a number from 1 to 100. If you validate first, `"2"` fails "must be a number" even though the client did nothing wrong. So the server **casts** (converts one type into another) the strings to numbers first, and then validates. Converting `"abc"` fails the cast, which is itself a validation error.
+
+### Normalizing values
+
+**Normalization** puts equivalent inputs into one canonical form:
+
+| Input | Normalized | Why |
+|---|---|---|
+| `"  Ada@Example.COM "` | `"ada@example.com"` | Trim and lowercase, so uniqueness checks and logins work |
+| `"919876543210"` | `"+919876543210"` | One phone format (E.164) for SMS providers |
+| `"05/11/2025"` | `"2025-11-05"` | One date format for storage |
+| missing `sort` | `"createdAt"` | Sane defaults, so the service never branches on "was it sent?" |
+
+### Why one pipeline
+
+Validation and transformation both deal with the **raw input**, so keep them together in a single **validation and transformation pipeline**, usually expressed by the same schema. All the rules about what an endpoint accepts live in one place, and nobody hunts through services to find where a field got lowercased.
+
+<ValidationPipeline />
+
+## Good error responses
+
+Two habits make validation errors genuinely helpful:
+
+1. **Report every problem at once.** If three fields are wrong, return three errors. Making the user fix one, resubmit, and discover the next is a frustrating loop.
+2. **Point at the field.** Use a path like `items[2].quantity` and a human-readable message.
+
+```json
+{
+  "error": "VALIDATION_FAILED",
+  "details": [
+    { "field": "email", "message": "Invalid email format" },
+    { "field": "phone", "message": "Expected string, received number" },
+    { "field": "dateOfBirth", "message": "Date of birth cannot be in the future" }
+  ]
+}
+```
+
+A nice side effect is that **clear validation errors act as documentation**. Send an empty body to a well-validated endpoint and the response lists every required field and its rules, which helps integrators when the docs are thin.
+
+<Callout kind="warn">
+Don't echo raw input back carelessly, and don't leak internals (stack traces, SQL) in validation errors. Describe the **rule** that was broken, not your implementation.
+</Callout>
+
+## Frontend vs backend validation
+
+A common mistake is assuming the frontend's form checks make server checks unnecessary. They solve **different problems**:
+
+| | Frontend validation | Backend validation |
+|---|---|---|
+| Purpose | **User experience**: instant feedback, no wasted round trip | **Security and data integrity** |
+| Required? | Nice to have | **Mandatory** |
+| Can be bypassed? | Yes, trivially | No, it's the last line of defence |
+
+A form that blocks an invalid email never even calls the API, which is great UX. But your API has **many clients**: the web app, a mobile app built by another team, scripts, and anyone with curl or an API client like Postman or Insomnia. None of those are bound by your form's JavaScript, and an attacker will skip it on purpose.
+
+So the rule is simple: be **as strict and specific on the server as possible**, regardless of what any client does. Frontend checks are a courtesy; backend checks are the contract.
+
+<Callout kind="remember">
+Ideally both sides share the same rules (for example, one schema used by the web app and the API), so the form and the server never disagree about what's valid.
+</Callout>
+
+## Cheat sheet
+
+- Validate **after route matching, before any business logic** or database work.
+- Check **body, query params, path params and headers**; all external input is untrusted.
+- Describe rules once as a **schema** run by a middleware or utility.
+- No validation means **500s or silently corrupted data**; validation gives a clear **400** (or 422).
+- **Type** = right data type, down to each array element; **syntactic** = right structure.
+- **Semantic** = makes sense (no future birth dates); **complex** = cross-field and conditional rules.
+- Query params are **always strings**: cast them before validating numbers.
+- **Normalize** emails, phones and dates, and fill **defaults**, in the same pipeline.
+- Return **all errors at once**, each with a field path and a readable message.
+- Frontend validation is **UX**; backend validation is **security and integrity**, and always required.

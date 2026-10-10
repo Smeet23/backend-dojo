@@ -1,0 +1,394 @@
+import { LoadBalancerSim } from "@/components/widgets/LoadBalancerSim";
+import { ReplicaLagLab } from "@/components/widgets/ReplicaLagLab";
+
+## Where part 1 left off
+
+Part 1 ended with a choice. **Vertical scaling** makes one machine bigger: simple, but capped, a single point of failure, and stuck in one location. **Horizontal scaling** runs many copies of the same server: more capacity, redundancy and geographic reach, at the price of new problems.
+
+This part works through those problems and the tools built for them:
+
+- making servers **stateless** so any copy can handle any request,
+- **load balancers**, their algorithms and **health checks**,
+- scaling the **database**: read replicas, sharding and managed distributed databases,
+- **CDNs** and **edge computing**, to beat the speed of light,
+- **asynchronous processing**, to cut the latency users feel,
+- **microservices** and **serverless**, and what they really buy you,
+- and the rules of thumb that tie it all together.
+
+## Statelessness
+
+Horizontal scaling only works if it **doesn't matter which instance handles a request**. That property is called **statelessness**.
+
+- A **stateful** server keeps something only it has: data in its own memory or on its own disk that other instances can't see.
+- A **stateless** server keeps nothing between requests that the others can't reach. Delete instance B and instances A and C behave exactly as before.
+
+The rule: **anything that must outlive a single request lives outside the app servers**, somewhere every instance can reach. This is why horizontal scaling has to be planned. It changes your code, not just your infrastructure, whereas vertical scaling is a slider in a cloud console.
+
+### Sessions
+
+A notes app uses session-based login. The user logs in, the server creates a session, stores it, and sends the session ID in a cookie. On each later request the server looks the ID up.
+
+Now run three instances. The user logs in through **A**, and A stores the session in a map in its own memory. The next request is routed to **B**. B has never heard of that session ID, so it returns **401 Unauthorized**. The user is "logged out" at random, depending on which server they hit. Bugs like this are maddening because they're intermittent.
+
+The fix is to store sessions in a **shared store** such as Redis. Any instance can then look up any session. (Stateless tokens such as JWTs avoid the lookup entirely, with their own trade-offs around revocation.)
+
+### File uploads
+
+The same thing happens with files. A user uploads a profile picture, instance A writes it to its local disk, and the next request for that picture lands on C, which returns 404. Store files in **object storage** that every instance can reach: **Amazon S3**, **Cloudflare R2**, or self-hosted **MinIO**.
+
+### Where shared state lives
+
+| State | Don't keep it on one instance; use |
+|---|---|
+| Sessions, shared cache, rate-limit counters | **Redis** (or Valkey, Memcached) |
+| Uploaded files, generated reports | **Object storage**: S3, R2, MinIO |
+| Application data | A **central database** (Postgres, MySQL), not a SQLite file on the server's disk |
+
+<Callout kind="remember">
+Once you scale out, treat every instance as disposable. If killing one at random would lose data or log someone out, you still have state on the instance.
+</Callout>
+
+## Load balancers
+
+With several instances, something has to decide **which instance gets each request**. That's the **load balancer** (LB), and setting one up is usually the first step of horizontal scaling.
+
+Clients send requests to the load balancer's address, not to a server. The LB picks an instance using its **algorithm**, forwards the request, and passes the response back to the client. It's a middleman; the interesting part is how it chooses. Managed options include AWS ALB, Google Cloud Load Balancing and Cloudflare; self-hosted ones include Nginx, HAProxy and Envoy.
+
+### Round robin
+
+**Round robin** sends requests in rotation: A, B, C, A, B, C. It works well when:
+
+- the servers have the **same capacity**, and
+- requests cost **roughly the same**.
+
+It breaks when requests differ a lot. Imagine two endpoints in the shop:
+
+- `GET /profile`: a simple indexed `SELECT`, about 50 ms.
+- `POST /checkout`: calls a payment provider, then writes to a large, heavily indexed `orders` table (every index must be updated on insert), about 2 s.
+
+Round robin routes blindly. If the traffic pattern happens to line up with the rotation, the expensive requests pile onto one server while the others sit idle.
+
+### Weighted round robin
+
+If servers differ in size, say A has 4 vCPUs and B and C have 2, give A a **weight** of 2. The rotation becomes A, A, B, C, A, A, B, C, so A gets twice the share. It fixes unequal **servers**, but it still knows nothing about unequal **requests**.
+
+### Least connections
+
+**Least connections** sends each request to the server with the **fewest requests in progress right now**. The insight is that a slow request stays open for its whole duration: while checkout waits on the payment provider, its connection to the server is active. A server busy with heavy work naturally shows more active connections and gets skipped.
+
+Walk through it with three idle servers:
+
+1. Request 1 (heavy, 2 s) goes to A.
+2. Request 2 (light) goes to B, which has zero.
+3. Request 3 (light) goes to C.
+4. Request 4: A is still working on the checkout, while B and C have finished. It goes to B, not A.
+
+<Callout kind="tip">
+Clients and LBs usually keep connections open across many requests (HTTP/1.1 keep-alive, HTTP/2 multiplexing). Modern load balancers therefore count **active requests**, not raw TCP connections. The idea is the same: prefer the least busy server.
+</Callout>
+
+**Weighted least connections** combines both ideas for servers of unequal size.
+
+### Other algorithms
+
+- **Least response time**: prefer the servers that are answering fastest. A struggling server slows down and automatically gets less traffic.
+- **Resource-based**: ask each server for its CPU and memory use and favour the least loaded.
+- **Hash-based** (for example on client IP or a user ID): the same client always lands on the same server. Useful for caches, but it reintroduces stickiness, so use it deliberately.
+
+They all answer the same question: which instance gets the next request?
+
+<LoadBalancerSim />
+
+### Health checks
+
+Servers die: out of memory, a bad deploy, a full disk. Without help, the load balancer keeps sending users to the dead one, and every request routed there fails with a **502 Bad Gateway** or **503 Service Unavailable**. With round robin, roughly a third of all requests fail.
+
+**Health checks** fix this:
+
+1. The LB sends a cheap request, such as `GET /health`, to **every** server on a schedule (every few seconds).
+2. A server that answers **200** stays in rotation.
+3. A server that fails (an error, a timeout, or several failures in a row) is **taken out of rotation**. Real traffic goes only to the healthy ones.
+4. The LB **keeps probing** the removed server. When it answers 200 again, it's added back.
+
+```ts
+app.get("/health", async (req, res) => {
+  // Cheap: no heavy queries. Optionally check that critical dependencies respond.
+  res.status(200).json({ status: "ok" });
+});
+```
+
+Keep the health endpoint fast and cheap so the checks themselves add no meaningful load. A deeper "readiness" check that pings the database is useful too, but be careful: if the shared database blips, every server fails its check at once.
+
+## Scaling the database
+
+Once state lives outside the app servers, scaling the app tier is easy: add instances behind the load balancer. The **database** is different. It **is** the state. You can't just clone it, because every copy must agree on the data, and coordinating that is the hard part. Meanwhile, all those app servers are hammering one database machine.
+
+### Read replicas
+
+Most applications **read far more than they write**; for typical SaaS products, reads are commonly 70–90% of queries. **Read replicas** exploit this:
+
+- One **primary** (older docs say master) accepts **all writes**: `INSERT`, `UPDATE`, `DELETE`.
+- Several **replicas** hold a copy of the data, kept up to date by the database's built-in **replication**, and serve **only reads**.
+
+```text
+            writes
+App ───────────────────▶ Primary (us-east)
+ │                          │ replication
+ │  reads                   ▼
+ └────────────────▶ Replica (Mumbai), Replica (Frankfurt)
+```
+
+Two wins:
+
+- **Less load on the primary**: if 80% of queries are reads, moving them to replicas leaves the primary handling a fraction of its old load.
+- **Lower latency far away**: put replicas (and app servers) in other regions, and users there read from nearby.
+
+### Replication lag
+
+Replication isn't instant. Changes travel from the primary to each replica over the network, and between continents that takes hundreds of milliseconds at best. That delay is **replication lag**.
+
+Here's the classic bug. A user in Mumbai changes her name. The write goes to the primary in the US, which commits it and returns **200 OK**. The page immediately re-fetches her profile. That's a read, so it goes to the **Mumbai replica**, which hasn't received the change yet. The page shows the **old name** right after saying "Saved". For a profile name it's confusing; for a balance or an invoice it can be a real problem.
+
+<ReplicaLagLab />
+
+Common mitigations, each a trade-off:
+
+| Approach | How | Cost |
+|---|---|---|
+| **Read your writes** | After a user writes, route that user's reads to the primary for a short window | More load on the primary; slower reads far away |
+| **Wait for replication** | Track how far each replica is behind and make the read wait until it has caught up | Slower reads during the wait |
+| **Design the frontend for it** | Show the value the user just submitted (optimistic UI) instead of re-fetching instantly, or delay the re-fetch | Can still show stale data if the lag is longer than expected |
+
+<Callout kind="remember">
+Distributed databases almost always trade some **consistency** for scale or latency. Know which reads must be fresh (balances, permissions) and route those to the primary.
+</Callout>
+
+In practice, managed services such as **Amazon RDS**, **Google Cloud SQL** and **Azure Database** make adding replicas a few clicks, and many drivers and proxies can route reads automatically. You rarely build replication yourself, but you need to understand lag to avoid the bugs it causes.
+
+### Sharding
+
+Replicas spread **reads**, but every write still goes to one primary, and every replica still holds **all** the data. Picture the `orders` table of a large marketplace with billions of rows. Even with an index, queries slow down, and one machine can't take the write volume.
+
+**Sharding** (horizontal partitioning) splits one table's **rows** across several database servers. Each **shard** holds a subset of rows and handles their reads and writes.
+
+The most important decision is the **shard key**: the column that decides which shard a row lives on. A good shard key:
+
+- **matches your main access pattern**, so most queries hit **one** shard, and
+- **spreads load evenly**, so no shard is much hotter than the others.
+
+| Shard key for orders | Query "orders for user 5" | Write load |
+|---|---|---|
+| `hash(user_id)` | Hits one shard | Spread evenly across shards |
+| Order date (one shard per month) | Must ask **every** shard | All new orders hit **this month's** shard: a hot spot |
+
+A **routing layer**, in your application or in a database proxy, works out which shard holds the data before querying it. Sharding fixes both problems: each shard scans fewer rows, and several machines share the request volume. In exchange, queries across shards (joins, global sorting, aggregates) become expensive, and **re-sharding** later, when one shard fills up, is a serious project.
+
+### Managed and distributed databases
+
+A newer generation of databases handles replication, sharding and distributed transactions for you: **PlanetScale** (MySQL, built on Vitess), **Neon** (serverless Postgres), **CockroachDB**, **YugabyteDB**, and the managed offerings of each cloud.
+
+Unless your team has deep database-operations experience, **don't run your own replicated, sharded database cluster**. Replication, failover, sharding and especially backups are easy to get subtly wrong, and the cost of getting them wrong is losing customer data. Pick a provider based on features, pricing and your team's familiarity, and plug in the connection string.
+
+You still need the concepts, because the provider asks you to make the decisions: which regions get replicas, how often to back up, what to shard on, and which reads tolerate lag.
+
+## CDNs
+
+Part 1's caches lived inside your data center. A **CDN** (content delivery network) is a cache spread **around the world**.
+
+### The speed of light
+
+Light in optical fibre travels at about 200,000 km per second, roughly two thirds of its speed in a vacuum. A round trip from Tokyo to a server in Virginia covers about 20,000 km of cable, which sets a floor of about **100 ms** before your server does anything. Real routes aren't straight, so it's usually more. No code optimisation can beat that.
+
+Add the rest of a typical request and it adds up:
+
+| Step | Rough cost |
+|---|---|
+| Network round trip, Tokyo to Virginia | 100–150 ms |
+| TCP and TLS setup for a new connection | One or two more round trips |
+| Parsing the request, routing, deserializing JSON | A few ms, more for large payloads |
+| Database queries | Tens of ms |
+| External API calls | 100–300 ms |
+
+After you've tuned queries and added Redis, **distance** is often the biggest remaining cost for faraway users.
+
+### What a CDN gives you
+
+A CDN runs many **points of presence (PoPs)**, also called **edge locations**, in cities around the world. A user in Tokyo talks to a PoP in Tokyo. If the content is cached there, the round trip drops from over 100 ms to a few milliseconds.
+
+- **Latency**: content is served from near the user.
+- **Less origin load**: cached responses never reach your servers, so you scale your origin less.
+- **Protection**: a large CDN sits in front of your origin and absorbs abuse. In a **DDoS** attack, thousands of compromised machines flood you with requests. Without protection, your servers either fall over or, with autoscaling, scale up and hand you an enormous bill. A CDN such as Cloudflare spreads the flood across its global network, filters obvious attack traffic, and challenges suspicious clients (for example with a CAPTCHA) before they reach you.
+
+### What to put on a CDN
+
+- **Static assets**: JavaScript and CSS bundles, images, fonts, video, and the HTML of static sites. A built React app is typically served entirely from a CDN.
+- **Some API responses**: data that's the same for many users and changes rarely, such as a product catalogue or public blog posts, using `Cache-Control` headers.
+
+When cached content changes, you **purge** it. Many CDNs support **cache tags**: tag every response that contains a given product with `product-42`, and when that product changes, purge the tag to drop all of them at once. The next request fetches fresh content from the origin and re-caches it.
+
+## Edge computing
+
+CDN locations are called the **edge** because they're at the edge of the network: the first stop for a user's traffic, often inside or right next to their internet provider. A classic CDN only **returns stored files**. **Edge computing** runs **your code** at those locations before (or instead of) going to the origin.
+
+Since there are far more edge locations than data centers, the round trip to an edge function is short, so even if the code takes as long as it would at the origin, the user gets an answer much sooner.
+
+Good uses:
+
+- **Rejecting bad requests early.** Verifying a JWT signature or checking a session at the edge means an unauthenticated request from Tokyo gets its **401** in a few milliseconds, and never costs the origin anything. Only valid requests travel across the ocean. (Checking a session needs the session store to be reachable from the edge, so stateless token checks are the easier fit.)
+- **Personalisation by location or language**: send a Japanese-language user to the Japanese version straight away.
+- **Validation, redirects, A/B routing**, and deciding which origin should get a request.
+
+Why not run everything at the edge?
+
+- **Small resources.** Edge machines are shared and run each function with tight CPU-time and memory limits.
+- **Restricted runtimes.** Platforms like Cloudflare Workers run code in **V8 isolates** (the JavaScript engine from Chrome). There's no local file system, limited networking, and not every library works.
+- **Data is far away.** Your database usually lives in one region, so edge code that queries it pays the long round trip anyway.
+
+So the origin stays. Move small, latency-sensitive decisions to the edge and let it work alongside the origin.
+
+## Asynchronous processing
+
+Some work doesn't need to finish before you respond. **Asynchronous processing** moves it out of the request, which cuts the latency the user **feels**. Unlike horizontal scaling, which you adopt once you outgrow one machine, this is worth doing from day one.
+
+The test is simple: **does the user need to see the result of this step in this response?** If you rename a user, yes: the next page load must show the new name, so the update happens before you return 200. Many other steps can wait.
+
+### Inviting a teammate
+
+A project-management SaaS lets admins invite people by email. The naive handler:
+
+1. Validates the input and checks the person isn't already a member (database, ~20 ms).
+2. Inserts an invite row with `status = 'pending'` (~20 ms).
+3. Calls the email provider's API to send the invite (~300 ms, and occasionally seconds, because it's someone else's infrastructure).
+4. Returns 200.
+
+The admin watches a spinner for 350 ms or more, and if the email provider is down, the invite fails even though nothing is wrong with your app.
+
+The async version does steps 1 and 2, **pushes a "send invite email" job onto a queue**, and returns 200 right away. The UI shows "Invited (pending)" after about 50 ms. A worker sends the email moments later, with retries if the provider is having a bad day.
+
+### Producers, queues and workers
+
+```text
+API server (producer) ── push job ──▶ Queue (Redis-based, RabbitMQ, SQS, Kafka)
+                                          │
+                                          ▼
+                                  Worker (consumer) ──▶ email provider
+```
+
+- The **producer** is your API server; it creates the job.
+- The **queue** stores jobs durably until a worker takes them.
+- The **worker** (consumer) pulls jobs and runs them. It can be the same codebase started as a separate process, or a separate service. Either way, workers **scale independently** of the API.
+
+In Node.js, a common setup is **BullMQ** on a managed Redis (such as Upstash or ElastiCache), which handles retries, backoff, scheduling and rate limiting. Other ecosystems have equivalents: Celery and RQ for Python, Sidekiq for Ruby, and cloud queues such as SQS.
+
+### What to make async
+
+- **Emails and notifications.**
+- **Media processing**: after a video upload finishes, a platform queues thumbnail generation, transcoding into several resolutions and subtitle generation. Users expect this to take minutes.
+- **Heavy deletes**: deleting a ten-year-old account means removing millions of rows across many tables (children before the `users` row, because of foreign keys). Done in the request, it could take many seconds. Instead, verify the request, mark the account as deleted (so it disappears immediately), log the user out, and let a background job remove the data.
+- **Reports, exports, image resizing, webhooks to third parties.**
+
+<Callout kind="tip">
+Async isn't free: you now need retries, idempotent jobs (a job may run twice) and a way to see failed jobs. It's still one of the cheapest, highest-impact latency wins available.
+</Callout>
+
+## Monoliths and microservices
+
+"Split it into microservices" is a common answer to "how do we scale?". It deserves a closer look.
+
+A **monolith** is **one deployable unit**. Auth, orders, payments and notifications are modules in one codebase that ship together as one application. It's **simple to develop, test, debug and deploy**, and refactoring across modules is easy. And a monolith **scales horizontally just fine**: run more copies behind a load balancer.
+
+So why split it? Mostly to scale **teams**, not machines. The problems appear with **many developers** (think well over a hundred working on one product):
+
+- **Deployment coupling**: the payments team has an urgent fix ready, but `main` also holds the notifications team's half-finished feature. Everything ships together, so someone waits. Feature flags help; at small team sizes it rarely hurts.
+- **Uniform scaling**: notifications are cheap, while payments are CPU-hungry and critical. In a monolith you scale everything together.
+- **One tech stack**: a blogging platform might want Node.js for its markdown and rendering ecosystem but Go or Rust for CPU-heavy image processing. One deployable unit usually means one language.
+
+**Microservices** split the system into separately deployed services that own their data and talk over the network. That solves the problems above and introduces new ones:
+
+| Cost | Why it hurts |
+|---|---|
+| **Network calls** | Function calls become HTTP or gRPC calls: more latency, and partial failures that need timeouts, retries and fallbacks |
+| **Debugging** | One user request crosses several services. You need distributed tracing and correlation IDs just to follow it |
+| **Data consistency** | Each service owns its own database, so there's no single transaction across them. Keeping data in sync becomes a design problem |
+| **Operations** | Many deploy pipelines, dashboards and on-call rotations |
+
+Choose microservices when you have **a large organisation with clear team boundaries**, and genuinely **different scaling or technology needs** per component. For most teams, a well-structured monolith (with clean module boundaries, so you could split later) is the better choice.
+
+## Serverless
+
+### Capacity planning
+
+In the traditional model, you rent a virtual machine (an EC2 instance, a droplet), install an OS, a web server and your runtime, deploy your code, and look after it for its whole life. You know exactly what you have, say 2 vCPUs and 4 GB of RAM, and you pay for it around the clock.
+
+The hard part is choosing that size in advance, which means predicting traffic:
+
+- **Under-provision** and a viral post or a marketing email overwhelms you. Requests slow to seconds or fail, and you lose users at exactly the moment you had their attention.
+- **Over-provision** and you pay for idle capacity: a fleet ten times bigger than you need, every hour of every day.
+
+### Autoscaling
+
+The long-standing answer is **autoscaling**: add instances when a metric (CPU, memory, request rate) crosses a threshold, remove them when it drops. It's standard practice, with known limits:
+
+- **It takes time.** A new instance has to boot, pull or start your code, pass health checks and join the load balancer: seconds for containers, minutes for full VMs. A sharp spike can outrun it.
+- **Limits cut both ways.** Set the maximum too low and you're under-provisioned again. Set it too high and an attack or a huge sale can scale you to hundreds of instances and a five- or six-figure bill.
+- **It's reactive.** It scales after you're already busy, not before.
+- **There's always a minimum.** You pay for at least one or two instances even at zero traffic.
+
+For **steady, predictable** traffic, which describes most SaaS products, servers with autoscaling work well and are cost-effective.
+
+### How serverless works
+
+**Serverless** doesn't mean there are no servers. It means **you don't manage them**: no machines to size, no OS to patch. You provide two things:
+
+1. **Functions**: your code.
+2. **Events** that trigger them: an HTTP route, a queue message, a file upload, a schedule.
+
+```text
+Client ──HTTP──▶ API gateway ──(route → function)──▶ function instance ──▶ response
+```
+
+When a request arrives, the platform (AWS Lambda, Google Cloud Run functions, Cloudflare Workers, Vercel Functions) finds or starts an instance of your function on hardware you never see, runs it and returns the response. The instance may be kept warm for a while to serve later requests, then discarded. Platforms scale out automatically to as many instances as traffic needs.
+
+The pricing model is the big draw: you pay **per execution** (requests plus compute time), not for idle hours. Spiky or low-traffic workloads can cost a fraction of an always-on server.
+
+### Cold starts and other catches
+
+- **Cold starts.** When no warm instance exists, the platform must start one before running your code: an isolated environment (AWS uses **Firecracker** micro-VMs; Cloudflare uses **V8 isolates**, which start in a few milliseconds or less) plus your language runtime and dependencies. Runtimes that start quickly (JavaScript, Python, Go) suffer less than heavier ones like the JVM. Pinging functions to keep them warm helps, but overdo it and you're paying for always-on capacity again. Cold starts can be reduced, never eliminated.
+- **Execution limits.** Functions have maximum run times; on AWS Lambda it's 15 minutes. A 30-minute export fails partway through.
+- **No local state.** Instances come and go, so nothing can rely on memory or local disk between invocations. Long-lived things that servers take for granted, like a **database connection pool** or **WebSocket** connections, need rethinking (a pooling proxy, a serverless-friendly database, a separate service for sockets).
+
+### When serverless fits
+
+| Good fit | Poor fit |
+|---|---|
+| Spiky or unpredictable traffic | Latency-critical paths where a cold start is unacceptable |
+| Event-driven work: queue messages, uploads, webhooks, schedules | Long-running work or long-lived connections (WebSockets) |
+| Occasional heavy jobs, such as image or video processing | Workloads with heavy, constant database connection needs |
+| Small teams that want no servers to manage | Steady high traffic, where always-on servers are usually cheaper |
+
+Serverless is a powerful tool for the right jobs, not a universal replacement for servers.
+
+## Rules of thumb
+
+Everything in both parts is a **solution**. These rules are about choosing when to use one.
+
+1. **Start with the problem, and measure.** Before changing anything, know whether the system is actually slow, how slow, which component is the bottleneck, and why ("the orders query does a sequential scan"). Use logs, metrics and traces (for example Prometheus and Grafana, or a hosted tool) and load tests. Optimising without numbers is premature optimisation, and fixing the wrong bottleneck feels like progress while the real one grows.
+2. **Prefer simple solutions.** A bigger machine is simpler than a fleet. An index is simpler than a cache. A monolith is simpler than microservices. Every component you add can fail and must be monitored and understood, so add complexity only when simplicity genuinely isn't enough.
+3. **Scale for the problems you have.** Build for today's traffic plus reasonable headroom, not for a hypothetical hundred million users. Architecture posts from the largest tech companies solve their problems, which may not be yours.
+4. **Invest in observability from day one.** This is the exception to "keep it simple": good logs, metrics and tracing pay for themselves by turning mysteries into measurements and warning you before users do.
+5. **Treat performance as an ongoing practice.** You won't predict every problem. Build systems that degrade gracefully, and get good at measuring, diagnosing and fixing quickly.
+
+## Cheat sheet
+
+- **Stateless** servers: sessions in Redis, files in object storage, data in a central database. Any instance can serve any request.
+- A **load balancer** picks an instance per request: **round robin** for equal servers and requests, **weighted** for unequal servers, **least connections** for uneven request costs.
+- **Health checks** remove failing instances from rotation and re-admit them once they answer 200 again.
+- **Read replicas**: writes go to the primary, reads to replicas. Beware **replication lag**; route must-be-fresh reads to the primary.
+- **Sharding** splits rows across databases by a **shard key** that matches your main query and spreads load evenly.
+- Prefer a **managed** database for replication, sharding and backups; know the concepts to configure it.
+- **CDNs** cache content near users: lower latency, less origin load, DDoS protection. Purge with cache tags.
+- **Edge computing** runs small, fast logic (auth checks, redirects, localisation) near users; heavy work stays at the origin.
+- **Async processing**: respond early, push a job onto a queue, let workers do emails, media and heavy deletes.
+- **Microservices** scale teams, not machines; they add network, debugging and consistency costs.
+- **Serverless**: functions plus events, pay per execution. Watch for cold starts, time limits and lack of local state.
+- Measure first, prefer simple, scale for real problems, and build observability in from day one.

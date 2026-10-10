@@ -1,0 +1,308 @@
+import { MultipartUploadSim } from "@/components/widgets/MultipartUploadSim";
+import { RangeRequestLab } from "@/components/widgets/RangeRequestLab";
+
+## Where a single PUT breaks
+
+Part 1 got avatars and documents into a bucket with a presigned POST and a two-phase flow. That works up to a few hundred MB. Now the notes app adds **video notes**, and some users attach 8 GB screen recordings or drone footage. A single `PUT` fails for four separate reasons.
+
+### The 5 GB limit
+
+S3 rejects any single `PUT` larger than **5 GB**. This isn't a recommendation or your framework's default; the storage API itself enforces it. If your product accepts files bigger than that, you are architecturally required to do something else.
+
+### All or nothing
+
+A single request either completes or doesn't. An 8 GB upload on a typical home or mobile connection can take 20 to 30 minutes, and a Wi-Fi hiccup in that window is very likely. At 4.8 GB of 5 GB, one dropped connection means starting over from byte zero.
+
+### One connection is slow
+
+A single TCP connection rarely fills a fast link. Its throughput is roughly bounded by **window size divided by round-trip time**, and it's very sensitive to packet loss: one lost packet shrinks the congestion window, and the connection has to ramp back up. On a 300 Mbps line, a single-stream upload can crawl along at 30 Mbps.
+
+The fix is **more connections**. Several parallel streams each have their own congestion window, so one stalling doesn't slow the others. That's all download managers do: they don't make your network faster, they open around eight connections to the same file.
+
+### Poor progress and no resume
+
+With one long request you get a jumpy progress bar, no pause button, and no way to survive a closed tab or a network switch. Users notice.
+
+## Multipart upload
+
+**Multipart upload** splits one object into many parts, uploaded as independent requests, then stitched together. The protocol is three calls, plus one for giving up.
+
+```text
+1. CreateMultipartUpload(bucket, key, contentType)      -> uploadId
+2. UploadPart(uploadId, partNumber, bytes)              -> ETag   (many, in parallel, any order)
+3. CompleteMultipartUpload(uploadId, [(partNumber, ETag), ...])
+4. AbortMultipartUpload(uploadId)                        (throw everything away)
+```
+
+### Create
+
+`CreateMultipartUpload` takes the bucket, key and content type and returns an **upload ID**. Think of the upload ID as a **staging area**, like git's index: parts collect there, but nothing is committed yet. A `GET` on the key returns `404` until the upload is completed.
+
+### Upload parts
+
+Each `UploadPart` sends the upload ID, a **part number** (1 to 10,000) and that part's bytes.
+
+- Every part is a **completely independent HTTP request**, so parts can upload **in parallel and in any order**. Part 7 can land before part 2.
+- A failed part is **retried on its own**. The other parts are unaffected.
+- Each successful part returns an **ETag**. Keep every one, because you need them to finish.
+
+### Complete or abort
+
+`CompleteMultipartUpload` sends the upload ID and the ordered list of part numbers and ETags. The object appears at its key, fully formed.
+
+Surprisingly, this call takes about the same time for 5 parts or a 50 GB object. The service doesn't physically concatenate the bytes. It records "this object is these parts in this order" in the **metadata plane**, the index from part 1, while the bytes stay where they already are in the data plane.
+
+`AbortMultipartUpload` discards the staging area and every part in it.
+
+## Choosing the part size
+
+Two hard limits shape the part size in S3:
+
+- At most **10,000 parts** per upload.
+- Each part except the last must be at least **5 MB** (and at most 5 GB).
+
+If you fix the part size at the 5 MB minimum, the largest possible file is 5 MB times 10,000, which is **50 GB**. Upload a 60 GB file that way and it fails on part 10,001, **after 50 GB has already been transferred**. That's a very expensive bug.
+
+So compute the part size from the file size, with a sensible floor:
+
+```ts
+const MAX_PARTS = 10_000;
+const FLOOR = 16 * 1024 * 1024; // 16 MB
+
+function partSize(fileSize: number): number {
+  return Math.max(FLOOR, Math.ceil(fileSize / MAX_PARTS));
+}
+```
+
+A 16 MB floor handles files up to about 160 GB with no special cases (32 MB gets you to about 320 GB), and bigger files simply get bigger parts.
+
+Why not use huge parts for everything? Because **the part is your retry unit**. If a 500 MB part fails on a phone, you resend 500 MB. With 16 to 64 MB parts, a retry is cheap. That range is the sweet spot.
+
+<MultipartUploadSim />
+
+## Multipart ETags are not checksums
+
+For an object uploaded with a single `PUT` (without server-side encryption using KMS keys), the ETag is the **MD5 of the content**. So people write integrity checks: hash the file locally, compare with the ETag.
+
+For a **multipart** object, the ETag is something else: the MD5 of the concatenated per-part MD5s, followed by a dash and the part count, like `"9b2cf5...e1-42"`. It will never equal the MD5 of the whole file, so that integrity check fails on every large upload, or worse, someone "fixes" it by skipping the check.
+
+For end-to-end integrity on large files:
+
+- Use the **checksum feature** of modern S3 APIs and SDKs: CRC32C or SHA-256 checksums per part, with the service validating a checksum for the whole object.
+- Or compute a **SHA-256 in the client**, send it as user metadata, and verify it in a background job after upload. A content hash also gives you **deduplication** for free: two uploads with the same hash are the same file.
+
+<Callout kind="warn">
+A trailing `-N` on an ETag means the object was uploaded in N parts. Don't compare it to an MD5 of the file.
+</Callout>
+
+## The hidden multipart leak
+
+A user starts uploading a 10 GB video in 300 parts of 32 MB, gets halfway, and closes the tab. Nobody calls Complete. Nobody calls Abort.
+
+Those uploaded parts **stay in the staging area, and you're billed for them every month, indefinitely**. Worse, you can't see them: listing the bucket only shows objects, and an unfinished multipart upload isn't an object yet. A dashboard might show one 184 MB object while a separate list of in-progress multipart uploads reveals several abandoned uploads holding hundreds of MB more, all billed.
+
+The fix is a one-time lifecycle rule:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-multipart",
+      "Status": "Enabled",
+      "Filter": {},
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 7 }
+    }
+  ]
+}
+```
+
+<Callout kind="remember">
+Add **"abort incomplete multipart uploads after 7 days"** to every production bucket on day one, before any feature code. It costs nothing and closes the leak permanently.
+</Callout>
+
+## Multipart with presigned URLs
+
+In production, large uploads combine multipart with the presigned, two-phase design from part 1. The browser still uploads directly to the bucket, and your API still records intent and verifies the result.
+
+1. **Browser to API**: `POST /uploads/init` with the file name, size and type.
+2. **API**:
+   - authenticates and authorizes the user,
+   - computes the part size,
+   - calls `CreateMultipartUpload`,
+   - inserts an `uploads` row with status `pending` and the upload ID,
+   - **presigns one `UploadPart` URL per part number**,
+   - returns the upload ID, part size and part URLs.
+3. **Browser to bucket**: uploads parts directly, **4 to 6 at a time**, collecting each part's ETag.
+4. **Browser to API**: `POST /uploads/complete` with the upload ID and the list of part numbers and ETags.
+5. **API**:
+   - calls `CompleteMultipartUpload`,
+   - calls `HeadObject` to confirm size and content type match what the client claimed,
+   - flips the row from `pending` to `ready`,
+   - optionally publishes a `file.uploaded` event to a queue, for audit logs, transcoding or a real-time "upload finished" notification.
+
+```json
+{
+  "uploadId": "VXBsb2FkIElE...",
+  "partSize": 16777216,
+  "parts": [
+    { "partNumber": 1, "url": "https://notes-uploads.s3.amazonaws.com/t_81/u_42/7c1d.mp4?partNumber=1&uploadId=...&X-Amz-Signature=..." },
+    { "partNumber": 2, "url": "https://notes-uploads.s3.amazonaws.com/t_81/u_42/7c1d.mp4?partNumber=2&uploadId=...&X-Amz-Signature=..." }
+  ]
+}
+```
+
+### Practical details
+
+- **Presign in batches.** Don't return 10,000 URLs up front; that's megabytes of JSON. Hand out around 100 at a time and let the client ask for more as it goes.
+- **Concurrency of 4 to 6** is the sweet spot. Beyond that you're mostly competing with yourself and every other device on the network for the same bandwidth.
+- **Browser memory stays small.** `File.slice(start, end)` returns a lazy `Blob` that only reads from disk when it's sent. Memory is roughly part size times concurrency, not the file size.
+- **Progress is smooth.** Progress, speed and ETA come from counting finished parts on the client, so the bar moves steadily instead of jumping.
+- **CORS must expose `ETag`.** Part 1's bucket CORS rule matters here: if `ETag` isn't in `ExposeHeaders`, browser JavaScript can't read the part ETags and can never complete the upload.
+
+```ts
+async function uploadPart(file: File, partNumber: number, size: number, url: string) {
+  const blob = file.slice((partNumber - 1) * size, partNumber * size); // lazy
+  const res = await fetch(url, { method: "PUT", body: blob });
+  if (!res.ok) throw new Error(`part ${partNumber} failed: ${res.status}`);
+  return { partNumber, etag: res.headers.get("ETag")! }; // needs ExposeHeaders: ETag
+}
+```
+
+### Resumable uploads
+
+Once uploads are multipart and tracked in your database, resuming is almost free:
+
+1. After a refresh or crash, the client asks the API whether this file has an upload in progress.
+2. The API finds the `pending` row and calls **`ListParts`** with its upload ID to learn which parts the bucket already holds.
+3. It returns fresh presigned URLs **only for the missing parts**.
+4. The client carries on from, say, part 341 instead of part 1.
+
+## Serving downloads
+
+Files are downloaded far more often than they're uploaded, so the download path matters even more. The rule is simple: **don't relay downloads through your API** (calling `GetObject` and copying bytes into your response).
+
+- Every download **ties up a worker** for its entire duration.
+- You **pay for the bandwidth** twice: out of the bucket and out of your servers.
+- It's **slow**. Your servers sit in one or two regions; a CDN has machines near every user.
+
+Bytes should flow from the bucket, or better, from a **CDN** in front of it. There are three patterns.
+
+### Public content behind a CDN
+
+For genuinely public files (marketing images, app icons, CSS and JS bundles, public product photos), keep the bucket **private** and let **only the CDN** read from it. Serve with a very long cache lifetime and **content-addressed keys**, where the key includes a hash of the content:
+
+```http
+GET /assets/logo.3f9a1c.png HTTP/1.1
+Host: cdn.notes.dev
+
+HTTP/1.1 200 OK
+Cache-Control: public, max-age=31536000, immutable
+```
+
+When the content changes, its hash changes, so the URL changes. There's nothing to invalidate. This is the cheapest and fastest option, and it's everywhere.
+
+### Presigned GET URLs
+
+For private files (a user's attachment), use the same idea as uploads. The browser asks your API, the API checks that **this user may read this object**, and returns a **presigned GET URL** valid for 5 to 15 minutes.
+
+The catch: every presigned URL contains a fresh timestamp and signature, so two requests for the same file get **different URLs**. To a CDN they're different resources, so the **cache hit rate drops to zero**. You pay for a CDN that caches nothing, plus full egress from the bucket.
+
+A cheap fix is to **round the signing time to a boundary**, for example sign every URL as if it were requested at the top of the hour and valid until the next one. Everyone requesting that file within the hour gets the same URL, and the CDN can cache it. You trade precise expiry for cache hits.
+
+### Signed URLs at the CDN
+
+At scale, the proper fix is to let the **CDN** check authorization itself, using the CDN's own **signed URLs** or **signed cookies**. The CDN verifies the signature at the **edge**, close to the user, and controls caching fully, with no call to your backend per file.
+
+Signed **cookies** are especially handy for video. One viewing session fetches hundreds or thousands of small segments, and signing each one through your API would be wasteful. One cookie scoped to `/videos/7c1d/` covers them all.
+
+| Pattern | Use for | Caches at CDN? | Backend per request? |
+|---|---|---|---|
+| Private bucket, CDN, content-addressed keys | Public assets | Yes, forever | No |
+| Presigned GET | Private files, modest traffic | Only with rounded expiry | Yes, to sign |
+| CDN signed URLs or cookies | Private files at scale, video | Yes | No (auth at the edge) |
+
+## Range requests
+
+HTTP lets a client ask for **part** of a resource with a `Range` header. Object storage speaks HTTP natively, so it supports this out of the box.
+
+```http
+GET /t_81/u_42/7c1d.mp4 HTTP/1.1
+Range: bytes=1000000-2999999
+
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 1000000-2999999/734003200
+Content-Length: 2000000
+```
+
+- A satisfiable range returns **`206 Partial Content`** with a **`Content-Range`** header saying which bytes these are and the total size.
+- A range that starts beyond the end of the object returns **`416 Range Not Satisfiable`**.
+- Byte ranges are **inclusive**: `bytes=0-99` is the first 100 bytes.
+
+A neat trick: `bytes=0-7` returns just the first 8 bytes, the file's **magic number**. Every PNG starts with the same 8-byte signature, so you can check an upload's real type without downloading it.
+
+<RangeRequestLab />
+
+### What ranges unlock
+
+- **Video seeking.** Drag the scrubber to 30:00 and the player uses the file's index to work out the byte offset, requests a range starting there (through the CDN), and plays immediately without downloading the first half hour.
+- **Resumable downloads.** A download dies at byte 400,000,000. The client reconnects and asks for `bytes=400000000-`.
+- **Parallel downloads.** Open about six connections to the same object, each fetching a different range, the download-side mirror of multipart upload.
+
+## Video streaming
+
+Range requests give you **progressive download**: one file, seekable. But there is exactly **one version** of it. Someone on a train gets the same 4K file as someone on fibre.
+
+Streaming platforms instead use **segmented streaming** with **HLS** or **DASH**:
+
+1. **Transcode** the original into several quality levels, say 240p, 480p, 1080p and 4K.
+2. **Chop** each quality into segments a few seconds long.
+3. Write a **manifest** listing the qualities and their segments.
+
+The player fetches the manifest, then fetches segments one at a time while **measuring how fast each arrives**. If the last segment came in slowly, it steps down a quality; if quickly, it steps up. This is **adaptive bitrate** (ABR) streaming.
+
+On the storage side, **nothing new is needed**: segments are objects, the manifest is an object, and a CDN serves them. Object storage plus a CDN is the serving layer of a streaming platform. The hard engineering is the **transcoding pipeline**: a background job triggered by every upload, with queues and workers.
+
+<Callout kind="tip">
+If video is a small feature of your product, use a hosted video service (such as Mux or Bunny Stream) for transcoding and delivery. If video *is* your product, build the pipeline yourself so the unit economics work.
+</Callout>
+
+## What object storage costs
+
+The pricing model shapes the architecture. You pay for three things:
+
+| Cost | Unit | Notes |
+|---|---|---|
+| **Storage** | Per GB per month | Includes the invisible parts of abandoned multipart uploads |
+| **Operations** | Per request | Writes (PUT, COPY, LIST) cost roughly 10x more than reads (GET) |
+| **Egress** | Per GB leaving the provider | Every byte downloaded out of the cloud |
+
+That table explains much of this lesson. A CDN with a good hit rate cuts egress and GET counts. Never calling LIST in the request path saves expensive operations. The abort rule stops paying for invisible storage. Content-addressed public assets get cached once and served forever.
+
+Egress is often the biggest surprise for media-heavy apps, which is why **Cloudflare R2** became popular: it charges **no egress fees**. Exact prices change every few years, so check providers' current pricing pages when you plan.
+
+## Putting both parts together
+
+- Object storage scales by **giving up mutability**: no in-place edits, renames, real folders or locks. In return: unlimited capacity, very high durability and a plain HTTP interface.
+- An object is a **key, bytes and metadata** in a flat bucket. Folders are a prefix group-by.
+- **Generate keys yourself**, put entropy early, encode ownership, and set metadata at write time.
+- Durability comes from **erasure coding**, but durability isn't a backup: **enable versioning and replication**.
+- Your **database** is the index of which files exist; never LIST in the request path.
+- Small files can go through your server if **streamed with a size cap**. Everything else goes **direct**, via **presigned POST** with `content-length-range`.
+- **Record intent, verify with HeadObject, clean up abandoned uploads.**
+- Large files use **multipart** with a computed part size, SDK checksums rather than ETags, and the **abort-incomplete lifecycle rule**.
+- Downloads come from the **bucket or a CDN**, never through your API. **Ranges** give seeking, resuming and parallel downloads; **segments** give adaptive video.
+
+## Cheat sheet
+
+- A single PUT tops out at 5 GB, fails all-or-nothing, and one TCP stream can't fill a fast link.
+- Multipart is Create (upload ID, nothing visible yet), UploadPart (independent, parallel, retried alone, returns ETag), Complete (metadata-only) or Abort.
+- Limits are 10,000 parts and a 5 MB minimum part, so use `partSize = max(16 MB, fileSize / 10,000)`.
+- Parts are the retry unit: 16 to 64 MB is the sweet spot.
+- Multipart ETags end in `-N` and aren't MD5s of the file. Use SDK checksums or your own SHA-256.
+- Every bucket gets "abort incomplete multipart uploads after 7 days" on day one.
+- Production flow is init (create, pending row, presigned part URLs), 4 to 6 parallel direct PUTs, then complete (Complete, HeadObject, ready).
+- Presign in batches of about 100, slice files lazily, and expose `ETag` in bucket CORS.
+- Resume by finding the pending row, calling ListParts, and signing only the missing parts.
+- Never proxy downloads. Public assets get a private bucket, CDN and content-addressed keys with long Cache-Control.
+- Presigned GETs defeat CDN caching; round the expiry or use CDN signed URLs or cookies.
+- `Range` returns `206` with `Content-Range`, or `416` if unsatisfiable. HLS or DASH segments plus ABR handle video. Costs are storage, operations (writes cost more) and egress.

@@ -1,0 +1,181 @@
+import { RouteMatcher } from "@/components/widgets/RouteMatcher";
+
+## What routing does
+
+An HTTP request tells the server two separate things. The **method** says *what* you want to do: read, create, update, delete. The **path** says *where*: which resource you want to do it to. `GET /notes` means "read" + "the notes collection".
+
+**Routing** is the part of the backend that takes those two pieces and decides **which piece of your code runs**. That code is called a **handler** (or controller action): it reads the request, runs business logic, talks to the database and builds a response.
+
+```ts
+router.get("/api/v1/notes", listNotes);
+router.post("/api/v1/notes", createNote);
+router.get("/api/v1/notes/:id", getNote);
+```
+
+A router is essentially a lookup table from **(method, path pattern)** to **handler**. Every web framework, whether Express, FastAPI, Gin, Spring or Rails, has one, and they all work in roughly the same way.
+
+## Method plus path is the key
+
+The router never matches on the path alone. `GET /api/v1/notes` and `POST /api/v1/notes` share a path but are **two different routes** with two different handlers: one lists notes, the other creates one. The pair is the key.
+
+This is why REST-style APIs don't need verbs in their URLs. Instead of `/getNotes` and `/createNote`, you have one noun (`/notes`) and let the method carry the verb.
+
+Two failure cases follow from this:
+
+| Situation | Correct response |
+|---|---|
+| No route has this path at all | `404 Not Found` |
+| The path exists, but not for this method (e.g. `DELETE /api/v1/notes`) | `405 Method Not Allowed`, with an `Allow: GET, POST` header |
+
+<Callout kind="tip">
+Many frameworks return `404` for both cases by default. A `405` with an `Allow` header is more honest: it tells the client the URL is right and the method is wrong.
+</Callout>
+
+## Static routes
+
+A **static route** is a fixed string with no variable parts, like `/api/v1/notes` or `/health`. It matches exactly one path. Static routes are used for collections (`/notes`), singletons (`/me`, `/settings`) and fixed actions or utilities (`/health`, `/notes/search`).
+
+## Dynamic routes and path parameters
+
+Most resources are identified by an ID, and you can't register a route per note. A **dynamic route** contains a placeholder segment, conventionally written `:id` (some frameworks use `{id}` or `<id>`):
+
+```ts
+router.get("/api/v1/notes/:id", getNote);
+```
+
+`GET /api/v1/notes/42` matches: `api` equals `api`, `v1` equals `v1`, `notes` equals `notes`, and `42` is captured into the `id` slot. The handler receives it as a **path parameter** (also called a route parameter):
+
+```ts
+function getNote(req) {
+  const id = req.params.id; // "42", a string
+}
+```
+
+Read that URL aloud and it's almost a sentence: "get, from notes, the one with ID 42". That readability is the point. The path identifies **which resource** you mean.
+
+### Parameters are strings
+
+The URL is text, so **every path parameter arrives as a string**, even when it looks like a number. `"42"` is not `42`. Comparing it to a numeric database ID, adding to it, or passing it to a typed query without converting can cause subtle bugs. Convert it explicitly and **validate** it: `/notes/abc` and `/notes/-1` also match `:id`, and your handler should answer them with `400 Bad Request` or `404`, not crash. Many frameworks let you declare the type up front (`{id:int}` in ASP.NET, or a typed `id: int` parameter in FastAPI), which does the parsing and rejects bad input for you.
+
+Path segments are also **URL-encoded**. A space becomes `%20`, a slash inside a value becomes `%2F`. The router decodes them before handing them to you.
+
+## Query parameters
+
+Everything after the `?` in a URL is the **query string**: a list of `key=value` pairs joined with `&`.
+
+```http
+GET /api/v1/notes?page=2&limit=20&sort=-updatedAt&tag=work
+```
+
+The router **ignores the query string when matching**. The route above is still `/api/v1/notes`, so `listNotes` runs and reads the extras from `req.query`. Like path parameters, query values are **strings**; a key can also appear several times (`?tag=work&tag=home`), and a key with no value (`?archived`) is an empty string.
+
+### Why not put everything in the path
+
+You could write `/notes/search/shopping-list` or `/notes/page/2`. It would work technically, but it blurs what the path means. The rule of thumb:
+
+| | Path parameter | Query parameter |
+|---|---|---|
+| Where | Inside the path: `/notes/:id` | After `?`: `?page=2` |
+| Answers | **Which** resource? | **How** do you want it? |
+| Typical contents | IDs, slugs, nested ownership | Pagination, filters, sorting, search terms, field selection |
+| Required? | Yes, or the route doesn't match | Usually optional, with defaults |
+
+GET requests are meant to have no body (the HTTP spec gives a GET body no defined meaning, and many proxies and clients drop it), so **query parameters are how a read request carries options**. They also make the URL fully describe the request, which means it can be bookmarked, shared, logged and cached.
+
+### Pagination example
+
+A list endpoint should never return every row. The server applies a **default page size** and returns metadata so the client can ask for more:
+
+```json
+{
+  "data": [ { "id": 41, "title": "Groceries" } ],
+  "page": 1,
+  "limit": 20,
+  "total": 134,
+  "totalPages": 7
+}
+```
+
+The client then asks for `GET /api/v1/notes?page=2`. The server should also cap `limit`, otherwise `?limit=1000000` becomes a denial-of-service lever.
+
+## Nested routes
+
+When resources belong to other resources, the path can mirror that relationship:
+
+```http
+GET /api/v1/users                    all users
+GET /api/v1/users/7                  user 7
+GET /api/v1/users/7/notes            all notes owned by user 7
+GET /api/v1/users/7/notes/99         note 99, owned by user 7
+```
+
+Nesting isn't a special router feature; it's just routes with more segments and more parameters (`:userId`, `:noteId`). **Each level is its own route** with its own handler, and the client can stop at any level.
+
+<Callout kind="warn">
+A nested URL is not a security check. `GET /users/7/notes/99` must still verify that note 99 really belongs to user 7, and that the caller is allowed to see user 7's notes. Otherwise anyone can swap IDs in the URL.
+</Callout>
+
+Keep nesting shallow. Two levels is usually plenty; past that, give the child its own top-level route (`/notes/99`) and use a query filter (`/notes?ownerId=7`).
+
+## Route order and matching
+
+Routers check routes in a defined order, and some patterns overlap. `/notes/search` is static, but it also fits `/notes/:id` with `id = "search"`. If the dynamic route is checked first, your search endpoint becomes unreachable and you get "note not found: search".
+
+Frameworks resolve this in one of two ways:
+
+- **First match wins, in registration order** (Express and many others). You must register **specific routes before general ones**.
+- **Most specific wins** (tree-based routers such as Fastify's, chi and Go's standard library mux since 1.22). Static segments beat parameters automatically, whatever the order.
+
+Know which kind your framework is. When in doubt, register static routes first.
+
+<RouteMatcher />
+
+## Versioning and deprecation
+
+APIs change. Say version 1 of the notes API returns `{ "name": ... }` and the new mobile app needs `{ "title": ... }` plus a different shape. If you change the existing response, every old client breaks: the web app that hasn't been redeployed, and the mobile apps people haven't updated.
+
+The usual fix is to **version the route**:
+
+```http
+GET /api/v1/notes   → { "data": [ { "id": 1, "name": "Groceries" } ] }
+GET /api/v2/notes   → { "data": [ { "id": 1, "title": "Groceries" } ] }
+```
+
+Inventing a new name (`/api/new-notes`) quickly gets messy; a version prefix says clearly "same resource, new contract". Path versioning is the most common style because it's visible and easy to route. The alternatives are a header (`Accept: application/vnd.notes.v2+json`) or a query parameter (`?version=2`).
+
+Only **breaking** changes need a new version: removing or renaming a field, changing a type, changing what an endpoint means. Adding an optional field usually doesn't.
+
+A clean deprecation workflow:
+
+1. Ship v2 alongside v1.
+2. Announce that v1 is deprecated, with a removal date. Mark responses with a `Deprecation` header and a `Sunset` header carrying the date.
+3. Watch v1 traffic in your logs and contact the remaining clients.
+4. After the migration window, remove v1 (and return `410 Gone` for a while if you like).
+
+## Catch-all routes
+
+What happens when someone requests `GET /api/v3/notes` and no route matches? Without a plan, the framework returns its default, which might be an HTML error page, an empty body or a stack trace. None of these is useful to an API client.
+
+A **catch-all route** is a wildcard registered **last** that matches anything left over:
+
+```ts
+// after every other route
+router.all("/*", (req, res) =>
+  res.status(404).json({ error: "Route not found", path: req.path })
+);
+```
+
+It must come last precisely because it matches everything: registered first, it would swallow every request. Single-page apps use the same idea differently, sending every unknown path to `index.html` so the client-side router can take over.
+
+## Cheat sheet
+
+- **Method = what, path = where**; the router maps the pair to a handler.
+- Same path with a different method is a **different route**.
+- Unknown path: **404**. Known path, wrong method: **405** with an `Allow` header.
+- `:id` captures a **path parameter**, and it is **always a string**: convert and validate it.
+- The **query string** isn't part of route matching; use it for pagination, filters, sorting and search.
+- Path identifies **which** resource; query says **how** you want it.
+- Nested routes mirror ownership, but **still check ownership** in the handler.
+- With first-match routers, register **static before dynamic** routes.
+- Version with `/v1`, `/v2` for **breaking changes only**; deprecate with a migration window.
+- A **catch-all** registered last returns a clean JSON 404.
