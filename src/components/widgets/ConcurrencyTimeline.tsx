@@ -94,8 +94,8 @@ function simulate(tasks: Task[], cores: number, blocking: boolean) {
 }
 
 const COLOR: Record<Cell, string> = {
-  cpu: "bg-accent",
-  io: "bg-surface-2 border border-dashed border-border",
+  cpu: "bg-primary",
+  io: "bg-muted border border-dashed border-border",
   wait: "bg-warn-soft",
 };
 
@@ -120,29 +120,29 @@ export function ConcurrencyTimeline() {
 
   return (
     <Widget title="Concurrency timeline" hint="Three requests arrive at the same moment. Switch the execution model and the kind of work, and compare when each one finishes.">
-      <p className="text-xs font-semibold uppercase tracking-wide text-muted">Execution model</p>
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Execution model</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {MODES.map((m) => (
           <Pill key={m.id} active={mode === m.id} onClick={() => setMode(m.id)}>{m.label}</Pill>
         ))}
       </div>
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">Each request is</p>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Each request is</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {(Object.keys(WORKLOADS) as Workload[]).map((w) => (
           <Pill key={w} active={workload === w} onClick={() => setWorkload(w)}>{WORKLOADS[w].label}</Pill>
         ))}
         <Pill active={heavy} onClick={() => setHeavy((v) => !v)}>+ 80 ms CPU task</Pill>
       </div>
-      <p className="mt-2 text-xs text-muted">{modeInfo.note}</p>
+      <p className="mt-2 text-xs text-muted-foreground">{modeInfo.note}</p>
 
       <div className="mt-4 space-y-3">
         {tasks.map((task, i) => (
           <div key={task.name}>
             <div className="flex items-baseline justify-between text-xs">
               <span className="font-semibold">{task.name}</span>
-              <span className="font-mono text-muted">done at {current.finish[i]} ms</span>
+              <span className="font-mono text-muted-foreground">done at {current.finish[i]} ms</span>
             </div>
-            <div className="relative mt-1 h-5 w-full rounded bg-surface">
+            <div className="relative mt-1 h-5 w-full rounded bg-card">
               {current.segments[i].map((s) => (
                 <div
                   key={s.start}
@@ -156,17 +156,17 @@ export function ConcurrencyTimeline() {
       </div>
 
       <div className="mt-3 flex flex-wrap gap-3 text-xs">
-        <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded-sm bg-accent" /> on the CPU</span>
-        <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded-sm border border-dashed border-border bg-surface-2" /> waiting for IO</span>
+        <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded-sm bg-primary" /> on the CPU</span>
+        <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded-sm border border-dashed border-border bg-muted" /> waiting for IO</span>
         <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded-sm bg-warn-soft" /> ready, waiting for a CPU</span>
       </div>
 
       <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
         {MODES.map((m) => (
-          <div key={m.id} className={`rounded-lg p-2 ${m.id === mode ? "bg-accent-soft" : "bg-surface-2"}`}>
-            <p className="text-[0.7rem] leading-tight text-muted">{m.label}</p>
+          <div key={m.id} className={`rounded-lg p-2 ${m.id === mode ? "bg-primary/10" : "bg-muted"}`}>
+            <p className="text-[0.7rem] leading-tight text-muted-foreground">{m.label}</p>
             <p className="font-mono">{results[m.id].total} ms</p>
-            <p className="text-[0.7rem] text-muted">CPU busy {results[m.id].busyPct}%</p>
+            <p className="text-[0.7rem] text-muted-foreground">CPU busy {results[m.id].busyPct}%</p>
           </div>
         ))}
       </div>

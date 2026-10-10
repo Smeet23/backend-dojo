@@ -49,14 +49,14 @@ export function ReplicaLagLab() {
       title="Replication lag"
       hint="A user in Mumbai renames herself from “Asha K” to “Asha Kapoor”. The write goes to the primary in the US; the page then re-fetches her profile."
     >
-      <p className="text-xs font-semibold uppercase tracking-wide text-muted">Read routing</p>
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Read routing</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {STRATEGIES.map((s) => (
           <Pill key={s.id} active={strategy === s.id} onClick={() => setStrategy(s.id)}>{s.label}</Pill>
         ))}
       </div>
-      <p className="mt-1 text-xs text-muted">{STRATEGIES.find((s) => s.id === strategy)?.blurb}</p>
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">Frontend waits before re-fetching</p>
+      <p className="mt-1 text-xs text-muted-foreground">{STRATEGIES.find((s) => s.id === strategy)?.blurb}</p>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Frontend waits before re-fetching</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {DELAYS.map((d) => (
           <Pill key={d} active={delay === d} onClick={() => setDelay(d)}>{d} ms</Pill>
@@ -72,25 +72,25 @@ export function ReplicaLagLab() {
         ]
           .sort((a, b) => a.t - b.t)
           .map((e) => (
-            <li key={e.text} className="rounded-md bg-surface-2 px-2 py-1">
-              <span className="font-mono text-xs text-muted">t = {e.t} ms</span> {e.text}
+            <li key={e.text} className="rounded-md bg-muted px-2 py-1">
+              <span className="font-mono text-xs text-muted-foreground">t = {e.t} ms</span> {e.text}
             </li>
           ))}
       </ol>
 
       <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
         <div className={`rounded-lg p-2 ${fresh ? "bg-good-soft" : "bg-bad-soft"}`}>
-          <p className="text-xs text-muted">Profile shows</p>
+          <p className="text-xs text-muted-foreground">Profile shows</p>
           <p className="font-semibold">{shown}</p>
           <p className="text-xs">{fresh ? "Fresh" : "Stale: right after “Saved”!"}</p>
         </div>
-        <div className="rounded-lg bg-surface-2 p-2">
-          <p className="text-xs text-muted">Read served by</p>
+        <div className="rounded-lg bg-muted p-2">
+          <p className="text-xs text-muted-foreground">Read served by</p>
           <p className="font-semibold">{where}</p>
           <p className="text-xs">read latency ≈ {readLatency} ms</p>
         </div>
       </div>
-      <p className="mt-3 text-xs text-muted">
+      <p className="mt-3 text-xs text-muted-foreground">
         Every option trades something: staleness, latency, or extra load on the primary.
       </p>
     </Widget>

@@ -98,7 +98,7 @@ export function RouteMatcher() {
           onChange={(e) => setUrl(e.target.value)}
           spellCheck={false}
           aria-label="Request URL"
-          className="min-h-10 w-full rounded-lg border border-border bg-surface-2 px-3 font-mono text-[0.8rem]"
+          className="min-h-10 w-full rounded-lg border border-border bg-muted px-3 font-mono text-[0.8rem]"
         />
         <div className="flex flex-wrap gap-2">
           {PRESETS.map((p) => (
@@ -106,7 +106,7 @@ export function RouteMatcher() {
               key={p.method + p.url}
               type="button"
               onClick={() => { setMethod(p.method); setUrl(p.url); }}
-              className="min-h-10 max-w-full truncate rounded-lg border border-border px-2 font-mono text-[0.72rem] hover:bg-surface-2"
+              className="min-h-10 max-w-full truncate rounded-lg border border-border px-2 font-mono text-[0.72rem] hover:bg-muted"
             >
               {p.method} {p.url}
             </button>
@@ -122,12 +122,12 @@ export function RouteMatcher() {
         {routes.map((r, i) => (
           <li key={r.method + r.pattern} className={`flex flex-wrap items-center justify-between gap-x-3 rounded-lg border px-3 py-1.5 font-mono text-[0.75rem] ${rowStyle[rows[i]]}`}>
             <span className="break-all"><strong>{r.method}</strong> {r.pattern}</span>
-            <span className="text-muted">{rowLabel[rows[i]]}</span>
+            <span className="text-muted-foreground">{rowLabel[rows[i]]}</span>
           </li>
         ))}
         <li className={`flex flex-wrap items-center justify-between gap-x-3 rounded-lg border px-3 py-1.5 font-mono text-[0.75rem] ${!hit && !allowed.length ? "border-bad bg-bad-soft" : "border-border opacity-30"}`}>
           <span><strong>ALL</strong> {"/* (catch-all, registered last)"}</span>
-          <span className="text-muted">{!hit && !allowed.length ? "fallback" : "not reached"}</span>
+          <span className="text-muted-foreground">{!hit && !allowed.length ? "fallback" : "not reached"}</span>
         </li>
       </ol>
 
@@ -140,7 +140,7 @@ export function RouteMatcher() {
 query  = ${JSON.stringify(Object.fromEntries(query))}`}
         </pre>
         {hit && Object.keys(hit.params).length > 0 && (
-          <p className="mt-1 text-muted">Every value is a string, even &quot;42&quot;. Convert and validate before using it.</p>
+          <p className="mt-1 text-muted-foreground">Every value is a string, even &quot;42&quot;. Convert and validate before using it.</p>
         )}
         {dynamicFirst && hit?.route.pattern === "/api/v1/notes/:id" && hit.params.id === "search" && (
           <p className="mt-1 font-medium">Oops: &quot;search&quot; was captured as a note id. Register static routes before dynamic ones.</p>

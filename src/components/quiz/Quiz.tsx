@@ -2,11 +2,18 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { ArrowRight, BookOpen, CheckCircle2, CircleAlert, RotateCcw, Trophy, XCircle } from "lucide-react";
 import type { Question, Response } from "@/lib/types";
 import { grade } from "@/lib/quiz";
 import { recordAnswer, recordQuizFinished } from "@/lib/progress";
-import { QuestionView, emptyResponse, isComplete } from "./QuestionView";
+import { cn } from "@/lib/utils";
 import { lectures } from "@/content/lectures";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
+import { QuestionView, emptyResponse, isComplete } from "./QuestionView";
 
 type Props = {
   questions: Question[];
@@ -22,6 +29,8 @@ function lessonHref(q: Question) {
   const lecture = lectures.find((l) => l.id === q.lectures[0]);
   return lecture ? `/lectures/${lecture.slug}#${q.lessonAnchor}` : "/";
 }
+
+const typeLabel = { scenario: "Scenario", mcq: "Multiple choice", order: "Put in order" } as const;
 
 export function Quiz({ questions, lectureId, title, onRestart }: Props) {
   const [index, setIndex] = useState(0);
@@ -61,77 +70,98 @@ export function Quiz({ questions, lectureId, title, onRestart }: Props) {
 
   if (finished) {
     const pct = percent(results);
+    const passed = pct >= 80;
     const missed = results.filter((r) => r.score < 1);
     return (
-      <div className="rounded-xl border border-border bg-surface p-4 sm:p-6">
-        <p className="text-sm text-muted">{title}</p>
-        <p className="mt-1 text-4xl font-semibold">{pct}%</p>
-        <p className={`mt-1 text-sm font-medium ${pct >= 80 ? "text-good" : "text-warn"}`}>
-          {pct >= 80 ? "Passed — nice work." : "Below 80%. Review the sections below and try again."}
-        </p>
-        {missed.length > 0 && (
-          <div className="mt-5">
-            <p className="text-sm font-semibold">Review these</p>
-            <ul className="mt-2 space-y-2">
-              {missed.map(({ question: q, score }) => (
-                <li key={q.id} className="rounded-lg bg-surface-2 px-3 py-2 text-sm">
-                  <p className="line-clamp-2">{q.prompt}</p>
-                  <div className="mt-1 flex items-center justify-between gap-2">
-                    <span className="text-muted">{Math.round(score * 100)}% correct</span>
-                    <Link href={lessonHref(q)} className="font-medium text-accent">Review section →</Link>
-                  </div>
-                </li>
-              ))}
-            </ul>
+      <Card>
+        <CardContent className="space-y-6">
+          <div className="flex items-center gap-4">
+            <span className={cn("flex size-14 shrink-0 items-center justify-center rounded-full", passed ? "bg-good-soft text-good" : "bg-warn-soft text-warn")}>
+              {passed ? <Trophy className="size-7" /> : <CircleAlert className="size-7" />}
+            </span>
+            <div>
+              <p className="text-sm text-muted-foreground">{title}</p>
+              <p className="text-4xl font-semibold tabular-nums">{pct}%</p>
+              <p className={cn("text-sm font-medium", passed ? "text-good" : "text-warn")}>
+                {passed ? "Passed — nice work." : "Below 80%. Review the sections below and try again."}
+              </p>
+            </div>
           </div>
-        )}
-        <button type="button" onClick={restart} className="mt-5 min-h-11 w-full rounded-lg bg-accent px-4 text-sm font-medium text-white dark:text-bg">
-          Try again
-        </button>
-      </div>
+          {missed.length > 0 && (
+            <div>
+              <p className="mb-2 text-sm font-semibold">Review these ({missed.length})</p>
+              <ul className="divide-y rounded-lg border">
+                {missed.map(({ question: q, score }) => (
+                  <li key={q.id} className="flex flex-col gap-2 p-3 text-sm sm:flex-row sm:items-center sm:justify-between">
+                    <p className="line-clamp-2 min-w-0">{q.prompt}</p>
+                    <div className="flex shrink-0 items-center gap-3">
+                      <Badge variant="outline" className="tabular-nums">{Math.round(score * 100)}%</Badge>
+                      <Button asChild variant="link" size="sm" className="h-auto px-0">
+                        <Link href={lessonHref(q)}>
+                          Review <ArrowRight />
+                        </Link>
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <Button onClick={restart} size="lg" className="w-full">
+            <RotateCcw /> Try again
+          </Button>
+        </CardContent>
+      </Card>
     );
   }
 
   const score = checked ? results[results.length - 1].score : 0;
+  const feedback =
+    score === 1
+      ? { title: "Correct", tone: "border-good/40 bg-good-soft", icon: <CheckCircle2 className="text-good" /> }
+      : score > 0
+        ? { title: `Partly right (${Math.round(score * 100)}%)`, tone: "border-warn/40 bg-warn-soft", icon: <CircleAlert className="text-warn" /> }
+        : { title: "Not quite", tone: "border-bad/40 bg-bad-soft", icon: <XCircle className="text-bad" /> };
 
   return (
-    <div className="rounded-xl border border-border bg-surface p-4 sm:p-6">
-      <div className="mb-4 flex items-center justify-between text-sm text-muted">
-        <span>{title}</span>
-        <span>{index + 1} / {questions.length}</span>
-      </div>
-      <div className="mb-4 h-1.5 overflow-hidden rounded-full bg-surface-2">
-        <div className="h-full bg-accent transition-all" style={{ width: `${(index / questions.length) * 100}%` }} />
-      </div>
-
-      <p className="mb-4 whitespace-pre-line text-[0.95rem] leading-relaxed">{question.prompt}</p>
-      <QuestionView key={question.id} question={question} response={response} onChange={setResponse} checked={checked} />
-
-      {checked && (
-        <div className={`mt-4 rounded-lg px-3 py-3 text-sm ${score === 1 ? "bg-good-soft" : score > 0 ? "bg-warn-soft" : "bg-bad-soft"}`}>
-          <p className="font-semibold">{score === 1 ? "✅ Correct" : score > 0 ? `⚠️ Partly right (${Math.round(score * 100)}%)` : "❌ Not quite"}</p>
-          <p className="mt-1 leading-relaxed">{question.explanation}</p>
-          <Link href={lessonHref(question)} className="mt-1 inline-block font-medium text-accent">Review this in the lesson →</Link>
+    <Card>
+      <CardHeader className="gap-3">
+        <div className="flex items-center justify-between gap-3 text-sm">
+          <span className="font-medium">
+            Question {index + 1} <span className="text-muted-foreground">of {questions.length}</span>
+          </span>
+          <Badge variant="secondary">{typeLabel[question.type]}</Badge>
         </div>
-      )}
+        <Progress value={((index + (checked ? 1 : 0)) / questions.length) * 100} aria-label={`${title} progress`} />
+      </CardHeader>
+      <CardContent className="space-y-5">
+        <p className="text-[0.95rem] leading-relaxed whitespace-pre-line">{question.prompt}</p>
+        <QuestionView key={question.id} question={question} response={response} onChange={setResponse} checked={checked} />
 
-      <div className="mt-5">
-        {checked ? (
-          <button type="button" onClick={next} className="min-h-11 w-full rounded-lg bg-accent px-4 text-sm font-medium text-white dark:text-bg">
-            {index === questions.length - 1 ? "See results" : "Next question"}
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={check}
-            disabled={!isComplete(question, response)}
-            className="min-h-11 w-full rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
-          >
-            Check answer
-          </button>
+        {checked && (
+          <Alert className={feedback.tone}>
+            {feedback.icon}
+            <AlertTitle>{feedback.title}</AlertTitle>
+            <AlertDescription className="text-foreground/90">
+              <p className="leading-relaxed">{question.explanation}</p>
+              <Link href={lessonHref(question)} className="mt-1 inline-flex items-center gap-1 font-medium text-primary hover:underline">
+                <BookOpen className="size-3.5" /> Review this in the lesson
+              </Link>
+            </AlertDescription>
+          </Alert>
         )}
-      </div>
-    </div>
+
+        {checked ? (
+          <Button onClick={next} size="lg" className="w-full">
+            {index === questions.length - 1 ? "See results" : "Next question"} <ArrowRight />
+          </Button>
+        ) : (
+          <Button onClick={check} size="lg" className="w-full" disabled={!isComplete(question, response)}>
+            Check answer
+          </Button>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

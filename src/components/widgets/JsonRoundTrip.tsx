@@ -113,7 +113,7 @@ export function JsonRoundTrip() {
             rows={5}
             spellCheck={false}
             aria-label="JSON text"
-            className="w-full rounded-lg border border-border bg-surface-2 p-3 font-mono text-[0.78rem]"
+            className="w-full rounded-lg border border-border bg-muted p-3 font-mono text-[0.78rem]"
           />
           {parsed.ok ? (
             <div className="rounded-lg bg-good-soft p-3">
@@ -140,7 +140,7 @@ export function JsonRoundTrip() {
 function Pane({ title, body }: { title: string; body: string }) {
   return (
     <div className="min-w-0 rounded-lg border border-border">
-      <p className="border-b border-border bg-surface-2 px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-muted">{title}</p>
+      <p className="border-b border-border bg-muted px-3 py-1.5 text-xs font-semibold uppercase tracking-wide text-muted-foreground">{title}</p>
       <pre className="overflow-x-auto whitespace-pre-wrap break-all p-3 font-mono text-[0.75rem] leading-5">{body}</pre>
     </div>
   );

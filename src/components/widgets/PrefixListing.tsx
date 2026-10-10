@@ -38,7 +38,7 @@ export function PrefixListing() {
     <Widget title="Folders are a group-by" hint="The bucket holds only the flat keys on the left. Pick a prefix and toggle the delimiter to see where 'folders' come from.">
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted">Prefix</span>
+          <span className="w-20 text-muted-foreground">Prefix</span>
           {PREFIXES.map((p) => (
             <Pill key={p || "none"} active={prefix === p} onClick={() => setPrefix(p)}>
               <span className="font-mono text-[0.78rem]">{p || "(none)"}</span>
@@ -46,7 +46,7 @@ export function PrefixListing() {
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted">Delimiter</span>
+          <span className="w-20 text-muted-foreground">Delimiter</span>
           <Pill active={useDelimiter} onClick={() => setUseDelimiter(true)}>/</Pill>
           <Pill active={!useDelimiter} onClick={() => setUseDelimiter(false)}>none</Pill>
         </div>
@@ -54,15 +54,15 @@ export function PrefixListing() {
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         <div className="rounded-lg border border-border p-3">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">Every key in the bucket</p>
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Every key in the bucket</p>
           <ul className="space-y-1 font-mono text-[0.78rem]">
             {KEYS.map((k) => (
-              <li key={k} className={`break-all rounded px-1 ${k.startsWith(prefix) ? "bg-accent-soft" : "text-muted"}`}>{k}</li>
+              <li key={k} className={`break-all rounded px-1 ${k.startsWith(prefix) ? "bg-primary/10" : "text-muted-foreground"}`}>{k}</li>
             ))}
           </ul>
         </div>
         <div className="rounded-lg border border-border p-3">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted">LIST response</p>
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">LIST response</p>
           <pre className="whitespace-pre-wrap break-all font-mono text-[0.78rem] leading-6">
             {`ListObjectsV2 prefix="${prefix}"${useDelimiter ? ' delimiter="/"' : ""}\n\n`}
             {`CommonPrefixes (${result.commonPrefixes.length}):\n`}
@@ -73,7 +73,7 @@ export function PrefixListing() {
         </div>
       </div>
 
-      <p className="mt-3 rounded-lg bg-surface-2 px-3 py-2 text-sm">
+      <p className="mt-3 rounded-lg bg-muted px-3 py-2 text-sm">
         {useDelimiter
           ? "Each 'folder' is just the key text up to the next '/', reported once. Nothing called a folder is stored. Note t_81/u_7/drafts/ is a zero-byte object a tool created to fake an empty folder."
           : "Without a delimiter there are no folders at all: just every key that starts with the prefix. This is what the bucket really is."}

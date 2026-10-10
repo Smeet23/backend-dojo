@@ -127,7 +127,7 @@ export function PresignedUploadLab() {
 
   const row = (label: string, children: ReactNode) => (
     <div className="flex flex-wrap items-center gap-2">
-      <span className="w-24 text-muted">{label}</span>
+      <span className="w-24 text-muted-foreground">{label}</span>
       {children}
     </div>
   );
@@ -161,10 +161,10 @@ export function PresignedUploadLab() {
           <li
             key={i}
             className={`rounded-lg border p-3 text-sm ${
-              s.tone === "good" ? "border-good bg-good-soft" : s.tone === "bad" ? "border-bad bg-bad-soft" : s.tone === "warn" ? "border-warn bg-warn-soft" : "border-border bg-surface-2"
+              s.tone === "good" ? "border-good bg-good-soft" : s.tone === "bad" ? "border-bad bg-bad-soft" : s.tone === "warn" ? "border-warn bg-warn-soft" : "border-border bg-muted"
             }`}
           >
-            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted">
+            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               {s.from === s.to ? s.from : `${s.from} → ${s.to}`} · {s.title}
             </p>
             <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[0.78rem] leading-6">{s.lines.join("\n")}</pre>
@@ -177,7 +177,7 @@ export function PresignedUploadLab() {
           type="button"
           onClick={() => setStep(current + 1)}
           disabled={current >= steps.length - 1}
-          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
+          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40"
         >
           {current >= steps.length - 1 ? "Done" : `Next step (${current + 1}/${steps.length})`}
         </button>

@@ -1,8 +1,13 @@
 "use client";
 
-import { useMemo } from "react";
+import { useId, useMemo } from "react";
+import { CheckCircle2, XCircle } from "lucide-react";
 import type { Question, Response } from "@/lib/types";
 import { shuffle } from "@/lib/quiz";
+import { cn } from "@/lib/utils";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 type Props = {
   question: Question;
@@ -30,37 +35,47 @@ export function isComplete(q: Question, r: Response): boolean {
   return false;
 }
 
+const resultTone = (right: boolean) => (right ? "border-good bg-good-soft" : "border-bad bg-bad-soft");
+
 export function QuestionView({ question, response, onChange, checked }: Props) {
+  const id = useId();
+
   if (question.type === "scenario" && response.type === "scenario") {
     return (
-      <div className="space-y-3">
+      <div className="grid gap-4 sm:grid-cols-2">
         {question.fields.map((field, i) => {
           const value = response.values[i];
           const right = value === field.answer;
+          const fieldId = `${id}-${i}`;
           return (
-            <label key={field.label} className="block">
-              <span className="mb-1 block text-sm font-medium">{field.label}</span>
-              <select
-                value={value}
+            <div key={field.label} className={cn("space-y-1.5", question.fields.length % 2 === 1 && i === question.fields.length - 1 && "sm:col-span-2")}>
+              <Label htmlFor={fieldId}>{field.label}</Label>
+              <Select
+                value={value || undefined}
                 disabled={checked}
-                onChange={(e) => {
+                onValueChange={(v) => {
                   const values = [...response.values];
-                  values[i] = e.target.value;
+                  values[i] = v;
                   onChange({ type: "scenario", values });
                 }}
-                className={`min-h-11 w-full rounded-lg border bg-surface px-3 text-base sm:text-sm ${
-                  checked ? (right ? "border-good bg-good-soft" : "border-bad bg-bad-soft") : "border-border"
-                }`}
               >
-                <option value="">Choose…</option>
-                {field.options.map((o) => (
-                  <option key={o} value={o}>{o}</option>
-                ))}
-              </select>
+                <SelectTrigger id={fieldId} className={cn("h-11 w-full", checked && resultTone(right))}>
+                  <SelectValue placeholder="Choose…" />
+                </SelectTrigger>
+                <SelectContent>
+                  {field.options.map((o) => (
+                    <SelectItem key={o} value={o}>
+                      {o}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               {checked && !right && (
-                <span className="mt-1 block text-sm text-good">Correct: <code className="font-mono">{field.answer}</code></span>
+                <p className="text-sm text-good">
+                  Correct: <code className="font-mono">{field.answer}</code>
+                </p>
               )}
-            </label>
+            </div>
           );
         })}
       </div>
@@ -69,34 +84,37 @@ export function QuestionView({ question, response, onChange, checked }: Props) {
 
   if (question.type === "mcq" && response.type === "mcq") {
     return (
-      <div className="space-y-2" role="radiogroup">
-        {question.options.map((o) => {
+      <RadioGroup value={response.value} onValueChange={(v) => onChange({ type: "mcq", value: v })} disabled={checked} className="gap-2">
+        {question.options.map((o, i) => {
           const picked = response.value === o;
           const right = o === question.answer;
-          const style = checked
-            ? right
-              ? "border-good bg-good-soft"
-              : picked
-                ? "border-bad bg-bad-soft"
-                : "border-border opacity-60"
-            : picked
-              ? "border-accent bg-accent-soft"
-              : "border-border hover:bg-surface-2";
+          const optionId = `${id}-o${i}`;
           return (
-            <button
+            <Label
               key={o}
-              type="button"
-              role="radio"
-              aria-checked={picked}
-              disabled={checked}
-              onClick={() => onChange({ type: "mcq", value: o })}
-              className={`block min-h-11 w-full rounded-lg border px-3 py-2 text-left text-sm ${style}`}
+              htmlFor={optionId}
+              className={cn(
+                "flex min-h-11 cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 text-sm leading-snug font-normal transition-colors",
+                checked
+                  ? right
+                    ? "border-good bg-good-soft"
+                    : picked
+                      ? "border-bad bg-bad-soft"
+                      : "opacity-60"
+                  : picked
+                    ? "border-primary bg-primary/5"
+                    : "hover:bg-accent/60",
+                checked && "cursor-default",
+              )}
             >
-              {o}
-            </button>
+              <RadioGroupItem id={optionId} value={o} className="mt-0.5" />
+              <span className="flex-1">{o}</span>
+              {checked && right && <CheckCircle2 className="size-4 shrink-0 text-good" />}
+              {checked && picked && !right && <XCircle className="size-4 shrink-0 text-bad" />}
+            </Label>
           );
         })}
-      </div>
+      </RadioGroup>
     );
   }
 
@@ -124,8 +142,8 @@ function OrderInput({
 
   return (
     <div>
-      <p className="mb-2 text-sm text-muted">Tap the steps in the order they happen. Tap a placed step to remove it.</p>
-      <ol className="mb-3 space-y-2">
+      <p className="mb-3 text-sm text-muted-foreground">Tap the steps in the order they happen. Tap a placed step to remove it.</p>
+      <ol className="mb-4 space-y-2">
         {sequence.map((s, i) => {
           const right = question.steps[i] === s;
           return (
@@ -134,26 +152,31 @@ function OrderInput({
                 type="button"
                 disabled={checked}
                 onClick={() => onChange(sequence.filter((x) => x !== s))}
-                className={`flex min-h-11 w-full items-start gap-2 rounded-lg border px-3 py-2 text-left text-sm ${
-                  checked ? (right ? "border-good bg-good-soft" : "border-bad bg-bad-soft") : "border-accent bg-accent-soft"
-                }`}
+                className={cn(
+                  "flex min-h-11 w-full items-start gap-3 rounded-lg border px-3 py-2.5 text-left text-sm",
+                  checked ? resultTone(right) : "border-primary/40 bg-primary/5 hover:bg-primary/10",
+                )}
               >
-                <span className="font-mono font-semibold">{i + 1}.</span>
+                <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-primary-foreground">
+                  {i + 1}
+                </span>
                 <span>{s}</span>
               </button>
             </li>
           );
         })}
-        {sequence.length === 0 && <li className="rounded-lg border border-dashed border-border px-3 py-3 text-sm text-muted">Your order appears here</li>}
+        {sequence.length === 0 && (
+          <li className="rounded-lg border border-dashed px-3 py-3 text-sm text-muted-foreground">Your order appears here</li>
+        )}
       </ol>
-      {!checked && (
+      {!checked && remaining.length > 0 && (
         <div className="space-y-2">
           {remaining.map((s) => (
             <button
               key={s}
               type="button"
               onClick={() => onChange([...sequence, s])}
-              className="block min-h-11 w-full rounded-lg border border-border px-3 py-2 text-left text-sm hover:bg-surface-2"
+              className="block min-h-11 w-full rounded-lg border bg-background px-3 py-2.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground"
             >
               {s}
             </button>
@@ -161,10 +184,12 @@ function OrderInput({
         </div>
       )}
       {checked && sequence.some((s, i) => question.steps[i] !== s) && (
-        <div className="mt-2 rounded-lg bg-surface-2 px-3 py-2 text-sm">
+        <div className="mt-2 rounded-lg bg-muted px-3 py-2 text-sm">
           <p className="font-semibold">Correct order</p>
-          <ol className="ml-5 list-decimal">
-            {question.steps.map((s) => <li key={s}>{s}</li>)}
+          <ol className="mt-1 ml-5 list-decimal space-y-0.5">
+            {question.steps.map((s) => (
+              <li key={s}>{s}</li>
+            ))}
           </ol>
         </div>
       )}

@@ -48,7 +48,7 @@ export function RequestJourney() {
           const failed = failAt === i;
           return (
             <li key={h.name} className={`rounded-lg border p-3 text-sm ${failed ? "border-bad bg-bad-soft" : "border-border"}`}>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted">Hop {i + 1} · {h.name}</p>
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Hop {i + 1} · {h.name}</p>
               <p className="mt-1">{failed && fault !== "none" ? faults[fault].result : h.detail}</p>
             </li>
           );
@@ -66,7 +66,7 @@ export function RequestJourney() {
           type="button"
           onClick={() => setStep(shown + 1)}
           disabled={shown >= last}
-          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
+          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40"
         >
           {shown >= last ? "Done" : "Next hop"}
         </button>

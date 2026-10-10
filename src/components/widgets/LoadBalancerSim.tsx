@@ -67,13 +67,13 @@ export function LoadBalancerSim() {
       title="Load balancer"
       hint="18 requests arrive one per tick. Every third one is heavy (checkout: slow external call plus a big write), the rest are light. Compare where the heavy ones land."
     >
-      <p className="text-xs font-semibold uppercase tracking-wide text-muted">Algorithm</p>
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Algorithm</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {ALGOS.map((a) => (
           <Pill key={a.id} active={algo === a.id} onClick={() => setAlgo(a.id)}>{a.label}</Pill>
         ))}
       </div>
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">Break it</p>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Break it</p>
       <div className="mt-1 flex flex-wrap gap-2">
         <Pill active={bDown} onClick={() => setBDown((v) => !v)}>Server B crashed</Pill>
         <Pill active={health} onClick={() => setHealth((v) => !v)}>Health checks on</Pill>
@@ -86,21 +86,21 @@ export function LoadBalancerSim() {
           const down = bDown && s.id === "B";
           const removed = down && health;
           return (
-            <div key={s.id} className={`rounded-lg border p-2 ${down ? "border-bad bg-bad-soft" : "border-border bg-surface-2"}`}>
+            <div key={s.id} className={`rounded-lg border p-2 ${down ? "border-bad bg-bad-soft" : "border-border bg-muted"}`}>
               <div className="flex items-baseline justify-between gap-2">
                 <p className="font-semibold">Server {s.id}</p>
-                <p className="text-xs text-muted">{s.size}</p>
+                <p className="text-xs text-muted-foreground">{s.size}</p>
               </div>
-              <p className="text-xs text-muted">
+              <p className="text-xs text-muted-foreground">
                 {removed ? "Failed health check: out of rotation" : down ? "Down, but still in rotation" : `Peak in-flight: ${peak[s.id]} · heavy: ${heavyCount}`}
               </p>
               <ul className="mt-2 flex flex-wrap gap-1">
-                {items.length === 0 && <li className="text-xs text-muted">no requests</li>}
+                {items.length === 0 && <li className="text-xs text-muted-foreground">no requests</li>}
                 {items.map((r) => (
                   <li
                     key={r.n}
                     className={`rounded px-1.5 py-0.5 font-mono text-[0.7rem] ${
-                      r.failed ? "bg-bad text-white dark:text-bg" : r.heavy ? "bg-warn-soft font-semibold" : "bg-surface"
+                      r.failed ? "bg-bad text-primary-foreground" : r.heavy ? "bg-warn-soft font-semibold" : "bg-card"
                     }`}
                   >
                     #{r.n}
@@ -112,7 +112,7 @@ export function LoadBalancerSim() {
           );
         })}
       </div>
-      <p className={`mt-3 rounded-lg px-3 py-2 text-sm ${failures > 0 ? "bg-bad-soft" : "bg-surface-2"}`}>
+      <p className={`mt-3 rounded-lg px-3 py-2 text-sm ${failures > 0 ? "bg-bad-soft" : "bg-muted"}`}>
         {failures > 0
           ? `${failures} users got a 502 because the load balancer kept sending traffic to a dead server. Turn on health checks.`
           : algo === "rr"
@@ -121,7 +121,7 @@ export function LoadBalancerSim() {
               ? "Weighting sends A twice the traffic because it's twice the size, but it still can't see which requests are heavy."
               : "Least connections skips servers that are still busy with a heavy request, so heavy work spreads out."}
       </p>
-      <p className="mt-2 text-xs text-muted">H = heavy request (9 ticks). Light requests finish within a tick.</p>
+      <p className="mt-2 text-xs text-muted-foreground">H = heavy request (9 ticks). Light requests finish within a tick.</p>
     </Widget>
   );
 }

@@ -66,7 +66,7 @@ export function SessionVsJwt() {
           const r = outcome(strategy, m, revoked);
           return (
             <li key={m} className={`rounded-lg border p-3 text-sm ${r === "200" ? "border-bad bg-bad-soft" : "border-good bg-good-soft"}`}>
-              <p className="text-xs text-muted">Attacker, minute {m}</p>
+              <p className="text-xs text-muted-foreground">Attacker, minute {m}</p>
               <p className="font-mono font-semibold">{r === "200" ? "200 OK" : "401"}</p>
               <p className="text-xs">{r === "200" ? "Got in" : "Blocked"}</p>
             </li>
@@ -75,9 +75,9 @@ export function SessionVsJwt() {
       </ol>
 
       <dl className="mt-4 grid gap-2 text-sm sm:grid-cols-3">
-        <div className="rounded-lg bg-surface-2 p-3"><dt className="text-xs font-semibold uppercase text-muted">Lookup per request</dt><dd>{f.lookup}</dd></div>
-        <div className="rounded-lg bg-surface-2 p-3"><dt className="text-xs font-semibold uppercase text-muted">Revocation</dt><dd>{f.revoke}</dd></div>
-        <div className="rounded-lg bg-surface-2 p-3"><dt className="text-xs font-semibold uppercase text-muted">Scaling</dt><dd>{f.scale}</dd></div>
+        <div className="rounded-lg bg-muted p-3"><dt className="text-xs font-semibold uppercase text-muted-foreground">Lookup per request</dt><dd>{f.lookup}</dd></div>
+        <div className="rounded-lg bg-muted p-3"><dt className="text-xs font-semibold uppercase text-muted-foreground">Revocation</dt><dd>{f.revoke}</dd></div>
+        <div className="rounded-lg bg-muted p-3"><dt className="text-xs font-semibold uppercase text-muted-foreground">Scaling</dt><dd>{f.scale}</dd></div>
       </dl>
       {strategy === "hybrid" && (
         <p className="mt-3 rounded-lg bg-warn-soft px-3 py-2 text-sm">

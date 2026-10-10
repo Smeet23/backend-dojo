@@ -48,9 +48,9 @@ export function ConceptTranslator() {
           <li key={c.name} className="grid gap-1 rounded-lg border border-border p-3 text-sm sm:grid-cols-[1fr_auto] sm:items-center sm:gap-4">
             <div>
               <p className="font-semibold">{c.name}</p>
-              <p className="text-muted">{c.idea}</p>
+              <p className="text-muted-foreground">{c.idea}</p>
             </div>
-            <p className="rounded-md bg-accent-soft px-2 py-1 font-mono text-[0.8rem] text-accent sm:text-right">{c.tools[lang]}</p>
+            <p className="rounded-md bg-primary/10 px-2 py-1 font-mono text-[0.8rem] text-primary sm:text-right">{c.tools[lang]}</p>
           </li>
         ))}
       </ul>

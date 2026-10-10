@@ -37,9 +37,9 @@ const groups = [
 ];
 
 const tone: Record<number, string> = {
-  1: "bg-surface-2",
+  1: "bg-muted",
   2: "bg-good-soft text-good",
-  3: "bg-accent-soft text-accent",
+  3: "bg-primary/10 text-primary",
   4: "bg-warn-soft text-warn",
   5: "bg-bad-soft text-bad",
 };
@@ -65,15 +65,15 @@ export function StatusCodeFinder() {
               type="button"
               onClick={() => setOpen(open === c.code ? null : c.code)}
               aria-expanded={open === c.code}
-              className="flex w-full items-center gap-3 rounded-lg border border-border px-3 py-2 text-left hover:bg-surface-2"
+              className="flex w-full items-center gap-3 rounded-lg border border-border px-3 py-2 text-left hover:bg-muted"
             >
               <span className={`rounded-md px-2 py-0.5 font-mono text-sm font-semibold ${tone[group]}`}>{c.code}</span>
               <span className="text-sm font-medium">{c.name}</span>
             </button>
             {open === c.code && (
-              <div className="mt-1 rounded-lg bg-surface-2 px-3 py-2 text-sm">
+              <div className="mt-1 rounded-lg bg-muted px-3 py-2 text-sm">
                 <p><span className="font-semibold">When:</span> {c.when}</p>
-                <p className="mt-1 text-muted"><span className="font-semibold text-text">Example:</span> {c.example}</p>
+                <p className="mt-1 text-muted-foreground"><span className="font-semibold text-foreground">Example:</span> {c.example}</p>
               </div>
             )}
           </li>

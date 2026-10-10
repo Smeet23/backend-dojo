@@ -113,16 +113,16 @@ export function WebhookDeliverySim() {
     <Widget title="Webhook delivery simulator" hint="A customer pays once. Stripe sends payment_succeeded (evt_9f2) to your endpoint. Step through the deliveries.">
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted">Your server</span>
+          <span className="w-24 text-muted-foreground">Your server</span>
           {RECEIVERS.map((r) => <Pill key={r.id} active={receiver === r.id} onClick={() => reset(setReceiver)(r.id)}>{r.label}</Pill>)}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted">Handler</span>
+          <span className="w-24 text-muted-foreground">Handler</span>
           <Pill active={!idempotent} onClick={() => reset(setIdempotent)(false)}>Just does the work</Pill>
           <Pill active={idempotent} onClick={() => reset(setIdempotent)(true)}>Dedupes on event id</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted">Provider</span>
+          <span className="w-24 text-muted-foreground">Provider</span>
           <Pill active={policy === "backoff"} onClick={() => reset(setPolicy)("backoff")}>Retries with backoff</Pill>
           <Pill active={policy === "none"} onClick={() => reset(setPolicy)("none")}>Never retries</Pill>
         </div>
@@ -136,27 +136,27 @@ export function WebhookDeliverySim() {
               a.tone === "good" ? "border-good bg-good-soft" : a.tone === "bad" ? "border-bad bg-bad-soft" : "border-warn bg-warn-soft"
             }`}
           >
-            <p className="text-xs font-semibold uppercase tracking-wide text-muted">t = {a.at}</p>
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">t = {a.at}</p>
             <p className="mt-1 break-words font-mono text-[0.78rem]">{a.request}</p>
             <p className="mt-1 font-medium">{a.outcome}</p>
-            <p className="mt-0.5 text-muted">{a.note}</p>
+            <p className="mt-0.5 text-muted-foreground">{a.note}</p>
           </li>
         ))}
       </ol>
 
       <div className="mt-3 grid gap-2 sm:grid-cols-2">
-        <div className={`rounded-lg px-3 py-2 text-sm ${duplicated ? "bg-bad-soft" : "bg-surface-2"}`}>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Pro time granted</p>
+        <div className={`rounded-lg px-3 py-2 text-sm ${duplicated ? "bg-bad-soft" : "bg-muted"}`}>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Pro time granted</p>
           <p className="font-mono">{state.proDays} days {duplicated && "(paid for 30!)"}</p>
         </div>
-        <div className={`rounded-lg px-3 py-2 text-sm ${state.receipts > 1 ? "bg-bad-soft" : "bg-surface-2"}`}>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Receipt emails sent</p>
+        <div className={`rounded-lg px-3 py-2 text-sm ${state.receipts > 1 ? "bg-bad-soft" : "bg-muted"}`}>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Receipt emails sent</p>
           <p className="font-mono">{state.receipts}</p>
         </div>
       </div>
 
       {finished && (
-        <p className="mt-3 rounded-lg bg-surface-2 px-3 py-2 text-sm">
+        <p className="mt-3 rounded-lg bg-muted px-3 py-2 text-sm">
           {duplicated
             ? "At-least-once delivery bit you: the same event ran twice. Switch the handler to dedupe on the event id."
             : state.proDays === 0
@@ -171,7 +171,7 @@ export function WebhookDeliverySim() {
           type="button"
           onClick={() => setStep(current + 1)}
           disabled={finished}
-          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
+          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40"
         >
           {finished ? "Done" : `Next delivery (${current + 1}/${attempts.length})`}
         </button>

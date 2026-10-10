@@ -83,14 +83,14 @@ export function PasswordHashLadder() {
         ))}
       </div>
 
-      <p className="mt-4 text-xs font-semibold uppercase tracking-wide text-muted">Stored column: {s.column}</p>
+      <p className="mt-4 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Stored column: {s.column}</p>
       <ul className="mt-2 space-y-2">
         {USERS.map((u, i) => (
           <li
             key={u.email}
-            className={`rounded-lg border p-2.5 ${duplicate && i < 2 ? "border-bad" : "border-border"} bg-surface-2`}
+            className={`rounded-lg border p-2.5 ${duplicate && i < 2 ? "border-bad" : "border-border"} bg-muted`}
           >
-            <p className="text-xs text-muted">{u.email}</p>
+            <p className="text-xs text-muted-foreground">{u.email}</p>
             <p className="mt-0.5 whitespace-pre-wrap break-all font-mono text-[0.75rem]">{rows[i]}</p>
           </li>
         ))}
@@ -101,7 +101,7 @@ export function PasswordHashLadder() {
         <p><span className="font-semibold">Attacker guess rate:</span> {GUESS_RATE[stage]}</p>
         <p className="mt-1">{s.verdict}</p>
       </div>
-      <p className="mt-2 text-xs text-muted">Hash strings are illustrative, not real SHA-256 or Argon2 output.</p>
+      <p className="mt-2 text-xs text-muted-foreground">Hash strings are illustrative, not real SHA-256 or Argon2 output.</p>
     </Widget>
   );
 }

@@ -75,21 +75,21 @@ export function CorsFlow() {
     <Widget title="CORS flow simulator" hint="Page at app.notes.dev calls api.notes.dev. Change the request and step through what the browser does.">
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted">Method</span>
+          <span className="w-20 text-muted-foreground">Method</span>
           {METHODS.map((m) => <Pill key={m} active={method === m} onClick={() => reset(setMethod)(m)}>{m}</Pill>)}
         </div>
         {method !== "GET" && (
           <div className="flex flex-wrap items-center gap-2">
-            <span className="w-20 text-muted">Body type</span>
+            <span className="w-20 text-muted-foreground">Body type</span>
             {TYPES.map((t) => <Pill key={t} active={ctype === t} onClick={() => reset(setCtype)(t)}>{t.replace("application/", "")}</Pill>)}
           </div>
         )}
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted">Auth</span>
+          <span className="w-20 text-muted-foreground">Auth</span>
           <Pill active={auth} onClick={() => reset(setAuth)(!auth)}>{auth ? "Authorization header ✓" : "No auth header"}</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted">Server</span>
+          <span className="w-20 text-muted-foreground">Server</span>
           <Pill active={allowed} onClick={() => reset(setAllowed)(true)}>Allows this origin</Pill>
           <Pill active={!allowed} onClick={() => reset(setAllowed)(false)}>Doesn&apos;t</Pill>
         </div>
@@ -110,11 +110,11 @@ export function CorsFlow() {
         {steps.slice(0, current + 1).map((s, i) => (
           <li
             key={i}
-            className={`rounded-lg border p-3 text-sm ${s.from === "Server" ? "ml-6 border-border bg-surface-2" : "mr-6 border-border"} ${
+            className={`rounded-lg border p-3 text-sm ${s.from === "Server" ? "ml-6 border-border bg-muted" : "mr-6 border-border"} ${
               s.tone === "good" ? "border-good bg-good-soft" : s.tone === "bad" ? "border-bad bg-bad-soft" : ""
             }`}
           >
-            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted">
+            <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               {s.from === "Browser" ? "Browser →" : "← Server"} · {s.title}
             </p>
             <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[0.78rem] leading-6">{s.lines.join("\n")}</pre>
@@ -127,7 +127,7 @@ export function CorsFlow() {
           type="button"
           onClick={() => setStep(current + 1)}
           disabled={current >= steps.length - 1}
-          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
+          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40"
         >
           {current >= steps.length - 1 ? "Done" : `Next step (${current + 1}/${steps.length})`}
         </button>

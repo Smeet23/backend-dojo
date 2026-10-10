@@ -59,13 +59,13 @@ export function LatencyPercentiles() {
 
   return (
     <Widget title="Latency percentiles" hint="1,000 requests to GET /products. Most are fast. Change how many are slow and watch which numbers notice.">
-      <p className="text-xs font-semibold uppercase tracking-wide text-muted">Share of slow requests</p>
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Share of slow requests</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {TAIL_SHARES.map((t) => (
           <Pill key={t} active={tail === t} onClick={() => setTail(t)}>{t}%</Pill>
         ))}
       </div>
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">A slow request takes about</p>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">A slow request takes about</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {SLOW_MS.map((s) => (
           <Pill key={s} active={slow === s} onClick={() => setSlow(s)}>{fmt(s)}</Pill>
@@ -82,20 +82,20 @@ export function LatencyPercentiles() {
                 <span className="font-semibold">{r.label}</span>
                 <span className="font-mono">{fmt(r.value)}</span>
               </div>
-              <div className="mt-1 h-2 w-full rounded-full bg-surface-2">
+              <div className="mt-1 h-2 w-full rounded-full bg-muted">
                 <div className={`h-2 rounded-full ${tone}`} style={{ width: `${width}%` }} />
               </div>
-              <p className="mt-0.5 text-xs text-muted">{r.note}</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">{r.note}</p>
             </li>
           );
         })}
       </ul>
-      <p className="mt-3 rounded-lg bg-surface-2 px-3 py-2 text-sm">
+      <p className="mt-3 rounded-lg bg-muted px-3 py-2 text-sm">
         {tail === 0
           ? "No slow tail: every percentile tells roughly the same story."
           : `At 1 million requests a day, about ${slowPerDay.toLocaleString("en-US")} people wait around ${fmt(slow)}. Notice the p50 barely moves, and the average lands somewhere no real request lives.`}
       </p>
-      <p className="mt-2 text-xs text-muted">Bars use a log scale so fast and slow values fit on one screen.</p>
+      <p className="mt-2 text-xs text-muted-foreground">Bars use a log scale so fast and slow values fit on one screen.</p>
     </Widget>
   );
 }

@@ -42,29 +42,29 @@ export function CacheFlow() {
   return (
     <Widget title="Conditional GET with ETags" hint="Fetch a few times, update the resource, then fetch again.">
       <div className="grid grid-cols-2 gap-2 text-sm">
-        <div className="rounded-lg bg-surface-2 p-2">
-          <p className="text-xs text-muted">Browser cache</p>
+        <div className="rounded-lg bg-muted p-2">
+          <p className="text-xs text-muted-foreground">Browser cache</p>
           <p className="truncate font-mono">{cached ? cached.etag : "empty"}</p>
         </div>
-        <div className="rounded-lg bg-surface-2 p-2">
-          <p className="text-xs text-muted">Server ETag</p>
+        <div className="rounded-lg bg-muted p-2">
+          <p className="text-xs text-muted-foreground">Server ETag</p>
           <p className="truncate font-mono">{etagFor(serverVersion)}</p>
         </div>
       </div>
       <div className="mt-3 flex gap-2">
-        <button type="button" onClick={fetchResource} className="min-h-10 flex-1 rounded-lg bg-accent px-3 text-sm font-medium text-white dark:text-bg">
+        <button type="button" onClick={fetchResource} className="min-h-10 flex-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground">
           Fetch profile
         </button>
         <button type="button" onClick={updateResource} className="min-h-10 flex-1 rounded-lg border border-border px-3 text-sm">
           Update profile
         </button>
       </div>
-      <p className="mt-2 text-xs text-muted">Body bytes downloaded so far: {bytes} KB</p>
+      <p className="mt-2 text-xs text-muted-foreground">Body bytes downloaded so far: {bytes} KB</p>
       <ol className="mt-3 space-y-2">
         {log.map((e, i) => (
           <li
             key={log.length - i}
-            className={`rounded-lg border p-3 text-sm ${e.tone === "good" ? "border-good bg-good-soft" : e.tone === "accent" ? "border-accent bg-accent-soft" : "border-border"}`}
+            className={`rounded-lg border p-3 text-sm ${e.tone === "good" ? "border-good bg-good-soft" : e.tone === "accent" ? "border-primary bg-primary/10" : "border-border"}`}
           >
             <div className="grid gap-2 sm:grid-cols-2">
               <pre className="whitespace-pre-wrap break-all font-mono text-[0.75rem] leading-5">→ {e.request.join("\n  ")}</pre>

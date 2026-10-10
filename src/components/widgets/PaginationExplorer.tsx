@@ -78,21 +78,21 @@ export function PaginationExplorer() {
     <Widget title="Pagination explorer" hint="Scroll a task feed page by page. Between pages, add or delete a task and compare offset with cursor pagination.">
       <div className="space-y-2 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-16 text-muted">Mode</span>
+          <span className="w-16 text-muted-foreground">Mode</span>
           <Pill active={mode === "offset"} onClick={() => reset("offset")}>Offset (page + limit)</Pill>
           <Pill active={mode === "cursor"} onClick={() => reset("cursor")}>Cursor</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-16 text-muted">Limit</span>
+          <span className="w-16 text-muted-foreground">Limit</span>
           {[3, 4, 5].map((n) => <Pill key={n} active={limit === n} onClick={() => reset(mode, n)}>{n}</Pill>)}
         </div>
       </div>
 
-      <div className="mt-3 rounded-lg bg-surface-2 p-3">
-        <p className="text-xs font-semibold uppercase tracking-wide text-muted">Table (newest first)</p>
+      <div className="mt-3 rounded-lg bg-muted p-3">
+        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Table (newest first)</p>
         <div className="mt-2 flex flex-wrap gap-1.5">
           {table.map((id) => (
-            <span key={id} className={`rounded-md border px-2 py-1 font-mono text-xs ${START.includes(id) ? "border-border bg-surface" : "border-accent bg-accent-soft"}`}>
+            <span key={id} className={`rounded-md border px-2 py-1 font-mono text-xs ${START.includes(id) ? "border-border bg-card" : "border-primary bg-primary/10"}`}>
               task {id}
             </span>
           ))}
@@ -104,7 +104,7 @@ export function PaginationExplorer() {
           type="button"
           onClick={next}
           disabled={exhausted}
-          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
+          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40"
         >
           {exhausted ? "No more pages" : fetches.length ? "Load next page" : "Load first page"}
         </button>
@@ -123,16 +123,16 @@ export function PaginationExplorer() {
         {fetches.map((f, i) => (
           <li key={i} className="rounded-lg border border-border p-3 text-sm">
             <p className="break-all font-mono text-[0.78rem] font-semibold">{f.request}</p>
-            <p className="mt-0.5 break-all font-mono text-[0.72rem] text-muted">{f.sql}</p>
+            <p className="mt-0.5 break-all font-mono text-[0.72rem] text-muted-foreground">{f.sql}</p>
             <div className="mt-2 flex flex-wrap gap-1.5">
               {f.items.map((id) => (
                 <span key={id} className={`rounded-md px-2 py-1 font-mono text-xs ${(counts.get(id) ?? 0) > 1 ? "bg-bad-soft" : "bg-good-soft"}`}>
                   task {id}
                 </span>
               ))}
-              {f.items.length === 0 && <span className="text-xs text-muted">(empty page)</span>}
+              {f.items.length === 0 && <span className="text-xs text-muted-foreground">(empty page)</span>}
             </div>
-            <p className="mt-1 text-xs text-muted">{f.meta}</p>
+            <p className="mt-1 text-xs text-muted-foreground">{f.meta}</p>
           </li>
         ))}
       </ol>

@@ -1,92 +1,183 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
 @plugin "@tailwindcss/typography";
 
+/* Dark mode follows the .dark class set by next-themes (Light / Dark / System). */
+@custom-variant dark (&:is(.dark *));
+
 :root {
-  --bg: #fafaf9;
-  --surface: #ffffff;
-  --surface-2: #f4f4f2;
-  --border: #e4e4e0;
-  --text: #1c1c1a;
-  --muted: #6b6b66;
-  --accent: #2f5bd3;
-  --accent-soft: #e8eefc;
-  --good: #1f8a4c;
-  --good-soft: #e5f4ea;
-  --warn: #a86a00;
-  --warn-soft: #fbf1dc;
-  --bad: #c23b3b;
-  --bad-soft: #fbe7e7;
+  --radius: 0.75rem;
+  --background: oklch(0.99 0 0);
+  --foreground: oklch(0.21 0.006 285.885);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.21 0.006 285.885);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.21 0.006 285.885);
+  /* One accent: indigo. */
+  --primary: oklch(0.511 0.262 276.966);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.967 0.001 286.375);
+  --secondary-foreground: oklch(0.21 0.006 285.885);
+  --muted: oklch(0.967 0.001 286.375);
+  --muted-foreground: oklch(0.552 0.016 285.938);
+  --accent: oklch(0.962 0.018 272.314);
+  --accent-foreground: oklch(0.359 0.144 278.697);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.92 0.004 286.32);
+  --input: oklch(0.92 0.004 286.32);
+  --ring: oklch(0.511 0.262 276.966);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.21 0.006 285.885);
+  --sidebar-primary: oklch(0.511 0.262 276.966);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.962 0.018 272.314);
+  --sidebar-accent-foreground: oklch(0.359 0.144 278.697);
+  --sidebar-border: oklch(0.92 0.004 286.32);
+  --sidebar-ring: oklch(0.511 0.262 276.966);
+  --chart-1: oklch(0.511 0.262 276.966);
+  --chart-2: oklch(0.627 0.194 149.214);
+  --chart-3: oklch(0.769 0.188 70.08);
+  --chart-4: oklch(0.637 0.237 25.331);
+  --chart-5: oklch(0.552 0.016 285.938);
+  /* Feedback colors used by quizzes and widgets. */
+  --good: oklch(0.527 0.154 150.069);
+  --good-soft: oklch(0.962 0.044 156.743);
+  --warn: oklch(0.555 0.163 48.998);
+  --warn-soft: oklch(0.973 0.071 103.193);
+  --bad: oklch(0.577 0.245 27.325);
+  --bad-soft: oklch(0.971 0.013 17.38);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #121211;
-    --surface: #1a1a19;
-    --surface-2: #222220;
-    --border: #2e2e2b;
-    --text: #ececea;
-    --muted: #9a9a94;
-    --accent: #7c9dff;
-    --accent-soft: #1d2640;
-    --good: #4fc27f;
-    --good-soft: #15291e;
-    --warn: #e0a640;
-    --warn-soft: #2e2412;
-    --bad: #f07272;
-    --bad-soft: #321a1a;
-  }
+.dark {
+  --background: oklch(0.141 0.005 285.823);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.18 0.006 285.885);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.18 0.006 285.885);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.585 0.233 277.117);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.274 0.006 286.033);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.235 0.006 285.885);
+  --muted-foreground: oklch(0.705 0.015 286.067);
+  --accent: oklch(0.279 0.077 274.0);
+  --accent-foreground: oklch(0.87 0.065 274.039);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.585 0.233 277.117);
+  --sidebar: oklch(0.16 0.005 285.823);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.585 0.233 277.117);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.279 0.077 274.0);
+  --sidebar-accent-foreground: oklch(0.87 0.065 274.039);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.585 0.233 277.117);
+  --chart-1: oklch(0.585 0.233 277.117);
+  --chart-2: oklch(0.723 0.219 149.579);
+  --chart-3: oklch(0.795 0.184 86.047);
+  --chart-4: oklch(0.704 0.191 22.216);
+  --chart-5: oklch(0.705 0.015 286.067);
+  --good: oklch(0.792 0.209 151.711);
+  --good-soft: oklch(0.266 0.065 152.934);
+  --warn: oklch(0.828 0.189 84.429);
+  --warn-soft: oklch(0.286 0.066 53.813);
+  --bad: oklch(0.704 0.191 22.216);
+  --bad-soft: oklch(0.258 0.092 26.042);
 }
 
 @theme inline {
-  --color-bg: var(--bg);
-  --color-surface: var(--surface);
-  --color-surface-2: var(--surface-2);
-  --color-border: var(--border);
-  --color-text: var(--text);
+  /* Literal names: @theme inline can't resolve the runtime font variables. */
+  --font-sans: "Geist", "Geist Fallback", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", "Geist Mono Fallback", ui-monospace, monospace;
+  --font-heading: var(--font-sans);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
   --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
   --color-accent: var(--accent);
-  --color-accent-soft: var(--accent-soft);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
   --color-good: var(--good);
   --color-good-soft: var(--good-soft);
   --color-warn: var(--warn);
   --color-warn-soft: var(--warn-soft);
   --color-bad: var(--bad);
   --color-bad-soft: var(--bad-soft);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
 }
 
-html {
-  scroll-behavior: smooth;
-  -webkit-text-size-adjust: 100%;
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+    scroll-behavior: smooth;
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
 }
 
-body {
-  background: var(--bg);
-  color: var(--text);
-}
-
-/* Anchored headings clear the sticky header. */
+/* Anchored headings clear the sticky top bar. */
 h2[id],
 h3[id] {
   scroll-margin-top: 5rem;
 }
 
+/* Lesson typography follows the theme tokens in both modes. */
 .lesson {
-  --tw-prose-body: var(--text);
-  --tw-prose-headings: var(--text);
-  --tw-prose-bold: var(--text);
-  --tw-prose-links: var(--accent);
-  --tw-prose-bullets: var(--muted);
-  --tw-prose-counters: var(--muted);
-  --tw-prose-quotes: var(--text);
-  --tw-prose-quote-borders: var(--accent);
-  --tw-prose-code: var(--text);
+  --tw-prose-body: var(--foreground);
+  --tw-prose-headings: var(--foreground);
+  --tw-prose-lead: var(--muted-foreground);
+  --tw-prose-bold: var(--foreground);
+  --tw-prose-links: var(--primary);
+  --tw-prose-bullets: var(--muted-foreground);
+  --tw-prose-counters: var(--muted-foreground);
+  --tw-prose-quotes: var(--foreground);
+  --tw-prose-quote-borders: var(--primary);
+  --tw-prose-captions: var(--muted-foreground);
+  --tw-prose-code: var(--foreground);
   --tw-prose-hr: var(--border);
   --tw-prose-th-borders: var(--border);
   --tw-prose-td-borders: var(--border);
-  --tw-prose-pre-bg: var(--surface-2);
-  --tw-prose-pre-code: var(--text);
+  --tw-prose-pre-bg: var(--muted);
+  --tw-prose-pre-code: var(--foreground);
 }
 
 .lesson :where(code):not(:where(pre code))::before,
@@ -95,7 +186,7 @@ h3[id] {
 }
 
 .lesson :where(code):not(:where(pre code)) {
-  background: var(--surface-2);
+  background: var(--muted);
   border: 1px solid var(--border);
   border-radius: 0.3rem;
   padding: 0.05rem 0.3rem;
@@ -107,6 +198,7 @@ h3[id] {
 
 .lesson pre {
   border: 1px solid var(--border);
+  border-radius: var(--radius);
   font-size: 0.8125rem;
   line-height: 1.6;
 }

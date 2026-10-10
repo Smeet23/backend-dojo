@@ -53,19 +53,19 @@ export function RangeRequestLab() {
       </div>
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         <div className="rounded-lg border border-border p-3">
-          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted">Request</p>
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Request</p>
           <pre className="whitespace-pre-wrap break-all font-mono text-[0.78rem] leading-6">
             {["GET /t_81/u_42/9f3c2a.png HTTP/1.1", "Host: notes-uploads.s3.amazonaws.com", ...(preset.range ? [`Range: ${preset.range}`] : [])].join("\n")}
           </pre>
         </div>
         <div className={`rounded-lg border p-3 ${res.tone === "good" ? "border-good bg-good-soft" : "border-bad bg-bad-soft"}`}>
-          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted">Response</p>
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Response</p>
           <pre className="whitespace-pre-wrap break-all font-mono text-[0.78rem] leading-6">
             {[`HTTP/1.1 ${res.status}`, ...res.headers, "", res.body].join("\n")}
           </pre>
         </div>
       </div>
-      <p className="mt-3 rounded-lg bg-surface-2 px-3 py-2 text-sm">{preset.why}</p>
+      <p className="mt-3 rounded-lg bg-muted px-3 py-2 text-sm">{preset.why}</p>
     </Widget>
   );
 }

@@ -51,7 +51,7 @@ export function MessageAnatomy() {
         <Pill active={tab === "request"} onClick={() => { setTab("request"); setSelected("method"); }}>Request</Pill>
         <Pill active={tab === "response"} onClick={() => { setTab("response"); setSelected("status"); }}>Response</Pill>
       </div>
-      <pre className="overflow-x-auto rounded-lg border border-border bg-surface-2 p-3 font-mono text-[0.8rem] leading-7">
+      <pre className="overflow-x-auto rounded-lg border border-border bg-muted p-3 font-mono text-[0.8rem] leading-7">
         {lines.map((line, i) => (
           <div key={i}>
             {line.map((part, j) =>
@@ -61,8 +61,8 @@ export function MessageAnatomy() {
                   type="button"
                   onClick={() => setSelected(part.key!)}
                   className={`rounded px-0.5 transition-colors ${
-                    selected === part.key ? "bg-accent text-white dark:text-bg" : "hover:bg-accent-soft"
-                  } ${part.key === "blank" ? "text-muted" : ""}`}
+                    selected === part.key ? "bg-primary text-primary-foreground" : "hover:bg-primary/10"
+                  } ${part.key === "blank" ? "text-muted-foreground" : ""}`}
                 >
                   {part.text}
                 </button>
@@ -74,7 +74,7 @@ export function MessageAnatomy() {
         ))}
       </pre>
       {info && (
-        <div className="mt-3 rounded-lg bg-accent-soft px-3 py-2 text-sm" aria-live="polite">
+        <div className="mt-3 rounded-lg bg-primary/10 px-3 py-2 text-sm" aria-live="polite">
           <span className="font-semibold">{info.name}:</span> {info.body}
         </div>
       )}

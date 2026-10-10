@@ -90,14 +90,14 @@ export function ShutdownTimeline() {
     >
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted">Signal</span>
+          <span className="w-20 text-muted-foreground">Signal</span>
           <Pill active={mode === "graceful"} onClick={() => { setMode("graceful"); setStep(0); }}>SIGTERM, handled</Pill>
           <Pill active={mode === "ignore"} onClick={() => { setMode("ignore"); setStep(0); }}>SIGTERM, ignored</Pill>
           <Pill active={mode === "kill"} onClick={() => { setMode("kill"); setStep(0); }}>SIGKILL</Pill>
         </div>
         {mode === "graceful" && (
           <div className="flex flex-wrap items-center gap-2">
-            <span className="w-20 text-muted">Drain timeout</span>
+            <span className="w-20 text-muted-foreground">Drain timeout</span>
             {[5, 25, 60].map((t) => (
               <Pill key={t} active={timeout === t} onClick={() => { setTimeoutSecs(t); setStep(0); }}>{t}s</Pill>
             ))}
@@ -113,7 +113,7 @@ export function ShutdownTimeline() {
               e.tone === "good" ? "border-good bg-good-soft" : e.tone === "bad" ? "border-bad bg-bad-soft" : e.tone === "warn" ? "border-warn bg-warn-soft" : "border-border"
             }`}
           >
-            <span className="w-12 shrink-0 font-mono text-xs text-muted">t={e.t}s</span>
+            <span className="w-12 shrink-0 font-mono text-xs text-muted-foreground">t={e.t}s</span>
             <span>{e.text}</span>
           </li>
         ))}
@@ -137,7 +137,7 @@ export function ShutdownTimeline() {
           type="button"
           onClick={() => setStep(current + 1)}
           disabled={done}
-          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
+          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40"
         >
           {done ? "Done" : `Next event (${current + 1}/${events.length})`}
         </button>

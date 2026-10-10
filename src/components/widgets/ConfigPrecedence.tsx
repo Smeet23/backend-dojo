@@ -80,7 +80,7 @@ export function ConfigPrecedence() {
         <Pill active={env === "development"} onClick={() => setEnv("development")}>Development</Pill>
         <Pill active={env === "production"} onClick={() => setEnv("production")}>Production</Pill>
       </div>
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">Layers (lowest → highest priority)</p>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Layers (lowest → highest priority)</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {LAYERS.map((layer) => (
           <Pill key={layer} active={enabled[layer]} onClick={() => setEnabled((e) => ({ ...e, [layer]: !e[layer] }))}>
@@ -88,7 +88,7 @@ export function ConfigPrecedence() {
           </Pill>
         ))}
       </div>
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">Break it</p>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Break it</p>
       <div className="mt-1 flex flex-wrap gap-2">
         <Pill active={forgetKey} onClick={() => setForgetKey((v) => !v)}>Forget STRIPE_API_KEY in prod</Pill>
         <Pill active={typo} onClick={() => setTypo((v) => !v)}>DB_POOL_SIZE=fifty</Pill>
@@ -99,7 +99,7 @@ export function ConfigPrecedence() {
           <li key={r.key} className={`rounded-lg border p-2 ${r.error ? "border-bad bg-bad-soft" : "border-border"}`}>
             <div className="flex flex-wrap items-baseline justify-between gap-x-3">
               <span className="font-mono text-sm font-semibold">{r.key}</span>
-              <span className="text-xs text-muted">{r.from ? `from ${LAYER_LABEL[r.from]}` : "not set"}</span>
+              <span className="text-xs text-muted-foreground">{r.from ? `from ${LAYER_LABEL[r.from]}` : "not set"}</span>
             </div>
             <p className="mt-0.5 break-all font-mono text-[0.8rem]">{r.value === undefined ? "(undefined)" : mask(r.key, r.value)}</p>
             <div className="mt-1 flex flex-wrap gap-1">
@@ -111,7 +111,7 @@ export function ConfigPrecedence() {
                   <span
                     key={layer}
                     className={`rounded px-1.5 py-0.5 text-[0.7rem] ${
-                      !enabled[layer] ? "bg-surface-2 text-muted line-through" : winner ? "bg-accent text-white dark:text-bg" : "bg-surface-2 text-muted"
+                      !enabled[layer] ? "bg-muted text-muted-foreground line-through" : winner ? "bg-primary text-primary-foreground" : "bg-muted text-muted-foreground"
                     }`}
                   >
                     {LAYER_LABEL[layer]}: {mask(r.key, v)}
@@ -132,7 +132,7 @@ export function ConfigPrecedence() {
                 <li key={e} className="break-all">{e}</li>
               ))}
             </ul>
-            <p className="mt-1 text-muted">With a rolling deploy, the old version keeps serving traffic.</p>
+            <p className="mt-1 text-muted-foreground">With a rolling deploy, the old version keeps serving traffic.</p>
           </>
         ) : (
           <p className="font-semibold">Config valid. Server starts on port {rows[0].value}.</p>

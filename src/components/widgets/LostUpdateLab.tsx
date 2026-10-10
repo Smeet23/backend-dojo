@@ -56,15 +56,15 @@ export function LostUpdateLab() {
         ))}
       </div>
 
-      <div className="mt-3 flex items-center justify-between rounded-lg bg-surface-2 px-3 py-2 text-sm">
-        <span className="text-muted">products.stock (id 7)</span>
+      <div className="mt-3 flex items-center justify-between rounded-lg bg-muted px-3 py-2 text-sm">
+        <span className="text-muted-foreground">products.stock (id 7)</span>
         <span className="font-mono text-lg font-semibold">{value}</span>
       </div>
 
       <ol className="mt-3 space-y-2">
         {shown.map((s, i) => (
           <li key={i} className={`rounded-lg border p-2 text-sm ${s.blocked ? "border-warn bg-warn-soft" : "border-border"} ${s.who === "B" ? "sm:ml-8" : "sm:mr-8"}`}>
-            <p className="text-xs font-semibold text-accent">Request {s.who}{s.blocked ? " (waiting)" : ""}</p>
+            <p className="text-xs font-semibold text-primary">Request {s.who}{s.blocked ? " (waiting)" : ""}</p>
             <pre className="mt-1 whitespace-pre-wrap break-all font-mono text-[0.72rem] leading-5">{s.sql}</pre>
             <p className="mt-1">{s.note}</p>
           </li>
@@ -72,7 +72,7 @@ export function LostUpdateLab() {
       </ol>
 
       <div className="mt-3 flex gap-2">
-        <button type="button" disabled={done} onClick={() => setStep((s) => s + 1)} className="min-h-10 flex-1 rounded-lg bg-accent px-3 text-sm font-medium text-white disabled:opacity-50 dark:text-bg">
+        <button type="button" disabled={done} onClick={() => setStep((s) => s + 1)} className="min-h-10 flex-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground disabled:opacity-50">
           Next step
         </button>
         <button type="button" onClick={() => setStep(0)} className="min-h-10 rounded-lg border border-border px-3 text-sm">

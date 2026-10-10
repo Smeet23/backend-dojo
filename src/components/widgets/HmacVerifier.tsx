@@ -76,19 +76,19 @@ export function HmacVerifier() {
 
   return (
     <Widget title="HMAC signature check" hint="The provider signs timestamp.body with a shared secret. Break something, then verify like a receiver would.">
-      <p className="text-xs font-semibold uppercase tracking-wide text-muted">Body as the provider sent it</p>
-      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.78rem]">{ORIGINAL}</pre>
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Body as the provider sent it</p>
+      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-muted px-3 py-2 font-mono text-[0.78rem]">{ORIGINAL}</pre>
 
       <div className="mt-3 space-y-2">
         {TOGGLES.map((t) => (
-          <label key={t.id} className="flex min-h-10 cursor-pointer items-center gap-3 rounded-lg border border-border px-3 text-sm hover:bg-surface-2">
+          <label key={t.id} className="flex min-h-10 cursor-pointer items-center gap-3 rounded-lg border border-border px-3 text-sm hover:bg-muted">
             <input type="checkbox" checked={on[t.id]} onChange={() => toggle(t.id)} className="h-4 w-4 accent-accent" />
             <span>{t.label}</span>
           </label>
         ))}
       </div>
 
-      <button type="button" onClick={verify} className="mt-3 min-h-10 w-full rounded-lg bg-accent px-4 text-sm font-medium text-white dark:text-bg">
+      <button type="button" onClick={verify} className="mt-3 min-h-10 w-full rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground">
         Verify delivery
       </button>
 
@@ -97,16 +97,16 @@ export function HmacVerifier() {
       {result && (
         <div className="mt-3 space-y-2 text-sm">
           <div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-muted">Signature header received</p>
-            <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.75rem]">{result.header}</pre>
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Signature header received</p>
+            <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-muted px-3 py-2 font-mono text-[0.75rem]">{result.header}</pre>
           </div>
           <div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-muted">Receiver signs these bytes</p>
-            <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.75rem]">{result.signedByReceiver}</pre>
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Receiver signs these bytes</p>
+            <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-muted px-3 py-2 font-mono text-[0.75rem]">{result.signedByReceiver}</pre>
           </div>
           <div>
-            <p className="text-xs font-semibold uppercase tracking-wide text-muted">Receiver&apos;s HMAC-SHA256</p>
-            <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.75rem]">{result.expected}</pre>
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Receiver&apos;s HMAC-SHA256</p>
+            <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-muted px-3 py-2 font-mono text-[0.75rem]">{result.expected}</pre>
           </div>
           <div className={`rounded-lg px-3 py-2 ${result.ok ? "bg-good-soft" : "bg-bad-soft"}`}>
             <p className="font-semibold">{result.ok ? "Verified: respond 2xx and process it" : "Rejected: respond 401 and do nothing"}</p>

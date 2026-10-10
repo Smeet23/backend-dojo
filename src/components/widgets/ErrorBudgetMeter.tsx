@@ -41,10 +41,10 @@ export function ErrorBudgetMeter() {
       <p className="mt-3 text-sm">
         Budget: <strong className="font-mono">{fmt(budget)}</strong> of downtime per 30 days
       </p>
-      <div className="mt-2 h-3 w-full overflow-hidden rounded-full bg-surface-2">
+      <div className="mt-2 h-3 w-full overflow-hidden rounded-full bg-muted">
         <div className={frozen ? "h-full bg-bad" : pct > 75 ? "h-full bg-warn" : "h-full bg-good"} style={{ width: `${pct}%` }} />
       </div>
-      <p className="mt-1 text-xs text-muted">Used {fmt(used)} · {frozen ? `over by ${fmt(-remaining)}` : `${fmt(remaining)} left`}</p>
+      <p className="mt-1 text-xs text-muted-foreground">Used {fmt(used)} · {frozen ? `over by ${fmt(-remaining)}` : `${fmt(remaining)} left`}</p>
 
       <div className="mt-3 flex flex-wrap gap-2">
         {INCIDENTS.map((i) => (
@@ -52,12 +52,12 @@ export function ErrorBudgetMeter() {
             key={i.label}
             type="button"
             onClick={() => setSpent((s) => [...s, i])}
-            className="min-h-10 rounded-lg border border-border px-3 text-sm hover:bg-surface-2"
+            className="min-h-10 rounded-lg border border-border px-3 text-sm hover:bg-muted"
           >
             + {i.label} ({i.minutes} min)
           </button>
         ))}
-        <button type="button" onClick={() => setSpent([])} className="min-h-10 rounded-lg border border-border px-3 text-sm text-muted">
+        <button type="button" onClick={() => setSpent([])} className="min-h-10 rounded-lg border border-border px-3 text-sm text-muted-foreground">
           New month
         </button>
       </div>
