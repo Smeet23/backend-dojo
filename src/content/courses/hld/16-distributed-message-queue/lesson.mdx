@@ -1,0 +1,277 @@
+import { HldConsumerGroupLab } from "@/components/widgets/HldConsumerGroupLab";
+import { SdEventDelivery } from "@/components/widgets/SdEventDelivery";
+
+## Why put a queue between services
+
+When service A calls service B directly over HTTP, the two are coupled in three ways: B must be **up** when A calls, B must be **fast enough** for A's traffic right now, and A must **know** B exists. A message queue cuts all three:
+
+- **Temporal decoupling.** A writes a message and moves on. If B is down for ten minutes, messages wait and B catches up afterwards.
+- **Load levelling.** A spike of 50,000 orders a minute lands in the queue; B drains it at the rate it can sustain instead of falling over.
+- **Fan-out without coupling.** A publishes "order placed"; billing, shipping, email and analytics each consume it. Adding a fifth consumer doesn't touch A.
+- **Independent scaling.** If B falls behind, add B instances. The backlog size tells you how many.
+
+The price is that work becomes **asynchronous**: A no longer knows when, or whether, B finished. Most of this lesson is about getting that "whether" right.
+
+## Two messaging models
+
+| | Point-to-point queue | Publish/subscribe |
+|---|---|---|
+| Who gets a message | **Exactly one** of the consumers | **Every** subscriber gets its own copy |
+| Typical use | Distributing work: resize this image, send this email | Broadcasting events: order placed, user signed up |
+| Scaling consumers | More consumers share the work | More subscribers each see everything |
+| Example | SQS queue, RabbitMQ queue with competing consumers | SNS topic, RabbitMQ fanout exchange, Kafka topic read by several groups |
+
+Real systems combine them. A common shape is **pub/sub for fan-out, then a queue per subscriber**: SNS publishes to one SQS queue per consuming service, and each service's instances compete for messages in its own queue. Kafka builds both into one abstraction with consumer groups, as we'll see.
+
+## Inside a broker
+
+The **broker** is the server that stores messages between producers and consumers. Brokers come in two broad designs, and the difference explains most of the behaviour you'll see.
+
+### Queue-style brokers
+
+RabbitMQ, ActiveMQ and SQS keep a **queue** of messages per destination. The broker **pushes** (or hands on request) each message to one consumer, waits for an **acknowledgement**, and then **deletes** it. Unacked messages are redelivered after the consumer disconnects or a timeout passes.
+
+- The broker tracks per-message state (delivered, acked), which makes rich routing and per-message retry easy.
+- Once acked, a message is gone. There's no replay.
+- Throughput is high but per-message bookkeeping limits it compared with a log.
+
+### Log-style brokers
+
+Kafka, Redpanda, Pulsar's storage layer and Kinesis store messages in an **append-only log** on disk. Consumers **pull**, and each consumer group just remembers a position (the **offset**) in the log. Reading doesn't delete anything; messages are removed only when **retention** expires.
+
+- The broker does almost no per-message work: appends are sequential disk writes, reads are sequential reads often served from the OS page cache and sent with zero-copy. This is why a few Kafka brokers can carry millions of messages per second.
+- Any number of independent consumers can read the same data, and any of them can **rewind** and replay.
+- Per-message features (individual acks, per-message delay, priorities) are harder or missing.
+
+## Topics and partitions
+
+In a log-style broker, a **topic** is a named stream such as `orders`. A topic is split into **partitions**, and each partition is an independent, ordered, append-only log stored on one broker (plus replicas).
+
+```
+topic: orders
+  P0: [0:o1] [1:o5] [2:o9]  ...
+  P1: [0:o2] [1:o3] [2:o6] [3:o7] ...
+  P2: [0:o4] [1:o8] ...
+```
+
+Each message in a partition has an **offset**: its position, 0, 1, 2, and so on. The pair (partition, offset) uniquely identifies a message.
+
+Why partitions exist:
+
+- **Scale beyond one machine.** Different partitions live on different brokers, so a topic's throughput and storage add up across the cluster.
+- **Parallel consumption.** Each partition can be read by a different consumer at the same time.
+- **Ordering where it's cheap.** Order is guaranteed **within** a partition, which needs no cross-machine coordination.
+
+### Choosing a partition
+
+The producer decides which partition a message goes to:
+
+- **With a key:** `partition = hash(key) mod partitionCount`. All messages with the same key (say, the same `order_id` or `user_id`) land in the same partition, in the order they were produced.
+- **Without a key:** spread for balance (round robin, or Kafka's "sticky" partitioner, which fills a batch for one partition then moves on).
+
+### How many partitions
+
+Partition count caps consumer parallelism within a group, so size it for peak: if one consumer handles 5,000 messages per second and you need 60,000, you need at least 12 partitions, and teams usually add headroom (say 24 or 48). Too many partitions cost memory, file handles, longer leader elections and more replication traffic. Changing the count later **changes hash(key) mod N**, which breaks per-key ordering across the change, so choose generously up front.
+
+## Consumer groups
+
+A **consumer group** is a set of consumer instances that share the work of reading a topic. The rule is simple:
+
+> Within a group, **each partition is assigned to exactly one consumer**. A consumer may own several partitions.
+
+Consequences:
+
+- Adding consumers to a group spreads partitions across more instances, up to one per partition. Consumers beyond the partition count sit **idle**.
+- Different groups are **independent**. The billing group and the analytics group each get every message and each keep their own offsets. That's pub/sub between groups and a work queue within each.
+- When a consumer joins, leaves or crashes, the group **rebalances**: partitions are reassigned, and the new owner resumes from the group's last **committed** offset for that partition.
+
+<HldConsumerGroupLab />
+
+Try this: produce a burst with one billing consumer and watch lag grow, then switch to 4 consumers and see it drain. Switch to 6 and note the two idle consumers. Turn on the analytics group: it reads the same messages at its own pace, and nothing is deleted. Messages with key A always land in P1, in order.
+
+Rebalancing has costs. In the classic "eager" protocol every consumer stops, gives up its partitions and waits for the new assignment, which pauses the whole group. Newer **cooperative** (incremental) rebalancing moves only the partitions that need to move. Either way, a consumer that's slow to poll (because a single message takes too long) can be **kicked out** for missing its deadline, triggering rebalances in a loop. Keep per-message work bounded, or tune the poll interval.
+
+## Offsets and commits
+
+A consumer's progress is the **committed offset** per partition: "the group has finished everything before offset 42 in P1". Kafka stores these commits in an internal topic; SQS and RabbitMQ track acks per message instead.
+
+**When** you commit relative to **when** you process decides your delivery guarantee:
+
+| Order of operations | If the consumer crashes in between | Guarantee |
+|---|---|---|
+| Commit, then process | Message is skipped on restart | At most once |
+| Process, then commit | Message is processed again on restart | At least once |
+
+Auto-commit (committing on a timer in the background) is convenient but can commit offsets for messages that are still being processed. For anything that matters, **commit explicitly after processing**, usually in batches.
+
+**Consumer lag** is the distance between the newest offset in a partition and the group's committed offset. It's the single most useful queue metric: steady lag is fine, growing lag means consumers can't keep up.
+
+## Ordering
+
+Ordering guarantees are narrower than people assume.
+
+- **Kafka and Kinesis:** order is guaranteed **per partition**. There's no order across partitions. To keep all events for one entity in order, give them the same key.
+- **SQS standard queues:** best-effort ordering only. **SQS FIFO** queues guarantee order per **message group id** (which plays the role of a key) at lower throughput.
+- **RabbitMQ:** a single queue is FIFO, but with several competing consumers, messages are processed in parallel and can **finish** out of order, and a redelivered message comes back after later ones.
+
+Ways ordering breaks even with keys:
+
+- **Producer retries.** If batch 1 fails and is retried after batch 2 succeeded, they swap. Kafka's **idempotent producer** (the default in modern clients) attaches sequence numbers so the broker rejects out-of-order or duplicate batches.
+- **Parallel processing inside a consumer.** Handing messages from one partition to a thread pool destroys order unless you shard the pool by key.
+- **Retry topics.** Moving a failing message aside to retry later lets later messages for the same key overtake it. If order matters per key, pause that key, not just that message.
+- **Repartitioning.** Adding partitions changes which partition a key maps to.
+
+If you need a **global** order across all messages, you need a single partition, which means a single consumer and a hard throughput ceiling. Usually the business only needs order per entity, which partitions by key provide.
+
+## Delivery guarantees
+
+Three guarantees, from weakest to strongest:
+
+- **At most once.** Each message is delivered zero or one times. Fast and simple; acceptable for metrics or logs where a small loss doesn't matter.
+- **At least once.** Each message is delivered one or more times. No loss, but duplicates happen whenever a consumer crashes after processing and before committing, or an ack is lost. This is the default for nearly every serious system.
+- **Exactly once.** Each message affects the system exactly one time.
+
+<SdEventDelivery />
+
+### What exactly once really means
+
+Over an unreliable network, a broker can't guarantee a message is **delivered** exactly once to an arbitrary consumer that has side effects. What you can build is exactly-once **effect**:
+
+- **Inside Kafka:** the idempotent producer prevents duplicates on write, and Kafka **transactions** let a consume-process-produce application write its output messages and its consumer offsets atomically. Stream processors (Kafka Streams, Flink) use this for end-to-end exactly-once **when both input and output are Kafka**.
+- **With external side effects** (charging a card, writing to Postgres, sending email): use **at-least-once delivery plus an idempotent consumer**. Store a processed-message id (or a business idempotency key) in the same database transaction as the side effect, and skip duplicates. Or store the consumed offset in the same database as the result and resume from there.
+- **On the producing side**, use the **transactional outbox**: write the business change and the outgoing message to the same database in one transaction, then relay the message to the broker. This prevents the "database committed but message lost" case.
+
+<Callout kind="remember">
+Assume at-least-once and make consumers idempotent. "Exactly once" in vendor docs usually means within the broker's own ecosystem; your database and the payment provider are outside it.
+</Callout>
+
+## Retention and compaction
+
+Log-style brokers keep messages for a configured **retention**, independent of whether anyone read them:
+
+- **Time-based:** keep 7 days (a common default), or 30, or forever.
+- **Size-based:** keep at most 500 GB per partition.
+
+Retention is what makes **replay** possible: deploy a fixed consumer, reset its group's offsets to yesterday, and reprocess. It also lets a brand-new service bootstrap from history.
+
+**Log compaction** is a different policy: instead of deleting by age, the broker keeps at least the **latest message for every key** and discards older ones. A compacted topic acts like a durable table of current values (user settings, product prices), and a message with a key and a null value (a **tombstone**) deletes that key. It's how Kafka stores consumer offsets and how change-data-capture topics hold the latest state of each row.
+
+Queue-style brokers, by contrast, delete a message once it's acked. SQS keeps unconsumed messages for up to 14 days, then drops them.
+
+## Replication and ISR
+
+A partition stored on one broker would be lost with that broker's disk. So each partition is **replicated** to R brokers (replication factor, typically 3, spread across racks or availability zones).
+
+- One replica is the **leader**: all writes, and by default all reads, go to it.
+- The others are **followers** that continuously fetch from the leader.
+- The **in-sync replicas (ISR)** are the replicas that are caught up with the leader within a time bound. A follower that falls too far behind is removed from the ISR until it catches up.
+
+The producer's `acks` setting decides when a write counts as successful:
+
+| acks | Leader replies when | Risk |
+|---|---|---|
+| `0` | Never waits | Messages lost on any hiccup |
+| `1` | Leader has written it | Lost if the leader dies before followers copy it |
+| `all` | Every replica in the ISR has it | Durable as long as one ISR member survives |
+
+`acks=all` alone isn't enough: if the ISR shrinks to just the leader, "all" means one copy. Set **`min.insync.replicas = 2`** (with RF 3) so writes are rejected rather than accepted with a single copy. That's the standard durable configuration: RF 3, `acks=all`, min ISR 2, which tolerates one broker failure with no data loss and no write outage.
+
+When a leader fails, the cluster controller (KRaft in modern Kafka, ZooKeeper in older versions) elects a new leader **from the ISR**, so no acknowledged write is lost. **Unclean leader election** (allowing an out-of-sync replica to become leader) restores availability faster at the cost of losing messages; it's off by default for good reason.
+
+Other systems make the same trade-off with different names: RabbitMQ **quorum queues** replicate with Raft; SQS replicates across availability zones internally and hides it from you.
+
+## Back-pressure
+
+A queue absorbs bursts, but if producers outpace consumers **for long**, the backlog grows without bound. **Back-pressure** is how the system pushes back instead of silently filling up.
+
+- **Pull-based consumers** (Kafka, SQS) have natural back-pressure: a consumer fetches only what it can handle. The backlog grows in the broker, where it's cheap.
+- **Push-based consumers** (RabbitMQ) need a **prefetch** limit, the maximum number of unacked messages a consumer may hold, or a slow consumer gets flooded and runs out of memory.
+- **Producers** buffer in memory. When the buffer fills because the broker is slow, the send call **blocks** or fails, which propagates pressure upstream. Decide what the caller should do then: wait, shed the request, or return 503.
+- **Bounded queues** (RabbitMQ max-length, broker quotas) reject or drop when full rather than exhausting disk.
+
+Operationally:
+
+- Alert on **consumer lag** (or queue depth and age of oldest message) rising, not just on errors.
+- **Autoscale consumers** on lag, up to the partition count.
+- If a downstream dependency is the bottleneck (a database, a rate-limited API), more consumers make it worse. Throttle consumers and let the queue hold the backlog.
+
+## Retries and dead-letter queues
+
+Some messages will fail processing. The cause matters:
+
+- **Transient:** the database timed out, a dependency returned 503. Retrying later will work.
+- **Poison message:** malformed payload, a bug triggered by this specific data, a reference to a deleted record. Retrying will **never** work.
+
+A poison message retried forever blocks its partition (in Kafka, the consumer can't move past it without skipping) or burns resources forever (in a queue). The standard solution:
+
+1. Retry a few times with **backoff**, in-process for short delays.
+2. For longer delays, publish to a **retry topic or queue** with a delay (for example retry-1m, retry-10m), so the main stream keeps flowing.
+3. After a maximum number of attempts, move the message to a **dead-letter queue (DLQ)** with its error and attempt count.
+4. **Alert** on DLQ arrivals; a human or tool inspects, fixes the bug or data, and **redrives** the messages back to the main queue.
+
+SQS builds this in: a message received more than `maxReceiveCount` times moves to the configured DLQ. Its **visibility timeout** hides a received message from other consumers until it's deleted or the timeout passes, which is how SQS redelivers after a crash; set it longer than your worst-case processing time, or a slow consumer and a second consumer will both process the same message. RabbitMQ uses dead-letter exchanges; in Kafka, DLQ topics are a convention implemented by the consumer or framework.
+
+<Callout kind="warn">
+A DLQ nobody watches is just a slower way to lose data. Every DLQ needs an alert, an owner and a redrive procedure.
+</Callout>
+
+## Kafka vs RabbitMQ vs SQS
+
+| | Kafka | RabbitMQ | Amazon SQS |
+|---|---|---|---|
+| Model | Partitioned, replicated log | Broker with exchanges and queues | Managed queue (standard or FIFO) |
+| Consumption | Pull; consumer groups track offsets | Push with prefetch; per-message ack | Pull (long polling); per-message delete |
+| After consumption | Kept until retention expires; replayable | Deleted on ack | Deleted on delete call |
+| Ordering | Per partition | Per queue, weakened by parallel consumers | None (standard), per group id (FIFO) |
+| Throughput | Very high (millions per second per cluster) | High (tens of thousands per second per queue) | Effectively unlimited (standard); lower for FIFO |
+| Routing | By topic and key only | Rich: direct, topic patterns, headers, fanout | None (pair with SNS or EventBridge for fan-out) |
+| Delay and priority | Not native | Priorities; delays via plugin or TTL plus DLX | Delay queues up to 15 minutes |
+| Operations | Heavy to self-run; managed options exist | Moderate | Zero: fully managed |
+| Best for | Event streaming, logs, CDC, analytics, replay, many consumers of one stream | Task queues, complex routing, RPC-style messaging | Simple decoupling and work queues on AWS |
+
+Rules of thumb: choose **Kafka** when the stream is the product (many readers, replay, high volume, ordering by key). Choose **RabbitMQ** for task distribution with flexible routing, priorities and per-message acks. Choose **SQS** when you're on AWS and want a reliable work queue with no operations. Redis Streams and NATS JetStream are lighter-weight alternatives with log-like semantics.
+
+## Designing a distributed queue
+
+If the interview asks you to **design** the queue itself, structure it like any system design.
+
+### Requirements
+
+- Functional: producers publish to topics; consumers subscribe in groups; messages persist for a configurable retention; consumers can replay from an offset; per-key ordering.
+- Non-functional: high throughput (say 1 million messages per second at 1 KB each, so about 1 GB/s in), durability (no loss of acknowledged writes), availability through broker failures, horizontal scalability.
+
+### Estimates
+
+- Ingest: 1 GB/s, replicated 3 times, is about 3 GB/s of disk writes across the cluster.
+- Storage: 1 GB/s times 86,400 seconds is about 86 TB per day. With 7-day retention and 3 replicas, that's about 1.8 PB.
+- So storage and disk bandwidth, not CPU, size the cluster. If one broker has 40 TB of disk and sustains 300 MB/s of writes, storage needs about 45 brokers and write bandwidth about 10, so plan around 50 brokers (or use tiered storage to cut local disk).
+- Partitions: at roughly 10 MB/s per partition per consumer, 1 GB/s needs at least 100 partitions across the busy topics.
+
+### Core components
+
+- **Brokers** store partitions as **segment files**: append-only files of a fixed size, each with a sparse **offset index** (offset to file position) and a time index. Deleting old data means deleting whole old segments, which is cheap.
+- **Controller / metadata service** (Raft-replicated) holds topic configs, partition-to-broker assignments, leaders and ISR, and handles leader election.
+- **Producers** batch, compress and send to each partition's leader, which they discover from metadata.
+- **Consumer group coordinator** on a broker manages membership, assignment and committed offsets.
+
+### Deep dives to mention
+
+- **Why it's fast:** sequential appends, batching, compression, reliance on the OS page cache, and zero-copy transfer from file to socket.
+- **Durability:** replication with ISR and `acks=all`, rather than fsync on every message.
+- **Scaling:** add brokers and move partitions; consumer parallelism is bounded by partition count.
+- **Tiered storage:** older segments offloaded to object storage, so retention can be long without huge local disks.
+
+## Cheat sheet
+
+- Queues decouple services in time, level load, and enable fan-out and independent scaling.
+- Point-to-point: one consumer per message. Pub/sub: every subscriber gets a copy.
+- Queue brokers delete on ack; log brokers keep messages for a retention period and allow replay.
+- A topic is split into partitions; each partition is an ordered log addressed by offset.
+- Same key, same partition, same order; no ordering across partitions.
+- In a consumer group, each partition has one consumer; extra consumers sit idle; groups are independent.
+- Process then commit gives at least once; commit then process gives at most once.
+- Exactly once in practice: idempotent producer and transactions inside Kafka, or at-least-once plus idempotent consumers plus outbox.
+- Durable setup: RF 3, acks=all, min.insync.replicas 2, no unclean leader election.
+- Watch consumer lag; autoscale consumers up to the partition count; throttle when the downstream is the bottleneck.
+- Retry with backoff, then a dead-letter queue with an alert and a redrive plan.
+- Kafka for streams and replay, RabbitMQ for routed task queues, SQS for zero-ops work queues.

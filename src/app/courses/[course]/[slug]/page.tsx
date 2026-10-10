@@ -51,7 +51,14 @@ async function LectureBody({ courseId, slug }: { courseId: string; slug: string 
       <h1 className="mt-1 text-3xl font-semibold tracking-tight sm:text-4xl">{lecture.title}</h1>
       <p className="mt-2 text-muted">{lecture.summary}</p>
       <p className="mt-3 text-xs text-muted">
-        {lecture.videoUrl ? (
+        {lecture.videoUrl && lecture.writtenFromTopic ? (
+          <>
+            Lesson written from the topic for this course ·{" "}
+            <a href={lecture.videoUrl} target="_blank" rel="noreferrer" className="underline underline-offset-2">
+              related video
+            </a>
+          </>
+        ) : lecture.videoUrl ? (
           <>
             Based on{" "}
             <a href={lecture.videoUrl} target="_blank" rel="noreferrer" className="underline underline-offset-2">

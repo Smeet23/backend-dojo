@@ -1,0 +1,212 @@
+import { HldTwoPlStepper } from "@/components/widgets/HldTwoPlStepper";
+import { HldDeadlockSchemes } from "@/components/widgets/HldDeadlockSchemes";
+
+## The problem 2PL solves
+
+A database runs many transactions at once. Each one, on its own, is correct. The danger is the **interleaving**: T1 reads an account, T2 changes it, T1 writes based on its stale read, and the combined result matches no order in which the two could have run alone.
+
+The correctness target is **conflict serializability**: the concurrent schedule must be equivalent to some serial schedule. Two operations **conflict** when they come from different transactions, touch the same item, and at least one is a write (read-write, write-read, write-write). If you draw an arrow T1 → T2 whenever T1 performs a conflicting operation before T2 does, you get a **precedence graph**. The schedule is conflict-serializable exactly when that graph has **no cycle**.
+
+Checking graphs after the fact doesn't help a running database. It needs a **protocol** that, if every transaction follows it, guarantees no cycle can ever form. **Two-phase locking (2PL)** is the classic such protocol, used by SQL Server, Db2, MySQL InnoDB (for its locking reads and serializable level) and many others.
+
+<Callout kind="warn">
+**Two-phase locking is not two-phase commit.** 2PL is a concurrency-control protocol inside one database: it decides when a transaction may take and release locks so concurrent transactions stay serializable. **Two-phase commit (2PC)** is an atomic-commitment protocol across several databases or services: a coordinator asks every participant to prepare, then tells all of them to commit or abort. They share the words "two phase" and nothing else. A distributed database may use both at once: 2PL on each node for isolation, 2PC across nodes for atomicity.
+</Callout>
+
+## Shared and exclusive locks
+
+Every data item (a row, a page, a table) can be locked in one of two basic modes:
+
+| Mode | Taken for | Others may also hold |
+|---|---|---|
+| **Shared (S)** | Reading | Other S locks |
+| **Exclusive (X)** | Writing | Nothing |
+
+The **compatibility matrix** decides whether a request is granted or must wait:
+
+| Requested / Held | None | S | X |
+|---|---|---|---|
+| **S** | Grant | Grant | Wait |
+| **X** | Grant | Wait | Wait |
+
+Many readers can read together; a writer needs the item alone. A transaction holding S can ask to **upgrade** to X when it decides to write; it must wait until it is the only S holder.
+
+Locks alone don't guarantee serializability. If T1 locks A, reads it, **unlocks**, then later locks B, another transaction can slip in between, change both A and B, and create a cycle. The rule about *when* you unlock is what does the work.
+
+## The two phases
+
+2PL splits every transaction's life into two phases:
+
+1. **Growing phase.** The transaction may acquire locks (and upgrade S to X). It may not release any.
+2. **Shrinking phase.** Starting from its first release, the transaction may release locks but may **never acquire another one**.
+
+```
+locks held
+  │          ┌───── lock point
+  │        ┌─┘└─┐
+  │      ┌─┘    └─┐
+  │    ┌─┘        └─┐
+  │  ┌─┘            └─┐
+  └──┴────────────────┴──── time
+     growing   │  shrinking
+```
+
+The moment a transaction holds its maximum set of locks, just before its first release, is its **lock point**.
+
+### Why it guarantees serializability
+
+Take any conflict edge T1 → T2 on item A: T1 touched A first, then T2 did. For T2 to get its lock on A, T1 must have **released** A. That release happened in T1's shrinking phase, so T1 had already passed its lock point. T2 acquired A in its growing phase, so T2's lock point is **later**. Every edge therefore points from an earlier lock point to a later one.
+
+A cycle T1 → T2 → ... → T1 would need T1's lock point to be earlier than itself, which is impossible. So the graph is acyclic and the schedule is serializable, and the equivalent serial order is simply **the order of lock points**.
+
+A small example. T1 transfers 100 from A to B, T2 sums A and B:
+
+```
+T1: X-lock(A)  read A  write A-100
+T2:                                 S-lock(A) ... waits
+T1: X-lock(B)  read B  write B+100  ← lock point
+T1: unlock(A)  unlock(B)            ← shrinking
+T2:            S-lock(A) read A  S-lock(B) read B   ← sees both changes
+```
+
+T2 waits until T1 has taken every lock it needs, so T2 can never see A after the debit but B before the credit.
+
+## Variants of 2PL
+
+Basic 2PL guarantees serializability but leaves two practical problems. The variants fix them by holding locks longer.
+
+### Basic 2PL and cascading aborts
+
+Under basic 2PL, T1 can release its X lock on A in the shrinking phase **before it commits**. T2 then reads A, seeing a value T1 might still undo. If T1 now aborts, T2 has read data that never officially existed, so T2 must abort too, and anything that read T2's writes must abort after that. This chain is a **cascading abort** (cascading rollback).
+
+Worse, if T2 had already **committed**, the schedule is **unrecoverable**: a committed transaction depended on an aborted one. Basic 2PL allows that.
+
+### Strict 2PL
+
+**Strict 2PL** adds one rule: **hold all exclusive (X) locks until the transaction commits or aborts.** Shared locks may still be released early in the shrinking phase.
+
+Because nobody can read or overwrite your uncommitted writes, nobody can depend on them. That eliminates cascading aborts and makes every schedule recoverable. It also makes rollback simple: restoring the before-image of each item you wrote can't clobber someone else's work.
+
+### Rigorous 2PL
+
+**Rigorous 2PL** (also called strong strict 2PL) holds **all** locks, shared and exclusive, until commit or abort. The shrinking phase collapses into a single instant at the end.
+
+The extra benefit: the equivalent serial order is the **commit order**. That's easy to reason about, and it is what most real lock-based databases actually implement, because the lock manager simply releases everything when the transaction ends.
+
+### Conservative 2PL
+
+**Conservative 2PL** (static 2PL) makes a transaction declare and acquire **every lock it will need before it starts**. If any lock is unavailable it takes none and waits. Because it never holds some locks while waiting for others, it **can't deadlock**. The catch is that most transactions don't know their full read and write set in advance (it depends on data they haven't read yet), so this is rare outside specialised systems.
+
+| Variant | Release rule | Serializable | Cascading aborts | Deadlocks | Serial order |
+|---|---|---|---|---|---|
+| Basic | Any time after the lock point | Yes | Possible | Possible | Lock point order |
+| Strict | X locks at commit or abort | Yes | No | Possible | Lock point order |
+| Rigorous | All locks at commit or abort | Yes | No | Possible | Commit order |
+| Conservative | Acquire all at start | Yes | Depends on release rule | No | Lock point order |
+
+<HldTwoPlStepper />
+
+## Phantoms and lock granularity
+
+2PL on individual rows makes reads of **existing** rows repeatable, but it can't lock a row that doesn't exist yet. T1 runs `SELECT ... WHERE room = 7 AND day = 'Fri'` and locks the zero rows it found; T2 inserts a matching row; T1 re-runs and sees a **phantom**. True serializability needs the lock to cover the **predicate**, not just the rows.
+
+Real systems approximate predicate locks with **range locks** on the index: InnoDB's **next-key locks** lock each scanned index entry plus the gap before it, and SQL Server's key-range locks do the same. An insert into a locked gap waits. Without a usable index, the database may have to lock a whole table to be safe, one more reason indexes matter.
+
+Locking granularity is a trade-off:
+
+| Granularity | Lock overhead | Concurrency |
+|---|---|---|
+| Row | Many locks to track | High |
+| Page | Fewer | Medium |
+| Table | One | Low |
+
+Databases mix them using **intention locks** (IS, IX): before taking an X lock on a row, a transaction takes IX on the table. Someone wanting a full-table S lock sees the IX and waits, without scanning millions of row locks. Some engines also do **lock escalation**, swapping thousands of row locks for one table lock when memory runs low.
+
+## Deadlocks
+
+Locking means waiting, and waiting can form a cycle:
+
+```
+T1: X-lock(A) ✓                 T2: X-lock(B) ✓
+T1: X-lock(B) … waits for T2    T2: X-lock(A) … waits for T1
+```
+
+Neither can proceed and neither will release, because under 2PL a transaction keeps its locks while it waits. This is a **deadlock**. 2PL (basic, strict or rigorous) does not prevent deadlocks; only the conservative variant does.
+
+A very common real-world form is the **upgrade deadlock**: T1 and T2 both hold S on the same row (both read it), and both then try to upgrade to X to update it. Each waits for the other to drop its S lock. SQL Server's **update (U) lock** exists for this: only one transaction can hold U, so the read-then-write path is serialised from the start. In SQL you get the same effect by reading with `SELECT ... FOR UPDATE` instead of a plain read.
+
+There are three ways to handle deadlocks: detect them, prevent them, or time out.
+
+### Detection with a wait-for graph
+
+The lock manager keeps a **wait-for graph**: one node per transaction and an edge Ti → Tj whenever Ti is waiting for a lock Tj holds. **A deadlock is a cycle in this graph.**
+
+The database checks for cycles periodically or whenever a wait begins (Postgres checks after `deadlock_timeout`, 1 s by default; InnoDB checks immediately on each wait). When it finds a cycle, it picks a **victim**, aborts it, and releases its locks so the others continue. Victim choice usually favours the transaction that has done the least work, holds the fewest locks, or has been restarted least often (to avoid starving the same one forever).
+
+```
+ERROR:  deadlock detected
+DETAIL: Process 4211 waits for ShareLock on transaction 9001; blocked by process 4212.
+        Process 4212 waits for ShareLock on transaction 9000; blocked by process 4211.
+```
+
+The application sees an error and should **retry the whole transaction**.
+
+### Prevention with timestamps
+
+Prevention schemes never let a cycle form. Each transaction gets a **timestamp** when it starts (older = smaller), and when Ti requests a lock that Tj holds, the timestamps decide who waits and who aborts:
+
+| Scheme | Ti older than Tj | Ti younger than Tj |
+|---|---|---|
+| **Wait-die** (non-preemptive) | Ti **waits** | Ti **dies** (aborts itself, restarts later) |
+| **Wound-wait** (preemptive) | Ti **wounds** Tj (Tj aborts) | Ti **waits** |
+
+In wait-die, only older transactions ever wait for younger ones; in wound-wait, only younger ones wait for older ones. Either way, every wait edge points in the same direction along the timestamp order, so no cycle is possible.
+
+Two important details:
+
+- A restarted transaction **keeps its original timestamp**. It gets older relative to newcomers, so eventually it is the oldest and can't be killed. This prevents starvation.
+- They abort some transactions that would never actually have deadlocked. Prevention trades extra aborts for never needing a cycle detector, which is attractive in distributed databases where building a global wait-for graph is expensive. Google Spanner, for example, uses wound-wait.
+
+| | Wait-die | Wound-wait |
+|---|---|---|
+| Who waits | Older waits for younger | Younger waits for older |
+| Who aborts | The young requester kills itself | The young holder is killed |
+| Aborts tend to be | More frequent but cheap (young transactions haven't done much) | Fewer, but may kill work in progress |
+
+### Timeouts
+
+The bluntest approach: if a lock wait exceeds N seconds, abort. No graph needed, but timeouts can't tell a deadlock from a slow transaction. Too short and you abort healthy work; too long and deadlocks linger. Most databases use detection and keep a lock wait timeout as a backstop (`innodb_lock_wait_timeout`, Postgres `lock_timeout`).
+
+<HldDeadlockSchemes />
+
+### Avoiding deadlocks in application code
+
+- **Lock in a consistent order.** If every transfer locks the lower account id first, the cycle in the example above can't form.
+- **Keep transactions short.** No network calls or user think time while holding locks.
+- **Read with intent.** Use `SELECT ... FOR UPDATE` when you'll update the row, to avoid upgrade deadlocks.
+- **Retry on deadlock errors** with a small jittered backoff; they are an expected outcome, not a crash.
+
+## 2PL compared with other approaches
+
+| Approach | How it isolates | Readers block writers? | Typical users |
+|---|---|---|---|
+| Strict or rigorous 2PL | Locks held to commit | Yes | SQL Server (default locking mode), Db2, InnoDB locking reads and serializable |
+| MVCC with snapshot isolation | Old versions for readers, locks only for writers | No | Postgres, Oracle, InnoDB plain reads |
+| Serializable snapshot isolation | MVCC plus tracking read-write dependencies; abort on dangerous patterns | No | Postgres serializable, CockroachDB |
+| Optimistic (OCC) | Validate at commit, abort on conflict | No | In-memory databases, version-column patterns |
+
+2PL's weakness is that **readers block writers and writers block readers**, which hurts read-heavy workloads; that's why MVCC took over for plain reads. But 2PL is still everywhere: it's what happens whenever you write, or read with `FOR UPDATE`, in almost any relational database.
+
+## Cheat sheet
+
+- Goal: conflict serializability, meaning an acyclic precedence graph.
+- Shared locks for reads are compatible with each other; exclusive locks for writes conflict with everything.
+- 2PL: a growing phase (acquire only) then a shrinking phase (release only); the lock point fixes the serial order.
+- Basic 2PL is serializable but allows cascading aborts and unrecoverable schedules.
+- Strict 2PL holds X locks to commit: no cascading aborts. Rigorous holds all locks to commit: serial order equals commit order.
+- Conservative 2PL acquires everything up front: no deadlocks, but needs the full lock set in advance.
+- Phantoms need predicate or range locks (next-key locks), not just row locks.
+- Deadlock detection: find a cycle in the wait-for graph, abort a victim, retry.
+- Wait-die: old waits, young dies. Wound-wait: old wounds young, young waits. Restarts keep their timestamp.
+- Avoid deadlocks: consistent lock order, short transactions, FOR UPDATE when you'll write, retry on error.
+- 2PL is not 2PC: one is isolation inside a database, the other is atomic commit across participants.

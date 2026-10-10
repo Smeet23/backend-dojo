@@ -1,0 +1,201 @@
+import { SdHashRing } from "@/components/widgets/SdHashRing";
+import { HldRingReplicas } from "@/components/widgets/HldRingReplicas";
+
+## The problem
+
+You have more data, or more requests, than one machine can handle, so you spread it across N servers. A cache cluster of 10 Memcached nodes. A key-value store of 50 storage nodes. A fleet of 8 chat servers where each user's connection state should live on one of them.
+
+Every such system needs a function that answers: **given a key, which server owns it?** The function has to be:
+
+- **Deterministic:** every client and every server computes the same answer, without asking a central directory for each lookup.
+- **Balanced:** each server gets roughly its fair share of keys and traffic.
+- **Stable:** when a server is added or removed, as few keys as possible change owner.
+
+The obvious function gets the first two and fails the third badly.
+
+## Why hash mod N breaks
+
+The obvious approach is:
+
+```
+server = hash(key) mod N
+```
+
+It's deterministic and, with a good hash function, balanced. Now add a fifth server to a four-server cache. For a key whose hash is 14:
+
+| | Calculation | Server |
+|---|---|---|
+| Before (N = 4) | 14 mod 4 | 2 |
+| After (N = 5) | 14 mod 5 | 4 |
+
+The key moved even though server 2 is perfectly healthy. A key stays put only if `hash mod 4` happens to equal `hash mod 5`, which is true for about one key in five. So going from 4 to 5 servers moves roughly **80% of all keys**. In general, changing N to N+1 moves about N/(N+1) of the keys: nearly everything.
+
+What that costs depends on the system:
+
+- **Cache:** 80% of lookups suddenly miss, because each key is now looked up on a server that never had it. The full read load falls through to the database at once, often taking it down. This is a classic outage pattern triggered by "we just added a cache node".
+- **Database or key-value store:** 80% of the data has to be **copied over the network** before the new layout is correct. For 50 TB, that's 40 TB of migration for one new node.
+- **Failure:** a server crashing is also a change of N. Losing one node out of ten remaps 90% of keys, at exactly the moment the system is already stressed.
+
+The ideal is that adding the (N+1)th server moves only the **1/(N+1)** of keys it should now own, all of them onto the new server, and removing a server moves only that server's keys. Consistent hashing achieves this.
+
+## The hash ring
+
+Consistent hashing (Karger and colleagues, 1997, originally for web caches) changes what gets hashed.
+
+1. Take a hash function with a large output range, say 0 to 2^32 - 1, and bend the range into a circle: the value after the maximum wraps around to 0. This is the **ring**.
+2. Hash each **server** (its id or address) onto the ring. Each server now occupies a point.
+3. Hash each **key** onto the same ring.
+4. A key belongs to the **first server found walking clockwise** from the key's position (its successor). A key past the last server wraps around to the first.
+
+```
+                 0
+          S1 ●       ● k1  → owned by S2 (next clockwise)
+       k4 ●             ● S2
+     S4 ●                 ● k2 → owned by S3
+          ● k3        ● S3
+             (k3 → S4, k4 → S1)
+```
+
+Equivalently, each server owns the **arc** between its predecessor and itself.
+
+### Looking up a key
+
+In code, the ring is just a **sorted array** of server positions, and a lookup is a binary search for the first position at or after the key's hash:
+
+```ts
+type Point = { pos: number; server: string };
+const ring: Point[] = servers
+  .map((s) => ({ pos: hash32(s), server: s }))
+  .sort((a, b) => a.pos - b.pos);
+
+function ownerOf(key: string): string {
+  const h = hash32(key);
+  let lo = 0, hi = ring.length;               // binary search: first pos >= h
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (ring[mid].pos < h) lo = mid + 1; else hi = mid;
+  }
+  return ring[lo === ring.length ? 0 : lo].server; // wrap around
+}
+```
+
+That's O(log P) per lookup, where P is the number of points on the ring, and the ring is small enough (thousands of entries) to keep in every client's memory. No central service is consulted per request; clients only need to learn about membership changes.
+
+The hash function needs good **spread**, not cryptographic strength. MurmurHash, xxHash or the first bytes of MD5 are all common.
+
+## Adding and removing servers
+
+**Adding** a server S5 places it at one point on the ring. Only keys on the arc between S5's predecessor and S5 change owner: they used to go to S5's successor, and now stop at S5. Every other key's clockwise walk is unchanged.
+
+**Removing** server S3 (or S3 crashing) hands S3's arc to its successor. Keys owned by every other server don't move.
+
+So with K keys and N servers, a membership change moves about **K/N** keys instead of nearly all K. Going from 4 to 5 servers moves about 20% (the new server's fair share) instead of 80%.
+
+<SdHashRing />
+
+Toggle a server in the widget with virtual nodes off and look at two things: the moved keys (highlighted) all come from or go to **one neighbour**, and the share bars are badly uneven. Both are problems the next sections fix.
+
+## The balance problem
+
+With one point per server, the arcs are as random as the hash values. With four servers you'll often see one owning 40% of the ring and another 10%. The statistics are unforgiving: the largest arc among N random points is typically around (ln N)/N of the ring, so with 10 servers the busiest might own close to a quarter of the space instead of a tenth.
+
+Two more problems follow from "one point per server":
+
+- **Load after a failure goes to one neighbour.** When S3 dies, its entire arc lands on its single successor, which may double that server's load and push it over too: a cascading failure.
+- **Machines aren't identical.** A new server with twice the RAM should own twice as much, but one point gives no way to express that.
+
+## Virtual nodes
+
+The fix is to give each physical server **many points** on the ring, called **virtual nodes** (vnodes) or **tokens**. Server A is hashed as `A#0`, `A#1`, ... `A#99`, and each point owns its own small arc. A key still goes to the next point clockwise; that point belongs to some physical server.
+
+Why this helps:
+
+- **Balance.** Each server's share is the sum of many small random arcs, and sums of many random pieces are close to the average. With 100 to 200 vnodes per server, shares typically land within a few percent of fair.
+- **Spread on failure.** When A dies, each of its 100 small arcs goes to whichever server is next on that part of the ring, so A's load is **spread across all survivors** instead of one neighbour.
+- **Spread on join.** A new server takes small slices from every existing server, so data streams in from many sources in parallel.
+- **Weighting.** Give a bigger machine more vnodes. A server with 200 vnodes owns about twice as much as one with 100.
+
+Turn virtual nodes on in the widget above and compare the share bars and where the moved keys come from.
+
+The costs are modest: a larger ring to store and search (still tiny), and more pairs of servers that share data, which affects repair and streaming. Cassandra historically used 256 tokens per node; newer versions default to 16 with a smarter token-allocation algorithm, because fewer tokens means fewer neighbours to coordinate with during repairs while still balancing well.
+
+## Replication along the ring
+
+A storage system needs every key on more than one machine. The ring gives a natural rule: store a key on the first **R** distinct servers clockwise from its position, where R is the **replication factor**. The first is often called the coordinator for the key; the list of R servers is its **preference list** (the term from Amazon's Dynamo paper).
+
+```
+key k ──▶ walk clockwise ──▶ S2 (copy 1), S3 (copy 2), S4 (copy 3)
+```
+
+Three details make this work in practice.
+
+### Skip virtual nodes of the same machine
+
+With vnodes, the next three **points** clockwise may include two belonging to the same physical server. If you naively take them, two of the "three copies" sit on one machine, and losing that machine loses two copies. The walk must **skip points whose physical server is already in the list** until it has R distinct machines.
+
+### Rack and zone awareness
+
+Distinct machines aren't enough if they share a rack, a power supply or an availability zone. Placement strategies (Cassandra's `NetworkTopologyStrategy`, for example) continue the walk until the replicas span **different racks or zones**, so one rack failure or zone outage leaves copies elsewhere.
+
+### When a replica is down
+
+If one of a key's R servers is down, writes shouldn't fail. Dynamo-style systems use a **sloppy quorum** with **hinted handoff**: the next healthy server further along the ring accepts the write along with a **hint** saying "this belongs to S3". When S3 comes back, the hint holder forwards the data and deletes its temporary copy. Membership and failure detection typically run over a **gossip** protocol so every node converges on the same view of the ring.
+
+<HldRingReplicas />
+
+In the widget, pick `user:42` with RF = 3 and distinct servers off: two copies land on C. Turn distinct servers on to fix it, then take C down to see another server pick up a hinted replica.
+
+## Hot keys
+
+Consistent hashing balances **keys**, not **traffic**. If one key is wildly popular (a celebrity's profile, a flash-sale product, a viral video's view counter), every request for it goes to the same server, no matter how well the ring is balanced. More vnodes don't help: the key still has exactly one owner.
+
+Mitigations, from simplest:
+
+- **Cache in front.** A small local cache in each app server (even a 1-second TTL) absorbs most reads of a hot key before they reach the ring.
+- **Read from all replicas.** With R = 3, spread reads of that key across all three copies instead of always hitting the first.
+- **Split the key.** Store the value under `key#0` to `key#9`, which hash to different servers. Writes go to one (or all) sub-keys; reads pick one at random or sum them (good for counters).
+- **Bounded loads.** "Consistent hashing with bounded loads" caps each server at, say, 1.25 times the average load; when a key's owner is full, the request walks on to the next server. Google and Vimeo have used this for load balancing.
+
+The flip side is **hot spots from bad keys**: if many keys share a prefix and you hash only part of the key, or the hash function is weak, clusters form on the ring. Hash the whole key with a well-mixed function.
+
+## Who uses it
+
+| System | How |
+|---|---|
+| **Amazon Dynamo** (2007 paper) | Ring with virtual nodes, preference lists, sloppy quorum and hinted handoff |
+| **Apache Cassandra** | Token ring (Murmur3 partitioner), vnodes, rack- and DC-aware replica placement |
+| **Riak, ScyllaDB, Voldemort** | Dynamo-style rings |
+| **Memcached clients** (ketama) | Client-side ring so adding a cache node doesn't flush the whole cache |
+| **Load balancers** (Envoy ring hash, Nginx `hash ... consistent`, Google's Maglev) | Sticky routing of a user or connection to a backend that survives backend changes |
+| **CDNs** (Akamai's origin) | Mapping objects to cache servers so each object is cached in few places |
+| **Discord, chat systems** | Routing each guild or user to the process that holds its state |
+
+### Related approaches
+
+Not every partitioned system uses a ring:
+
+| Approach | Idea | Used by |
+|---|---|---|
+| **Fixed hash slots** | Hash into a fixed number of slots (Redis Cluster uses 16,384) and keep a slot-to-node table; rebalancing moves whole slots | Redis Cluster, Couchbase vBuckets, Elasticsearch shards |
+| **Rendezvous (highest random weight) hashing** | For each key, score every server with hash(key, server) and pick the highest; also moves only 1/N on change | Some load balancers, distributed caches |
+| **Jump consistent hash** | A tiny arithmetic function mapping a key to one of N numbered buckets with minimal movement, but only for adding or removing the last bucket | Sharded storage with numbered shards |
+| **Range partitioning** | Keys sorted, split into ranges, ranges split as they grow | HBase, Bigtable, CockroachDB, Spanner |
+
+Fixed slots are worth knowing for interviews: they keep the "only some data moves" property but make the mapping an explicit, inspectable table, which simplifies operations.
+
+<Callout kind="remember">
+Consistent hashing solves **remapping**: a membership change moves about K/N keys instead of almost all of them. Virtual nodes solve **balance and failure spread**. Neither solves a **single hot key**; that needs caching, replica reads or key splitting.
+</Callout>
+
+## Cheat sheet
+
+- hash(key) mod N remaps about N/(N+1) of keys when N changes: a cache miss storm or a mass data migration.
+- Consistent hashing puts servers and keys on one ring; a key belongs to the next server clockwise.
+- Lookup is a binary search over sorted ring positions, done locally by every client.
+- Adding or removing a server moves only about K/N keys, to or from its ring neighbours.
+- One point per server gives uneven arcs and dumps a failed server's load on a single neighbour.
+- Virtual nodes give each server many points: even shares, failure load spread across all, weighting by capacity.
+- Replicate to the next R distinct physical servers clockwise, aware of racks and zones.
+- Hinted handoff lets a further server hold writes for a down replica and hand them back later.
+- Hot keys need caching, replica reads, key splitting or bounded loads; the ring alone can't fix them.
+- Dynamo, Cassandra, Riak, ketama clients and many load balancers use rings; Redis Cluster uses fixed hash slots.

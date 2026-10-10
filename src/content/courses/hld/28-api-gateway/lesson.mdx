@@ -1,0 +1,235 @@
+import { HldGatewayPipeline } from "@/components/widgets/HldGatewayPipeline";
+import { HldBffFanout } from "@/components/widgets/HldBffFanout";
+
+## Why microservices need a front door
+
+Split a monolith into twenty services (users, catalog, cart, orders, payments, search, reviews, notifications...) and a new question appears: **how do clients reach them?**
+
+The naive answer is to expose every service directly. The mobile app learns twenty hostnames and calls whichever it needs. That falls apart quickly:
+
+- **Clients are coupled to your internal layout.** Split `orders` into `orders` and `fulfilment` and every app version in the wild breaks. Mobile apps can't be force-updated, so old versions live for years.
+- **Every service re-implements the same plumbing.** Token validation, rate limits, CORS, request logging, TLS certificates: twenty copies, twenty slightly different bugs.
+- **Chatty clients.** Rendering one screen needs data from five services, so the phone makes five round trips over a slow, lossy mobile network.
+- **A bigger attack surface.** Every service is reachable from the internet, so every service must be hardened like an edge server.
+- **Protocol mismatch.** Internally you might use gRPC or a message queue; browsers want HTTP and JSON.
+
+An **API gateway** is a single entry point that sits between clients and your services. Clients talk only to the gateway; the gateway handles the cross-cutting concerns once and forwards each request to the right service.
+
+```
+                         ┌──────────────► users-svc
+ web / mobile / partners │
+ ───────────────► [ API gateway ] ──────► orders-svc
+   (one hostname,        │
+    one auth model)      └──────────────► catalog-svc
+```
+
+It is the **facade pattern** applied to a whole system: one stable, public interface in front of a changing set of internals.
+
+## What a gateway does
+
+A gateway is a reverse proxy with an opinion about APIs. Requests flow through a **pipeline of filters** (also called plugins, policies or middleware), each of which can reject, modify or answer the request.
+
+### Routing
+
+The core job: map an incoming request to a backend.
+
+```yaml
+routes:
+  - match: { path_prefix: /api/v1/users }
+    backend: http://users-svc:8080
+  - match: { path_prefix: /api/v1/orders, methods: [GET, POST] }
+    backend: http://orders-svc:8080
+  - match: { path_prefix: /api/v2/orders }
+    backend: http://orders-v2-svc:8080        # new version, same public host
+  - match: { header: { x-canary: "true" }, path_prefix: /api/v1/cart }
+    backend: http://cart-canary:8080
+```
+
+Routing can match on path, host, method, headers or query parameters, and can **rewrite** paths (`/api/v1/users/42` becomes `/42` on the users service). Because routing lives in one place, you can move, split, version or canary services without clients noticing. The gateway usually finds backend instances through service discovery and load balances across them.
+
+### Authentication and authorization
+
+The gateway is the natural place to check **who** is calling:
+
+- Validate a **JWT** (signature, expiry, issuer, audience) using the identity provider's public keys, without a network call per request.
+- Check **API keys** for partner integrations, or terminate **OAuth 2.0** and introspect opaque tokens.
+- Enforce **coarse-grained authorization**: this route needs the `orders:write` scope; admin routes need the `admin` role.
+- Pass verified identity downstream as headers (`X-User-Id`, `X-Scopes`) or a signed internal token, and **strip** any such headers arriving from outside so clients can't forge them.
+
+Fine-grained authorization ("may user 42 cancel order 9001?") still belongs in the service that owns the data, because only it knows who owns order 9001. The gateway answers "is this a valid, authenticated caller allowed to use this endpoint at all".
+
+<Callout kind="warn">
+Don't let the gateway become the only security layer. Services should still reject requests that didn't come through the gateway (network policy, mTLS, or verifying a signed internal token). Otherwise anyone who reaches the internal network bypasses all of it.
+</Callout>
+
+### Rate limiting and quotas
+
+The gateway sees every request, so it can enforce limits per API key, user, IP or route: 100 requests per minute for free-tier keys, 10 login attempts per minute per IP, 1,000 writes per second total to protect a fragile backend. Over the limit, it answers `429 Too Many Requests` with a `Retry-After` header, and the backend never sees the request.
+
+With many gateway instances the counters must be shared (usually in Redis, with an atomic increment or Lua script) or approximated locally per instance. Quotas (10,000 calls per month per plan) are the billing-flavoured version of the same idea and are a core feature of commercial API management products.
+
+### TLS termination
+
+The gateway holds the public certificates and decrypts HTTPS. That centralises certificate management (one place to rotate, often automated with Let's Encrypt or a cloud certificate manager) and lets the gateway read the request to route and authenticate it. Traffic onward to services is either plain HTTP inside a trusted network or, increasingly, re-encrypted with mTLS.
+
+### Request aggregation and BFF
+
+Some screens need data from several services. Instead of the client making five calls, the gateway (or a layer just behind it) exposes **one endpoint** that fans out to the services in parallel over the fast internal network and **composes** one response.
+
+```
+GET /mobile/home
+  → users-svc       /users/42              (parallel)
+  → orders-svc      /orders?user=42&limit=3 (parallel)
+  → recs-svc        /recommendations/42     (parallel)
+  ← { user, recentOrders, recommendations }  one response, shaped for the screen
+```
+
+Different clients want different shapes: the mobile app wants a small payload for a 6-inch screen, the web app wants more detail, a smart TV wants something else. The **Backend for Frontend (BFF)** pattern gives each client type its own thin gateway layer, owned by the team that builds that client. Each BFF aggregates and trims data for its client, so the mobile team can change its API without negotiating with the web team.
+
+GraphQL gateways are a related approach: the client describes exactly the fields it needs, and the gateway resolves them across services (Apollo Federation is a common example).
+
+<HldBffFanout />
+
+### Protocol translation
+
+Clients and services often speak different protocols. The gateway can translate:
+
+| Client side | Service side | Example |
+|---|---|---|
+| REST and JSON | gRPC and Protobuf | Envoy's gRPC-JSON transcoder, gRPC-Gateway |
+| WebSocket | Internal pub/sub or HTTP | Long-lived connections terminated at the edge |
+| HTTP | Message queue | POST becomes a message on Kafka or SQS for async processing |
+| HTTP | Serverless function | AWS API Gateway invoking Lambda |
+| SOAP or XML | REST | Wrapping a legacy system |
+
+This lets internal teams pick efficient protocols without forcing them on every client.
+
+### Caching
+
+For safe, cacheable `GET`s (product details, configuration, public catalog pages), the gateway can keep responses for a short TTL and answer repeat requests without touching the backend. It respects or sets `Cache-Control`, and keys the cache on path, query and relevant headers. Never cache per-user responses under a shared key: include the user id in the key, or don't cache them.
+
+### Observability
+
+As the single entry point, the gateway is the best place to measure the whole system from the client's point of view:
+
+- **Access logs** with route, status, latency, caller identity.
+- **Metrics**: request rate, error rate and latency percentiles per route and per consumer (the RED metrics).
+- **Tracing**: assign or propagate a request id and trace context (W3C `traceparent`) so one request can be followed through every service.
+
+When something breaks, the gateway's dashboards usually tell you first which route and which backend is unhealthy.
+
+### The rest of the toolbox
+
+| Feature | What it does |
+|---|---|
+| Request validation | Reject bodies that don't match the OpenAPI schema before they reach the service |
+| Transformation | Add, remove or rename headers and fields; mask sensitive data in responses |
+| CORS | Answer preflights and set allow-origin headers in one place |
+| Timeouts and retries | Bound how long a client waits; retry idempotent requests on another instance |
+| Circuit breaking | Stop forwarding to a backend that's failing, return a fast error or fallback |
+| Compression | gzip or brotli responses |
+| IP allow and deny lists, WAF rules | Block known-bad traffic at the edge |
+| Developer portal and API keys | Self-service onboarding for third-party developers (API management products) |
+
+<HldGatewayPipeline />
+
+## Gateway, load balancer and service mesh
+
+All three are proxies that sit in the request path, which is why they're constantly confused. The difference is **where** they sit and **what they understand**.
+
+| | Load balancer | API gateway | Service mesh |
+|---|---|---|---|
+| Main job | Spread traffic across identical instances | Manage the API as a product for external clients | Manage service-to-service calls |
+| Traffic direction | Anywhere (often in front of the gateway itself) | North-south (outside into the system) | East-west (between services inside) |
+| Understands | Connections (L4) or HTTP basics (L7) | API concepts: routes, consumers, keys, plans, schemas | Service identities and calls |
+| Typical features | Health checks, algorithms (round robin, least connections), TLS | Auth, rate limits, quotas, aggregation, transformation, developer portal | mTLS, retries, timeouts, circuit breaking, traffic splitting, telemetry |
+| Deployed as | A managed appliance or a few proxy instances | A cluster of proxies at the edge | A sidecar or node proxy next to every service, plus a control plane |
+| Examples | AWS ALB and NLB, HAProxy, Nginx | Kong, AWS API Gateway, Apigee, Tyk, Envoy Gateway | Istio, Linkerd, Consul |
+
+They're complementary, and a real system often has all three:
+
+```
+client → DNS → cloud load balancer → API gateway cluster → (mesh sidecars) → services
+```
+
+- The **load balancer** spreads traffic across gateway instances and handles raw connection volume.
+- The **gateway** applies API policy for outside callers.
+- The **mesh** secures and controls calls between services.
+
+The lines blur in practice: an L7 load balancer can route by path, Envoy can be a gateway or a mesh sidecar, and meshes ship "ingress gateways". In an interview, define each by its **responsibility**, then say which product plays which role.
+
+## Single point of failure concerns
+
+Putting everything through one component creates obvious risks. Good designs address each one explicitly.
+
+### Availability
+
+If the gateway is down, the whole product is down. So the gateway is never one box:
+
+- Run **many stateless instances** behind a load balancer, across **multiple availability zones**.
+- Keep gateway instances **stateless**: configuration comes from a control plane or database, and shared state (rate limit counters, sessions) lives in an external store. Any instance can serve any request.
+- Make the gateway **degrade gracefully** when its dependencies fail. If Redis for rate limiting is down, fail open with local limits rather than rejecting all traffic. If the auth provider's key endpoint is down, keep using cached keys.
+- Use a managed gateway (AWS API Gateway, Apigee) if you'd rather the provider carry the availability burden.
+
+### Latency
+
+Every request pays an extra network hop and the cost of every plugin. Typically that's around a millisecond or a few for a well-tuned proxy, but slow plugins (an external auth call per request, heavy body transformation) add up. Validate JWTs locally, cache introspection results, and measure the gateway's own overhead per route.
+
+### Bottleneck and blast radius
+
+All traffic shares the gateway's capacity, so one abusive client or one slow backend can hurt everyone:
+
+- Autoscale gateway instances on CPU and connection count.
+- Apply **per-route timeouts** and **circuit breakers**, and isolate connection pools per backend (bulkheads) so a slow service can't exhaust the gateway's workers.
+- Roll out gateway config changes gradually: a bad routing rule is a global outage.
+- For very large systems, use **multiple gateways** split by audience (public API, mobile, partner, internal admin) so one can't take down the others.
+
+### The god-gateway anti-pattern
+
+The most common long-term failure isn't technical, it's organisational. Teams start putting **business logic** in the gateway: "if the user is premium, call this service instead", "merge these fields and compute a discount". The gateway becomes a shared monolith that every team must change and coordinate releases on.
+
+Keep the gateway to **cross-cutting concerns** (routing, auth, limits, observability, protocol). Put screen-specific composition in **BFFs owned by client teams**, and put business rules in **services**.
+
+<Callout kind="remember">
+A gateway should be **smart about traffic and dumb about business**. If a change to the gateway needs a product manager's sign-off, something has leaked into it that belongs in a service.
+</Callout>
+
+## Real-world gateways
+
+| Product | What it is | Notable traits |
+|---|---|---|
+| **Kong** | Open-source gateway built on Nginx and OpenResty, with enterprise editions | Large plugin ecosystem (auth, rate limiting, transformations), Lua or other plugin languages, Kubernetes ingress controller, DB or declarative config |
+| **AWS API Gateway** | Fully managed service | REST, HTTP and WebSocket APIs; native Lambda integration; usage plans and API keys; Cognito and JWT authorizers; pay per request, no servers to run; has request-rate and payload limits to design around |
+| **Envoy** | High-performance C++ proxy | Dynamic configuration over xDS APIs, first-class HTTP/2 and gRPC, rich telemetry; the data plane under Istio, Envoy Gateway, Ambassador/Emissary and others |
+| **Apigee** (Google) | Full API management platform | Analytics, monetisation, developer portal; aimed at exposing APIs as products |
+| **Nginx, Traefik, Tyk, Spring Cloud Gateway, Azure API Management** | Other common choices | From a lightweight reverse proxy with config to full management suites |
+
+How to choose in an interview:
+
+- **Serverless or small team on AWS**: AWS API Gateway, because you get auth, throttling and Lambda wiring with no infrastructure.
+- **Kubernetes, want open source and plugins**: Kong, or an Envoy-based gateway, especially if you already run Envoy in a mesh.
+- **Selling APIs to third parties**: an API management platform (Apigee, Kong Enterprise, Azure APIM) for keys, quotas, billing and a developer portal.
+
+## Designing with a gateway
+
+When an interview design has more than a couple of services and external clients, a gateway is usually worth drawing. A crisp description covers:
+
+1. **Placement**: DNS and a load balancer in front, gateway cluster across zones, services behind on a private network.
+2. **Responsibilities**: TLS, JWT validation, per-key rate limits, routing and versioning, request ids and tracing.
+3. **What it does not do**: business logic, fine-grained authorization, data ownership.
+4. **Aggregation**: whether mobile needs a BFF or GraphQL layer to avoid chatty clients.
+5. **Failure handling**: stateless instances, autoscaling, timeouts and circuit breakers per backend, fail-open versus fail-closed choices.
+6. **Trade-offs**: an extra hop and an operational component, in exchange for one consistent edge and the freedom to reshape services behind it.
+
+## Cheat sheet
+
+- An API gateway is the single entry point for external clients: a facade over many services.
+- It centralises routing, authentication, rate limiting, TLS termination, caching, CORS and observability.
+- Aggregation turns many client round trips into one; BFF gives each client type its own thin gateway layer.
+- Protocol translation lets clients use REST or WebSocket while services use gRPC, queues or functions.
+- Load balancer spreads traffic over instances; gateway manages north-south API policy; mesh manages east-west service calls.
+- Avoid a single point of failure with stateless instances across zones behind a load balancer, plus graceful degradation.
+- Per-route timeouts, circuit breakers and bulkheads stop one slow backend from taking down the gateway.
+- Keep business logic out: smart about traffic, dumb about business.
+- Services still need their own checks; the gateway shouldn't be the only security layer.
+- Examples: Kong (open-source plugins), AWS API Gateway (managed, Lambda), Envoy (programmable proxy under many gateways and meshes).

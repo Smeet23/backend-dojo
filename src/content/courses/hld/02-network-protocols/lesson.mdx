@@ -1,0 +1,236 @@
+import { HldHolBlocking } from "@/components/widgets/HldHolBlocking";
+import { RealtimeTimeline } from "@/components/widgets/RealtimeTimeline";
+import { HldProtocolPicker } from "@/components/widgets/HldProtocolPicker";
+
+## Why protocols matter in design
+
+Every arrow on a system design diagram is a protocol choice. "The app talks to the server" hides real decisions: does the client ask or does the server push? Is a late message useless or must every byte arrive? Is the other end a browser, a phone or another service in the same data centre? Picking the wrong answer shows up as wasted servers, laggy features or connections that silently die behind a corporate proxy.
+
+This lesson builds up from the communication models, through the two transport protocols, to the application protocols you'll name in interviews, and ends with a way to choose between them.
+
+## Communication models
+
+### Client-server
+
+In the **client-server** model, one side (the server) owns data and logic, and many clients send it requests. The web, mobile apps talking to APIs, and services calling a database all work this way.
+
+- **Central control.** The server enforces rules, validates input and holds the truth. That makes security and consistency far easier.
+- **Clients are simple and untrusted.** A browser tab can close at any time; it doesn't matter, the server still has the data.
+- **Scaling means scaling the server side**: load balancers, replicas, caches. The clients don't help carry the load.
+- **The server is the bottleneck and the single point of failure** unless you design around it.
+
+### Peer-to-peer
+
+In **peer-to-peer (P2P)**, every participant is both client and server. Peers exchange data directly. BitTorrent, many blockchain networks and the media path of a 1:1 video call are P2P.
+
+- **Capacity grows with users.** Each new BitTorrent peer downloads but also uploads, so popular files get faster, not slower.
+- **No central bottleneck for the data path**, which cuts bandwidth cost and latency (two people in the same city don't route video through a distant data centre).
+- **Hard problems move to the edges**: discovering peers, getting through NATs and firewalls, trusting data from strangers, and coping with peers that leave mid-transfer.
+
+### Hybrids are the norm
+
+Pure P2P is rare in products. Most "peer-to-peer" systems keep servers for the parts that need authority: a video call uses a server to find the other person and exchange connection details, then sends media directly. BitTorrent uses trackers or a DHT to find peers. In interviews, say which **plane** goes where: **control plane** (who, when, permissions) through servers, **data plane** (the heavy bytes) directly when it pays off.
+
+## The layers in one minute
+
+Application protocols sit on top of a **transport** protocol, which sits on **IP**.
+
+- **IP** gets a packet from one address to another, best effort. Packets can be lost, duplicated or reordered, and there's no notion of a conversation.
+- **Transport** (TCP or UDP) adds **ports**, so many conversations share one machine, and optionally reliability.
+- **Application** protocols (HTTP, WebSocket, gRPC, DNS, SMTP) define what the bytes mean.
+
+**TLS** sits between transport and application to add encryption and server authentication. With HTTP/3, the transport and TLS are fused into one protocol, QUIC.
+
+## TCP
+
+**TCP** gives applications the illusion of a reliable, ordered **byte stream** between two endpoints, built on top of unreliable packets.
+
+### How it delivers that
+
+- **Three-way handshake.** `SYN`, `SYN-ACK`, `ACK` establish the connection and agree on starting sequence numbers. That costs **one round trip** before any data, plus TLS on top (one more round trip with TLS 1.3, two with TLS 1.2).
+- **Sequence numbers and acknowledgements.** Every byte is numbered. The receiver acknowledges what it got; anything unacknowledged after a timeout, or flagged by duplicate ACKs, is **retransmitted**.
+- **In-order delivery.** If segment 5 is lost but 6 and 7 arrive, the receiver holds 6 and 7 in a buffer and gives the application nothing until 5 is retransmitted. This is TCP's **head-of-line blocking**, and it matters for HTTP/2 later.
+- **Flow control.** The receiver advertises how much buffer it has left (the window), so a fast sender can't overwhelm a slow reader.
+- **Congestion control.** The sender starts slowly, ramps up, and backs off sharply when it sees loss, so the network as a whole doesn't collapse. A fresh connection therefore can't use the full bandwidth immediately (slow start), which is one reason to **reuse connections**.
+
+### When to use it
+
+Almost always, when correctness matters more than a few milliseconds: web pages, APIs, database connections, file transfers, email, payments. If losing or reordering a byte would corrupt the meaning, you want TCP or something with the same guarantees.
+
+## UDP
+
+**UDP** is a thin layer over IP: add source and destination ports and a checksum, then send. No handshake, no acknowledgements, no retransmission, no ordering, no congestion control.
+
+That sounds like a downgrade, but it's exactly right when **late data is worthless**:
+
+- **Live voice and video.** A 20 ms audio frame that arrives 300 ms late is worse than a tiny glitch. Retransmitting it wastes bandwidth and delays everything else.
+- **Fast multiplayer games.** The newest position update supersedes the old one, so the game wants the latest packet, not every packet.
+- **DNS lookups.** One small request, one small response. A handshake would double the latency; if it's lost, the client just asks again.
+- **Building your own transport.** QUIC is built on UDP precisely because UDP lets you implement new reliability and congestion logic in user space, without waiting for every operating system and middlebox to learn a new protocol.
+
+The application has to handle what UDP doesn't: dropping stale packets, rate limiting itself, and adding reliability for the few messages that must arrive (a player's "I bought this item" message, for example).
+
+| | TCP | UDP |
+|---|---|---|
+| Connection setup | Handshake, 1 RTT | None |
+| Delivery | Reliable, retransmits lost data | Best effort, may lose packets |
+| Ordering | Strictly in order | No ordering |
+| Congestion control | Built in | Up to the application |
+| Unit | Byte stream | Individual datagrams |
+| Head-of-line blocking | Yes, one loss stalls later bytes | No |
+| Typical uses | HTTP/1.1 and HTTP/2, databases, SSH, email | DNS, VoIP, video calls, games, QUIC |
+
+<Callout kind="remember">
+The real question is not "fast vs slow". It's **"must every byte arrive in order, or is fresh data more valuable than complete data?"** The first means TCP, the second means UDP with your own rules.
+</Callout>
+
+## HTTP
+
+**HTTP** is the request-response protocol of the web. A client sends a method (`GET`, `POST`, `PUT`, `DELETE`...), a path, headers and an optional body; the server replies with a status code, headers and a body. It is **stateless**: each request carries everything needed to handle it (cookies or tokens identify the user), which is what lets any server behind a load balancer handle any request.
+
+Its versions differ in how they move those messages, not in what the messages mean.
+
+### HTTP/1.1
+
+- Text-based messages, one request at a time per connection.
+- **Keep-alive** reuses a TCP connection for several requests, avoiding a new handshake each time.
+- On one connection, the next request can't be answered until the previous response is fully sent. A slow response blocks everything behind it: **head-of-line blocking at the HTTP layer**. (Pipelining tried to fix this and was never usable in practice.)
+- Browsers work around it by opening **about 6 connections per host**, and sites used to shard assets across domains to get more. Every extra connection pays its own handshake and slow start.
+- Headers are repeated uncompressed on every request, often hundreds of bytes of cookies and user-agent strings.
+
+### HTTP/2
+
+- **Binary framing.** Messages are split into frames tagged with a **stream id**.
+- **Multiplexing.** Many requests and responses are interleaved on **one** TCP connection, so a slow response no longer blocks others at the HTTP layer. Domain sharding becomes counter-productive.
+- **HPACK header compression** sends repeated headers as small references to a shared table.
+- Stream priorities and flow control per stream.
+
+The catch: everything still rides on **one TCP connection**, and TCP delivers bytes strictly in order. Lose one packet, and every stream on the connection waits for its retransmission, even streams whose data already arrived. On lossy mobile networks, HTTP/2 can do worse than HTTP/1.1's six independent connections.
+
+### HTTP/3 and QUIC
+
+**HTTP/3** keeps HTTP/2's ideas but runs on **QUIC**, a transport built on UDP:
+
+- **Independent streams at the transport layer.** QUIC orders data per stream, so a lost packet only stalls the stream it belonged to.
+- **Faster setup.** Transport and TLS 1.3 handshakes are combined into **one round trip**, and a returning client can send data in its first flight with **0-RTT** (with a replay caveat: only use it for idempotent requests).
+- **Always encrypted.** Even most transport headers are encrypted, so middleboxes can't ossify the protocol.
+- **Connection migration.** Connections are identified by a connection id, not by the IP and port pair, so a phone moving from Wi-Fi to cellular can keep its connection.
+
+The costs: QUIC runs in user space and uses more CPU per byte than kernel TCP, some networks block or throttle UDP (clients fall back to HTTP/2), and the tooling is younger. Browsers discover HTTP/3 support through the `Alt-Svc` header or DNS `HTTPS` records.
+
+<HldHolBlocking />
+
+| | HTTP/1.1 | HTTP/2 | HTTP/3 |
+|---|---|---|---|
+| Transport | TCP | TCP | QUIC over UDP |
+| Format | Text | Binary frames | Binary frames |
+| Requests per connection at once | One | Many, multiplexed | Many, multiplexed |
+| Head-of-line blocking | HTTP and TCP | TCP only | Neither (per stream) |
+| Header compression | None | HPACK | QPACK |
+| Setup cost (with TLS 1.3) | 2 RTT | 2 RTT | 1 RTT, or 0 on resumption |
+
+## Real-time updates
+
+HTTP is client-initiated: the server can only answer. Many features need the server to speak first: a new chat message, a price change, a build finishing. There are four common approaches.
+
+- **Short polling.** The client asks every few seconds. Simple and works everywhere, but most responses are empty, and updates arrive up to one interval late. Fine for a dashboard that refreshes every minute.
+- **Long polling.** The client asks, and the server holds the request open until there's news or a timeout (say 30 seconds), then the client immediately asks again. Near-instant delivery with plain HTTP, but each message costs a full request and the server holds many idle requests.
+- **Server-Sent Events (SSE).** One long-lived HTTP response that the server keeps writing `data:` lines into. Server to client only, text only, with automatic reconnect and `Last-Event-ID` resume built into browsers. A great fit for notifications, live feeds and streaming LLM output.
+- **WebSockets.** A full-duplex channel. The client sends an HTTP request with `Upgrade: websocket`, the server answers `101 Switching Protocols`, and from then on both sides send small framed messages over the same TCP connection whenever they like.
+
+```http
+GET /chat HTTP/1.1
+Host: example.com
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+Sec-WebSocket-Version: 13
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+```
+
+<RealtimeTimeline />
+
+### Scaling WebSockets
+
+WebSockets make the server **stateful**: each user is attached to one specific server for as long as the connection lives. That changes the design:
+
+- **Load balancers** must support upgrades and long idle timeouts, and connections should be spread by count, not by request rate.
+- **Fan-out needs a backplane.** If Alice is connected to server 3 and Bob to server 7, a message from Alice must reach server 7. A pub-sub layer (Redis pub-sub, Kafka, NATS) or a connection registry mapping user to server handles that.
+- **Deploys drain connections.** Restarting a server disconnects thousands of clients at once; they all reconnect at once. Clients need **backoff with jitter** and a way to **resume** from the last message they saw.
+- **Heartbeats.** Proxies and mobile networks silently drop idle connections, so both sides send pings to detect dead ones.
+
+## WebRTC
+
+**WebRTC** lets browsers and apps send audio, video and arbitrary data **directly to each other**. It's the standard behind browser video calls.
+
+The connection is set up in stages:
+
+1. **Signalling.** The two peers exchange session descriptions (SDP offers and answers: codecs, encryption keys) and network candidates. WebRTC deliberately doesn't define how; you usually use your own WebSocket or HTTPS server.
+2. **ICE and STUN.** Most devices sit behind NAT and don't know their public address. A **STUN** server tells each peer what address the internet sees. ICE then tries pairs of candidate addresses until one works.
+3. **TURN fallback.** When NATs or firewalls block a direct path (common on corporate and some mobile networks), traffic is relayed through a **TURN** server. That's no longer peer-to-peer, and TURN bandwidth is a real cost.
+4. **Media and data.** Media flows over SRTP on UDP with built-in congestion control and bitrate adaptation. **Data channels** (SCTP over DTLS) can be reliable and ordered, or unordered with no retransmission for game-like use.
+
+Direct P2P works for 1:1 and small calls. With many participants, each sender would have to upload one stream per receiver, so group calls use a server:
+
+- **SFU (selective forwarding unit).** Each participant uploads once; the server forwards streams to everyone, often choosing a lower-quality layer for weak receivers. The common choice today.
+- **MCU (multipoint control unit).** The server decodes, mixes and re-encodes into one stream per receiver. Cheap for clients, very expensive for the server.
+
+## gRPC
+
+**gRPC** is a remote procedure call framework that runs on **HTTP/2**. You describe services and messages in a **Protocol Buffers** schema, and code generators produce typed clients and servers in many languages.
+
+```protobuf
+service OrderService {
+  rpc GetOrder (GetOrderRequest) returns (Order);
+  rpc WatchOrder (GetOrderRequest) returns (stream OrderEvent);
+}
+
+message GetOrderRequest { string order_id = 1; }
+```
+
+- **Compact and fast.** Protobuf is binary and much smaller to encode and parse than JSON.
+- **Strong contracts.** The schema is the API; field numbers allow backward-compatible evolution.
+- **Four call styles**: unary (one request, one response), server streaming, client streaming and bidirectional streaming, all multiplexed over one HTTP/2 connection.
+- **Deadlines and cancellation** propagate across services, so a caller that gives up stops work downstream.
+
+Trade-offs: payloads aren't human-readable, browsers can't speak native gRPC (you need **gRPC-Web** through a proxy, or a REST gateway), and because one HTTP/2 connection carries many calls, an **L4 load balancer pins all of a client's calls to one backend**. Use an L7 balancer, a service mesh or client-side balancing to spread them.
+
+That's why the usual split is **REST or GraphQL at the public edge, gRPC between internal services**.
+
+## Choosing a protocol
+
+| Use case | Good fit | Why |
+|---|---|---|
+| Public API for third-party developers | REST over HTTPS | Universal tooling, caching, readable |
+| Internal service-to-service calls | gRPC | Typed contracts, low overhead, streaming, deadlines |
+| Static assets and downloads | HTTP/2 or HTTP/3 via a CDN | Multiplexing, caching, edge delivery |
+| Notifications, live feed, LLM token stream | SSE | Server push over plain HTTP, auto-reconnect |
+| Chat, collaborative editing, live cursors | WebSocket | Low-overhead messages in both directions |
+| Browser video or voice call | WebRTC | UDP media, NAT traversal, direct paths |
+| Native fast-paced multiplayer game | Custom protocol over UDP | Fresh state beats complete state |
+| Name resolution | DNS over UDP | One tiny request and response |
+| Mobile clients on flaky networks | HTTP/3 | No TCP head-of-line blocking, connection migration |
+
+<HldProtocolPicker />
+
+<Callout kind="tip">
+In an interview, state the protocol on each arrow and **one reason**: "clients hold a WebSocket to the gateway because the server pushes messages; services talk gRPC internally; media goes peer-to-peer over WebRTC with TURN as a fallback." That one sentence shows you've thought about every edge.
+</Callout>
+
+## Cheat sheet
+
+- Client-server centralises truth and control; P2P scales the data path with users but pushes discovery, NAT and trust problems to the edges.
+- TCP: handshake, reliable, ordered, congestion-controlled byte stream; one lost segment stalls everything behind it.
+- UDP: no handshake, no guarantees; right when fresh data beats complete data (voice, video, games, DNS, QUIC).
+- HTTP/1.1: one request at a time per connection, so browsers open about 6 connections per host.
+- HTTP/2: binary frames multiplexed over one TCP connection, HPACK; still blocked by TCP packet loss.
+- HTTP/3: HTTP over QUIC on UDP; per-stream ordering, 1-RTT setup, 0-RTT resumption, connection migration.
+- Polling is simple but wasteful; SSE pushes server to client over HTTP; WebSockets are full-duplex and stateful.
+- WebSockets need a pub-sub backplane, long LB timeouts, heartbeats and reconnect with jitter.
+- WebRTC: signalling via your server, STUN to find public addresses, TURN to relay, SFU for group calls.
+- gRPC: protobuf over HTTP/2, typed and streaming; needs L7 balancing and gRPC-Web for browsers.
+- Usual split: REST at the public edge, gRPC inside, WebSocket or SSE for push, WebRTC for media.

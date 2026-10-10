@@ -1,0 +1,202 @@
+import { SdCapPartition } from "@/components/widgets/SdCapPartition";
+import { HldConsistencyReads } from "@/components/widgets/HldConsistencyReads";
+
+## The setting
+
+As soon as data lives on more than one machine, you have **replicas**: copies of the same data on different nodes. You replicate for good reasons. A single node can die and take your data with it; a single node can only serve so many reads; and users on another continent want a copy nearby.
+
+Replicas talk to each other over a network, and networks fail. Messages get delayed, dropped or cut off entirely. The **CAP theorem** (Eric Brewer's conjecture, proved by Gilbert and Lynch in 2002) describes what that forces on you: when the network splits your replicas apart, you can't both keep answering every request **and** guarantee every answer is up to date.
+
+That's the whole theorem in one sentence. The rest of this lesson is about stating it precisely, because most confusion about CAP comes from loose definitions.
+
+## The three properties
+
+### Consistency
+
+In CAP, **consistency** means **linearizability**: the system behaves as if there were a single copy of the data, and every operation takes effect at one instant between its start and its end. Concretely:
+
+- Once a write completes, **every** later read, on any replica, returns that value or a newer one.
+- Once any client has read a new value, no client can afterwards read an older one.
+
+This is a much stronger and narrower idea than the **C in ACID**, which means "transactions leave the database satisfying its rules and constraints" (foreign keys, balances not negative). The two share a letter and nothing else. Mixing them up is the most common CAP error.
+
+### Availability
+
+**Availability** in CAP means: **every request received by a non-failing node gets a non-error response.** Not "most requests", not "the cluster is up", but every node that's still running must answer, even if it can't reach anyone else.
+
+That's stricter than the everyday meaning (99.9% uptime). A system that answers from the majority side of a split but returns errors on the minority side is **not** available in the CAP sense, even if 99.99% of users never notice.
+
+### Partition tolerance
+
+A **network partition** is when some nodes can't communicate with others: messages between the groups are lost or delayed indefinitely. **Partition tolerance** means the system keeps operating (in some defined way) despite that, rather than falling into undefined behaviour.
+
+Partitions are not only cut cables. From the point of view of one node, these are all indistinguishable from a partition:
+
+- A switch or router failure, or a misconfigured firewall rule.
+- A cross-region link degrading so badly that messages time out.
+- A **long garbage-collection pause** or VM freeze: the node is alive but silent for 20 seconds.
+- An overloaded node that's too slow to answer heartbeats.
+
+## Partitions are not optional
+
+The popular summary "pick two of three" suggests three equal options: CP, AP or CA. That framing is misleading.
+
+In any system whose nodes communicate over a network, **partitions will happen**. You don't get to choose whether they occur, only how the system behaves when they do. So "CA" (consistent and available, but not partition tolerant) isn't a design you can pick for a distributed system; it describes a system that only works while the network is perfect, and does something undefined otherwise.
+
+A single-node database is "CA" in a trivial sense: there's no network between replicas to partition. The moment you add a replica, you're back to choosing.
+
+<Callout kind="remember">
+The honest version of CAP: **during a network partition, a replicated system must choose between consistency and availability.** When there's no partition, you can have both.
+</Callout>
+
+## The choice during a partition
+
+Picture a bank balance of 100 on three replicas, A, B and C. The network splits: A and B can talk to each other, C is cut off. A customer asks C to withdraw 60, and at the same moment someone asks A to withdraw 60.
+
+C has two options:
+
+1. **Refuse** (return an error or time out) because it can't confirm with the others that the money is still there. The data stays correct; the request fails. That's choosing **consistency (CP)**.
+2. **Accept** the withdrawal locally. The customer gets an answer, but now both sides approved 60 from a balance of 100, and when the partition heals the account is at -20. That's choosing **availability (AP)**.
+
+There's no third option. C can't know what's happening on the other side, and waiting forever is just a slow way of not answering.
+
+<SdCapPartition />
+
+A common CP design uses a **majority (quorum)**: the side with a majority of replicas keeps serving reads and writes; the minority side refuses. Since two disjoint groups can't both have a majority, there's never more than one side accepting writes, so there are never conflicting histories.
+
+## CP systems
+
+**CP** systems refuse some requests during a partition rather than risk returning stale data or accepting conflicting writes.
+
+Examples:
+
+- **ZooKeeper, etcd and Consul's key-value store.** Built on consensus (Zab, Raft). A minority partition can't elect a leader or commit writes. That's exactly what you want for leader election, distributed locks and configuration, where two nodes both believing they're the leader is a disaster.
+- **HBase** and **Google Bigtable.** Each row range is served by one server at a time; if that server is unreachable, the range is unavailable until it's reassigned.
+- **Google Spanner.** Paxos groups with a majority quorum. Google runs it on a private network engineered so partitions are very rare, so it's CP but in practice extremely available.
+- **A relational primary with synchronous replication**, or MongoDB with majority write and read concerns.
+
+Use CP where a wrong answer costs more than no answer: account balances, inventory that must not oversell, seat or ticket booking, unique username registration, locks and leases.
+
+## AP systems
+
+**AP** systems keep answering on every reachable node and accept that replicas will temporarily disagree. Once the partition heals, replicas exchange updates and **converge**: that's **eventual consistency**.
+
+Examples:
+
+- **Cassandra** and **Amazon DynamoDB** (with default eventually consistent reads), descendants of Amazon's Dynamo paper, which was designed so the shopping cart could always accept "add to cart".
+- **Riak**, **CouchDB** and many multi-leader or leaderless replication setups.
+- **DNS.** Records are cached everywhere with TTLs; you always get an answer, possibly an old one.
+
+Accepting writes on both sides means **conflicts** when the partition heals. AP systems need a resolution strategy:
+
+| Strategy | How it works | Risk |
+|---|---|---|
+| Last write wins (LWW) | Keep the value with the highest timestamp | Silently drops a concurrent write; clock skew picks the "wrong" winner |
+| Version vectors | Detect that two writes were concurrent and keep both as siblings | The application (or user) must merge them |
+| CRDTs | Data types that merge automatically and deterministically: counters, sets, maps | Only certain operations fit; a balance that must not go negative doesn't |
+| Application merge | Domain logic, e.g. union of two shopping carts | You write and test it |
+
+Use AP where an answer is better than no answer and temporary disagreement is tolerable: shopping carts, like counts, view counters, social feeds, user presence, product catalogue reads, DNS.
+
+<Callout kind="tip">
+Most real products are **not** one letter. An e-commerce site can keep the cart and catalogue AP while checkout and payment are CP. In interviews, make the choice **per feature or per piece of data**, and say why.
+</Callout>
+
+## Tunable consistency
+
+Many databases let you choose per operation. Leaderless stores like Cassandra use **quorums**:
+
+- **N**: number of replicas for each key (say 3).
+- **W**: how many replicas must acknowledge a write.
+- **R**: how many replicas must answer a read.
+
+If **R + W > N**, every read set overlaps every write set in at least one replica, so a read sees the latest acknowledged write (with caveats around concurrent writes and failed partial writes; it's not full linearizability without extra mechanisms).
+
+```text
+N = 3
+W = 2, R = 2   → R + W = 4 > 3: reads overlap writes, survives 1 node down
+W = 1, R = 1   → fastest, but reads may miss the latest write
+W = 3, R = 1   → fast reads, but any one node down blocks writes
+```
+
+Cassandra exposes this as consistency levels such as `ONE`, `QUORUM`, `LOCAL_QUORUM` and `ALL`. DynamoDB offers eventually consistent reads (cheaper, may be stale) and strongly consistent reads (from the leader replica, twice the read cost, and unavailable if that replica can't be reached).
+
+So "Cassandra is AP" really means "Cassandra lets you choose, and its common configurations favour availability."
+
+## PACELC
+
+CAP only talks about behaviour **during** a partition, which is rare. Most of the time the network is fine, and a different trade-off dominates every single request. **PACELC** (Daniel Abadi) captures both:
+
+> If there is a **P**artition, choose **A**vailability or **C**onsistency; **E**lse, choose **L**atency or **C**onsistency.
+
+Why is there a trade-off without a partition? Because strong consistency requires **coordination**. To guarantee a read is current, you must either read from the leader or contact a quorum, and to acknowledge a write you must wait for other replicas, possibly in other regions. That costs round trips. A system that answers from the nearest replica without asking anyone is fast but can return stale data.
+
+| System | Partition | Else | Notes |
+|---|---|---|---|
+| Cassandra, DynamoDB (default) | A | L | Answer from nearby replicas, converge later |
+| Spanner, etcd, ZooKeeper | C | C | Pay consensus latency on every write |
+| HBase, Bigtable | C | C | One server owns each range |
+| Postgres primary with async replicas | C on the primary | L on replica reads | Replica reads are fast and possibly stale |
+
+<Callout kind="remember">
+CAP describes the rare bad day. **PACELC's "else" half is the everyday cost**: every strongly consistent operation pays extra latency for coordination, partition or not.
+</Callout>
+
+## Consistency levels
+
+"Consistent" vs "eventually consistent" is too coarse. Between them is a ladder of guarantees, and many products only need a middle rung.
+
+| Level | Guarantee | Typical way to get it |
+|---|---|---|
+| Linearizable (strong) | Behaves like a single copy; reads see the latest completed write | Read from leader or quorum, consensus |
+| Sequential | All clients see operations in the same order, but not necessarily real-time order | Total ordering through a log |
+| Causal | If one operation could have influenced another (a reply after the post), everyone sees them in that order | Track dependencies with version vectors |
+| Read-your-writes | A user always sees their own updates | Route that user's reads to the leader, or to a replica caught up to their last write |
+| Monotonic reads | A user never sees data go backwards in time | Pin a user to one replica, or track the version they've seen |
+| Eventual | If writes stop, all replicas converge eventually | Asynchronous replication, anti-entropy |
+
+The middle rows are **session guarantees**: they're about what one user experiences, and they're far cheaper than global linearizability because they only need to track per-user position. A profile edit that the editor can't see on refresh feels like a bug; the same edit taking two seconds to reach other users usually doesn't matter.
+
+<HldConsistencyReads />
+
+## Common misconceptions
+
+- **"Pick any two of three."** Partitions aren't optional, so the real choice is C or A **when partitioned**. Without a partition you can have both.
+- **"CA systems exist in distributed databases."** Only if you assume the network never fails, which is assuming the problem away.
+- **"The C in CAP is the C in ACID."** CAP's C is linearizability across replicas; ACID's C is about application invariants within a transaction.
+- **"A system is either CP or AP."** Most databases are configurable per operation, and a product can make different choices per feature.
+- **"AP means no consistency."** AP systems still converge, and can offer session guarantees like read-your-writes.
+- **"Available means high uptime."** CAP availability means every non-failing node answers. A CP system with a quorum can still have excellent real-world uptime.
+- **"CAP covers latency."** It doesn't. PACELC adds the latency vs consistency trade-off that applies when there's no partition.
+- **"Eventual means a long time."** In a healthy cluster replication lag is usually milliseconds. The guarantee is weak; the typical behaviour is good.
+
+## Using CAP in an interview
+
+When a design involves replicated data, walk through it explicitly:
+
+1. **Name the data and what a stale or conflicting value would cost.** A stale like count costs nothing; a double-sold seat costs money and trust.
+2. **Pick the behaviour during a partition** for that data: refuse (CP) or answer and reconcile (AP).
+3. **Pick the everyday trade-off** (PACELC): is a few milliseconds of coordination acceptable on every request?
+4. **Name the mechanism**: quorum reads and writes, leader reads, consensus, LWW, CRDTs, or session routing.
+5. **Say how conflicts or stale reads show up to users**, and why that's acceptable.
+
+```text
+Ticket booking:
+  seat inventory   → CP: majority quorum; minority side rejects bookings
+  event listings   → AP: served from nearest replica, stale by seconds is fine
+  "my bookings"    → read-your-writes: read from leader for 30 s after a booking
+```
+
+## Cheat sheet
+
+- CAP: during a network partition, a replicated system must give up either consistency or availability.
+- C means linearizability (acts like one copy), not ACID's C.
+- A means every non-failing node returns a non-error response, not just high uptime.
+- Partitions include cut links, timeouts, GC pauses and overloaded nodes; you can't opt out of them.
+- CP: refuse on the minority side (ZooKeeper, etcd, Spanner, HBase); use for money, inventory, locks.
+- AP: answer everywhere and reconcile later (Cassandra, DynamoDB, DNS); use for carts, counters, feeds.
+- AP conflicts need LWW, version vectors, CRDTs or application merges.
+- Quorums: R + W greater than N makes reads overlap the latest acknowledged write.
+- PACELC: else (no partition) choose latency or consistency; strong consistency always costs coordination.
+- Session guarantees (read-your-writes, monotonic reads) fix what users notice at a fraction of the cost.
+- Choose per feature and per piece of data, not per company.

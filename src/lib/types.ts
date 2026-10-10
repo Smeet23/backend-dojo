@@ -47,6 +47,8 @@ export type Lecture = {
   summary: string;
   /** Source video; null when the lesson was written from the topic alone (e.g. members-only video). */
   videoUrl: string | null;
+  /** True when the lesson was written from the topic even though a video exists (it's linked as related). */
+  writtenFromTopic?: boolean;
   minutes: number;
   available: boolean;
 };

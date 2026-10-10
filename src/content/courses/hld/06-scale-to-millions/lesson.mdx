@@ -1,0 +1,256 @@
+import { SdScaleStory } from "@/components/widgets/SdScaleStory";
+import { HldStatelessSessions } from "@/components/widgets/HldStatelessSessions";
+
+## How to read this lesson
+
+Almost every system-design interview secretly asks the same question: "you have a working app; what do you add, and in what order, as traffic grows?" This lesson walks one imaginary product, a photo-sharing site, from a single box to a multi-region system. At each step, ask three things:
+
+1. **What ran out?** CPU, memory, disk, connections, write throughput, network distance, or availability.
+2. **What do we add?** The smallest change that fixes that bottleneck.
+3. **What new problem does it create?** Every component removes one failure mode and introduces another.
+
+Don't add components because they appear in diagrams. Add them because a specific number crossed a specific limit.
+
+## Step 0, a single server
+
+At launch, everything runs on one machine: the web server, the application code, the database, and uploaded files on local disk.
+
+```
+user ──DNS lookup──▶ 203.0.113.10
+user ──HTTPS──────▶ [ one VM: nginx + app + Postgres + /uploads ]
+```
+
+A request goes: the browser asks DNS for `photos.example.com`, gets an IP, opens a connection to that IP, and the app reads and writes the local database.
+
+This is the **right** architecture for a new product. It's cheap, easy to debug, and fast because everything is in one process space. It'll comfortably serve thousands of users.
+
+**What breaks:** the app and the database fight over the same CPU and RAM. One kernel patch or disk failure takes down everything, and there's no backup machine. Uploads fill the same disk the database needs.
+
+## Step 1, separate the database
+
+Move the database to its own server (or, more often today, a managed service such as RDS or Cloud SQL).
+
+```
+user ─▶ [ web/app server ] ──private network──▶ [ database server ]
+```
+
+Why this is the first split:
+
+- The two tiers have **different resource profiles**. The app wants CPU; the database wants RAM for its buffer cache and fast disks. Now each can be sized independently.
+- The database can be backed up, patched and upgraded without touching the app.
+- It's the precondition for everything else: you can't have multiple app servers if the data lives on one of them.
+
+Pick the database carefully here. A relational database is the safe default for most products: transactions, joins, mature tooling. Reach for a NoSQL store only when there's a concrete reason (very low latency key lookups, massive write volume, schemaless data).
+
+**What breaks:** one more network hop per query (fine on a private network, roughly half a millisecond). Both servers are still single points of failure.
+
+## Vertical versus horizontal scaling
+
+When a tier runs hot you have two moves.
+
+| | Vertical (scale up) | Horizontal (scale out) |
+|---|---|---|
+| What | Bigger machine: more CPU, RAM, faster disk | More machines of the same size |
+| Code changes | None | The tier must be **stateless** or partitioned |
+| Ceiling | Hard limit (the largest instance on offer) | Practically unbounded |
+| Failure | Still one machine: one crash, full outage | One machine dies, others carry on |
+| Cost curve | Gets expensive fast at the top end | Roughly linear |
+
+Scale up first: it's the fastest fix and often buys a year. But the ceiling and the single point of failure are real, so plan the scale-out path before you need it.
+
+## Step 2, a load balancer and more app servers
+
+Put a **load balancer** in front of two or more identical app servers.
+
+```
+                    ┌─▶ app-1 ─┐
+user ─▶ DNS ─▶ LB ──┼─▶ app-2 ─┼─▶ database
+                    └─▶ app-3 ─┘
+```
+
+- DNS now points at the load balancer's public IP. The app servers have only **private** IPs and can't be reached directly from the internet, which shrinks the attack surface.
+- The LB runs **health checks** and stops sending traffic to a server that fails them. A crashed app server becomes a non-event.
+- Deployments become rolling: drain one server, upgrade it, put it back.
+- Capacity is now "add another server", and with autoscaling, the cloud does that for you based on CPU or request rate.
+
+This only works if **any server can handle any request**. If server 1 keeps something about the user in its memory (a session, an upload in progress, a cache the app relies on for correctness), the LB can't freely route. That's the stateless requirement, covered in step 6.
+
+**What breaks:** the load balancer itself is now critical. Managed LBs are internally redundant; a self-run one needs a hot standby with a floating IP. And all those app servers now hammer one database.
+
+## Step 3, database replication
+
+Most products read far more than they write: a photo is uploaded once and viewed thousands of times. **Replication** exploits that.
+
+- One **primary** accepts all writes.
+- Several **replicas** receive a copy of every change (by streaming the write-ahead log) and serve reads.
+- The application routes writes to the primary and reads to the replicas.
+
+```
+app ──writes──▶ primary ──WAL stream──▶ replica-1, replica-2, replica-3
+app ──reads───▶ replicas (behind a read endpoint)
+```
+
+Benefits:
+
+- **Read capacity** scales with the number of replicas.
+- **Availability.** If a replica dies, reads go to the others. If the primary dies, a replica is **promoted** to primary (automatically with managed databases or tools like Patroni).
+- **Disaster recovery.** A replica in another zone survives a zone outage.
+
+**What breaks:** replication is usually **asynchronous**, so replicas lag by milliseconds to seconds. A user uploads a photo, the next page load reads from a lagging replica, and the photo is missing. The standard fix is **read-your-writes**: route a user's reads to the primary for a short window after they write, or read their own data from the primary always. Failover can also lose the last few writes that hadn't reached the new primary. And replication does nothing for write throughput: every write still goes to one machine.
+
+## Step 4, a cache
+
+Even with replicas, the same hot rows (the front page, a celebrity's profile) are read millions of times. A **cache** such as Redis or Memcached keeps them in memory, answering in well under a millisecond.
+
+The default pattern is **cache-aside**:
+
+```ts
+async function getPhoto(id: string) {
+  const hit = await redis.get(`photo:${id}`);
+  if (hit) return JSON.parse(hit);
+  const row = await db.query("SELECT * FROM photos WHERE id = $1", [id]);
+  await redis.set(`photo:${id}`, JSON.stringify(row), { EX: 300 }); // 5 min TTL
+  return row;
+}
+```
+
+Things to decide:
+
+- **What to cache:** data read often and changed rarely. Not data where staleness is dangerous (account balances).
+- **Expiry:** a TTL bounds staleness. Too short and the hit rate drops; too long and users see old data.
+- **Invalidation:** delete the key when the row changes, and keep the TTL as a safety net for missed deletes.
+- **Eviction:** memory is finite; LRU evicts the least recently used keys.
+
+**What breaks:** stale reads; a cold cache after a restart sending the full load to the database; the **thundering herd** when a hot key expires and thousands of requests miss at once (fix: request coalescing or early refresh); and the cache cluster becoming a dependency you must replicate.
+
+## Step 5, a CDN
+
+Users far from your data centre wait on the speed of light: a round trip from Singapore to Virginia is around 200 ms before any work is done. Photos, JavaScript, CSS and video are the bulk of the bytes, and they're the same for everyone.
+
+A **content delivery network** (CloudFront, Cloudflare, Akamai, Fastly) keeps copies of those files on **edge servers** in hundreds of cities. The first user in Singapore causes a miss that the edge fetches from your origin; everyone after that is served from a few milliseconds away.
+
+- Serve files from object storage (S3, GCS) as the CDN's **origin**, not from your app servers' disks. Store the file's URL, not its bytes, in the database.
+- Control freshness with `Cache-Control` headers.
+- Use **versioned file names** (`app.3f9c2a.js`, `photo-123-v2.jpg`) so a new version is a new URL, and you never need to purge the old one.
+- Many CDNs also cache API responses that are public, and absorb DDoS traffic before it reaches you.
+
+**What breaks:** cost scales with bytes transferred; a bad cache rule can serve one user's private page to others; and purging a mistake across every edge takes time.
+
+## Step 6, move state out of the web tier
+
+Now the requirement from step 2 comes due. If a session lives in app-1's memory, a request routed to app-2 finds no session and the user is logged out. Restarting or autoscaling app-1 away logs out everyone it held.
+
+The options:
+
+| Approach | How | Problem |
+|---|---|---|
+| In-process memory | Each server keeps its own sessions | Breaks as soon as there are two servers |
+| **Sticky sessions** | LB pins a user to one server via a cookie | Uneven load; when the server dies or is scaled in, its users lose their sessions |
+| **Shared session store** | Sessions in Redis or a database, cookie holds only the id | One more dependency (replicate it) |
+| **Self-contained tokens** | Signed token (for example a JWT) carries the claims | Hard to revoke before expiry; token size |
+
+The scalable answer is to make app servers **stateless**: everything a request needs is either in the request (cookie, token) or in a shared store. Then any server can serve any request, autoscaling can add and remove servers freely, and a crash loses nothing.
+
+<HldStatelessSessions />
+
+The same principle applies beyond sessions: uploaded files go to object storage, not local disk; in-progress jobs go to a queue, not a background thread; locks go to a shared lock service, not a local mutex.
+
+## Step 7, a message queue
+
+Some work doesn't need to finish before the user gets a response. When a photo is uploaded, the app must store the original and say "uploaded". Generating five thumbnail sizes, running content moderation, updating followers' feeds and sending notifications can happen a few seconds later.
+
+A **message queue** (SQS, RabbitMQ, Kafka) decouples the two:
+
+```
+app ── "photo 123 uploaded" ──▶ [ queue ] ──▶ thumbnail workers
+                                         ──▶ moderation workers
+                                         ──▶ feed fan-out workers
+```
+
+- **Faster responses:** the request does the minimum and returns.
+- **Independent scaling:** if thumbnails fall behind, add thumbnail workers; the web tier is unaffected. Queue depth is the autoscaling signal.
+- **Absorbing spikes:** a burst of uploads fills the queue; workers drain it at their own pace instead of the database falling over.
+- **Fault isolation:** if the moderation service is down, messages wait in the queue rather than failing uploads.
+
+**What breaks:** the work becomes **eventually** done, so the UI needs a "processing" state. Delivery is usually at-least-once, so workers must be idempotent. Failed messages need retries and a dead-letter queue. The distributed message queue lesson goes deep on all of this.
+
+## Step 8, sharding the database
+
+Eventually the primary itself is the bottleneck: either the data no longer fits (tens of terabytes) or writes exceed what one machine can commit. Replicas don't help, because every replica holds all the data and every write still goes through one primary.
+
+**Sharding** splits the data across multiple independent databases (shards), each holding a subset of rows, each with its own replicas.
+
+```
+user_id 0..∞ ──hash(user_id) mod 4──▶ shard 0 | shard 1 | shard 2 | shard 3
+```
+
+The decisions that matter:
+
+- **Shard key.** Choose a key that spreads data and load evenly and that most queries include. `user_id` is common for user-centric apps: a user's photos, likes and settings all live on one shard, so most queries touch one shard.
+- **Mapping function.** Hash-based (even spread, range queries scatter), range-based (good for ranges, risks hot spots), or a **directory** lookup table (flexible, but one more component). Plain `hash mod N` makes adding shards painful; consistent hashing or a fixed large number of logical shards mapped onto fewer physical servers fixes that.
+
+**What breaks:**
+
+- **Resharding.** When a shard fills up, moving data online without downtime is a project.
+- **Hot keys.** A celebrity's shard gets far more traffic than the rest. Fixes include splitting that key further or caching aggressively.
+- **Cross-shard queries.** Joins across shards are gone. You **denormalize** (store data where it's read), maintain secondary indexes in another store, or run scatter-gather queries and accept the cost.
+- **Cross-shard transactions** need sagas or a distributed SQL database.
+
+Many teams also move some data to a store designed for it at this point: timelines to a wide-column store, search to Elasticsearch, counters to Redis.
+
+## Step 9, multiple data centres
+
+One data centre (or one cloud region) is still a single point of failure, and it's far from users on other continents. Running in several regions brings both availability and latency.
+
+- **GeoDNS** or anycast routes each user to the nearest healthy region.
+- If a region fails, DNS (or the global load balancer) routes its users elsewhere.
+
+The hard part is **data**:
+
+- **Active-passive:** one region takes writes; others hold asynchronously replicated copies and serve reads. Failover promotes another region, possibly losing the last seconds of writes.
+- **Active-active:** every region takes writes. You must handle conflicting writes (last-writer-wins, CRDTs, or partitioning users by home region so each user's writes go to one region).
+
+Also needed: deployment tooling that rolls out to every region consistently, caches and queues per region, and regular **failover drills**. A failover path that's never tested won't work on the day you need it.
+
+## Logging, metrics and automation
+
+Past a handful of servers you can't SSH into boxes to see what's wrong. Add these alongside the scaling steps, not after:
+
+- **Centralised logging.** Every service ships logs to one searchable place (ELK, Loki, CloudWatch), each line tagged with a request id so one user's journey can be followed.
+- **Metrics.** Host level (CPU, memory, disk I/O), service level (request rate, error rate, latency percentiles, queue depth, replica lag, cache hit rate) and business level (sign-ups, uploads per minute). Dashboards and alerts on the ones that predict outages.
+- **Tracing.** Distributed traces show where time goes across the LB, app, cache, database and workers.
+- **Automation.** CI/CD pipelines, infrastructure as code (Terraform), autoscaling policies, automated backups. Manual steps don't scale with server count.
+
+## What breaks at each step
+
+| Step | Fixes | Introduces |
+|---|---|---|
+| Separate DB | App and DB competing for one machine | Network hop; still two single points of failure |
+| Load balancer | App CPU limit, app server failures | LB is critical; needs stateless servers |
+| Replicas | Read load, DB failover | Replication lag, stale reads, failover data loss |
+| Cache | Repeated hot reads | Staleness, invalidation, thundering herd |
+| CDN | Distance to users, static bandwidth | Cost per GB, cache-rule mistakes, purge delay |
+| Stateless tier | Sticky routing, lost sessions | A shared session store to run and replicate |
+| Queue | Slow requests, spikes, coupling | Eventual completion, duplicates, DLQs |
+| Sharding | Write throughput, data size | Resharding, hot shards, no cross-shard joins |
+| Multi-region | Region outages, global latency | Cross-region data sync and conflicts |
+
+<SdScaleStory />
+
+<Callout kind="tip">
+In an interview, narrate the evolution: name the metric that crossed a limit, the component you add, and the new problem it creates. "Reads now exceed one database, so I add replicas; that introduces lag, so writes-then-reads go to the primary" shows far more judgement than drawing the final diagram at once.
+</Callout>
+
+## Cheat sheet
+
+- Start with one server; split the database off first so tiers can scale independently.
+- Scale up first for speed, but plan to scale out: vertical has a ceiling and no redundancy.
+- A load balancer plus health checks turns server crashes into non-events, if servers are stateless.
+- Replicas scale reads and enable failover; handle replication lag with read-your-writes.
+- Cache hot data with cache-aside and a TTL; watch for stale data and thundering herds.
+- Serve static files from object storage through a CDN, with versioned file names.
+- Keep sessions in a shared store or signed tokens; sticky sessions are a stopgap.
+- Push slow, non-critical work onto a queue; workers scale on queue depth and must be idempotent.
+- Shard when writes or data size outgrow one primary; the shard key decides everything.
+- Multi-region gives availability and latency; the hard part is replicating and reconciling data.
+- Centralised logs, metrics, traces and automation must grow with the server count.

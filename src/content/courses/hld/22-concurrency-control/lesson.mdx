@@ -1,0 +1,247 @@
+import { LostUpdateLab } from "@/components/widgets/LostUpdateLab";
+import { HldIsolationAnomalyLab } from "@/components/widgets/HldIsolationAnomalyLab";
+import { SdFencingLock } from "@/components/widgets/SdFencingLock";
+
+## Why concurrency control exists
+
+A busy system runs many transactions at the same time over the same data. Running them strictly one after another would be correct but hopelessly slow, so databases interleave them. **Concurrency control** is the set of rules that lets transactions overlap while keeping the result as if they hadn't.
+
+The gold standard is **serializability**: the outcome of running transactions concurrently equals the outcome of running them in *some* serial order. Anything weaker trades correctness for throughput, and the art is knowing exactly which anomalies you've let in.
+
+This lesson walks from the problems (anomalies), to the knobs databases give you (isolation levels), to the two families of solutions (pessimistic and optimistic), to how modern databases implement them (MVCC), and finally to what changes when the data lives on many machines (distributed locks).
+
+## The lost update
+
+The most common concurrency bug in web backends is the **read-modify-write race**. Two requests read the same value, both compute a new value in application code, and both write it back. The second write silently erases the first.
+
+```python
+# Two requests run this at the same moment
+stock = db.query("SELECT stock FROM products WHERE id = 7")   # both read 40
+db.execute("UPDATE products SET stock = %s WHERE id = 7", stock - 1)  # both write 39
+# Two units sold, stock dropped by one
+```
+
+Nothing errored, no exception was logged, and the data is wrong. These bugs survive testing because they need two requests within milliseconds of each other, which only happens under real load: flash sales, ticket drops, likes on a viral post, two admins editing the same record.
+
+<LostUpdateLab />
+
+The widget shows the two simplest fixes: make the change **atomic in one statement** (`SET stock = stock - 1`), or **lock the row** before reading (`SELECT ... FOR UPDATE`). Atomic updates are the best option whenever the logic fits in SQL. When it doesn't (the new value depends on checks in code, an external call, or several rows), you need one of the locking strategies below.
+
+## Read anomalies
+
+Lost updates are a write-write conflict. The SQL standard defines three classic **read** anomalies, each a different way a transaction can see data that doesn't match a single consistent moment.
+
+| Anomaly | What happens | Example |
+|---|---|---|
+| **Dirty read** | T1 reads a change T2 hasn't committed yet; T2 then rolls back | A fraud check approves a payment because it saw a balance that was never committed |
+| **Non-repeatable read** | T1 reads a row twice and gets different values because T2 committed an update in between | A report reads a price at the start and again at the end; totals don't add up |
+| **Phantom read** | T1 runs the same range query twice and gets a different **set** of rows because T2 inserted or deleted matching rows | "Is room 7 free on Friday?" returns no bookings, then a new booking appears |
+
+Two more anomalies matter in practice even though the original standard doesn't name them:
+
+- **Lost update** (above): two read-modify-write cycles overwrite each other.
+- **Write skew**: two transactions read the same data, each makes a decision that is valid on its own, and each writes a **different** row. Together they break an invariant. Classic example: a hospital requires at least one doctor on call. Alice and Bob are both on call; both check "are at least 2 on call?", both see yes, and both go off call. Neither overwrote the other's row, so row locks on what was written don't catch it.
+
+<Callout kind="remember">
+Non-repeatable reads are about **existing rows changing**. Phantoms are about **the set of rows matching a condition changing**. Locking the rows you read stops the first but not the second, because you can't lock a row that doesn't exist yet.
+</Callout>
+
+## Isolation levels
+
+The SQL standard defines four **isolation levels** by which anomalies they must prevent. Higher levels are safer and usually cost more in blocking, aborts or both.
+
+| Level | Dirty read | Non-repeatable read | Phantom | Typical cost |
+|---|---|---|---|---|
+| Read uncommitted | Possible | Possible | Possible | Cheapest; almost never used |
+| Read committed | Prevented | Possible | Possible | Default in Postgres, Oracle, SQL Server |
+| Repeatable read | Prevented | Prevented | Possible (per standard) | Default in MySQL InnoDB |
+| Serializable | Prevented | Prevented | Prevented | Most blocking or most aborts |
+
+The standard only sets **minimum** guarantees, and real databases differ:
+
+- **Postgres** treats read uncommitted as read committed (no dirty reads ever). Its repeatable read is **snapshot isolation**: the transaction sees one frozen snapshot, so phantoms don't appear either, and a concurrent update to the same row aborts with a serialization error. Snapshot isolation still allows **write skew**. Postgres's serializable level (SSI) detects the dangerous read-write patterns and aborts one transaction.
+- **MySQL InnoDB** repeatable read gives plain `SELECT`s a consistent snapshot, while locking reads (`FOR UPDATE`) and writes take **next-key locks** (a row lock plus a lock on the gap before it) that block inserts into scanned ranges.
+- **Oracle**'s "serializable" is actually snapshot isolation.
+
+So in an interview, saying "use repeatable read" is less useful than saying **which anomaly** you're worried about and how your specific database handles it.
+
+<HldIsolationAnomalyLab />
+
+### Choosing a level
+
+Most applications run at **read committed** and fix the specific races they have with targeted tools: atomic updates, `SELECT ... FOR UPDATE`, unique constraints, or version columns. Move a transaction up to **serializable** when it enforces an invariant across several rows (booking systems, double-entry ledgers, the on-call rule) and you'd rather retry occasionally than reason about every interleaving. Serializable transactions **must** be wrapped in retry logic, because the database will abort some of them by design.
+
+```python
+for attempt in range(5):
+    try:
+        with db.transaction(isolation="serializable"):
+            on_call = db.query("SELECT COUNT(*) FROM doctors WHERE on_call AND shift_id = %s", shift)
+            if on_call < 2:
+                raise BusinessError("at least one doctor must stay on call")
+            db.execute("UPDATE doctors SET on_call = false WHERE id = %s", me)
+        break
+    except SerializationFailure:
+        continue   # another transaction won; re-read and decide again
+```
+
+## Pessimistic locking
+
+**Pessimistic** concurrency control assumes conflicts are likely, so it prevents them up front: take a lock before touching the data, and make everyone else wait.
+
+```sql
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;   -- row locked until COMMIT
+-- application checks: enough balance? account not frozen?
+UPDATE accounts SET balance = balance - 500 WHERE id = 1;
+COMMIT;                                                  -- lock released
+```
+
+Lock flavours you'll meet:
+
+| Lock | Allows others to | Example |
+|---|---|---|
+| **Shared** (read) lock | Read, but not write | `SELECT ... FOR SHARE` |
+| **Exclusive** (write) lock | Nothing that conflicts | `SELECT ... FOR UPDATE`, any `UPDATE` or `DELETE` |
+| **Range / gap / predicate** lock | Not insert into a locked range | InnoDB next-key locks; how phantoms are stopped |
+
+Useful variants: `FOR UPDATE NOWAIT` fails immediately instead of waiting, and `FOR UPDATE SKIP LOCKED` skips rows other workers hold, which turns a table into a safe job queue.
+
+**Strengths:** simple to reason about, no wasted work, conflicts never reach the application as errors.
+
+**Costs:**
+
+- **Blocking.** A transaction holding a lock while it calls a slow payment API holds up everyone behind it. Keep locked sections short and never hold a DB lock across a network call you don't control.
+- **Deadlocks.** T1 locks A then wants B; T2 locks B then wants A. The database detects the cycle and kills one. Lock rows in a consistent order (for example, by primary key) to avoid them. The next lesson on two-phase locking goes deeper.
+- **Throughput** drops sharply on hot rows: every buyer of the same flash-sale item queues on one row lock.
+
+## Optimistic locking
+
+**Optimistic** concurrency control assumes conflicts are rare. Don't lock anything; do the work, and at write time **check that nobody changed the data since you read it**. If someone did, reject and retry.
+
+The standard implementation is a **version column**:
+
+```sql
+-- Read: remember the version
+SELECT id, title, body, version FROM documents WHERE id = 9;   -- version = 14
+
+-- Write: only succeeds if the version is still 14
+UPDATE documents
+SET title = 'New title', body = '...', version = version + 1
+WHERE id = 9 AND version = 14;
+-- 1 row updated → success
+-- 0 rows updated → someone else saved first: reload, merge or show a conflict
+```
+
+The `WHERE version = 14` turns the write into a **compare-and-set**. Because a single `UPDATE` is atomic, only one of two racing writers can match version 14; the other updates 0 rows. A timestamp column (`updated_at`) works the same way but is riskier (clock resolution, two writes in the same millisecond). A plain integer or a content hash is safer.
+
+The same idea appears everywhere:
+
+| Where | Mechanism |
+|---|---|
+| ORMs | JPA `@Version`, Rails `lock_version`, Django packages |
+| HTTP APIs | `ETag` on GET, `If-Match` on PUT; a mismatch returns `412 Precondition Failed` |
+| Redis | `WATCH` a key, then `MULTI`/`EXEC` aborts if it changed |
+| DynamoDB | Conditional writes (`ConditionExpression: version = :v`) |
+| Kubernetes | `resourceVersion` on every object |
+| CPUs | Compare-and-swap instructions |
+
+### Pessimistic or optimistic
+
+| | Pessimistic | Optimistic |
+|---|---|---|
+| Assumes | Conflicts are common | Conflicts are rare |
+| On conflict | Second transaction **waits** | Second transaction **fails and retries** |
+| Holds locks during work | Yes | No |
+| Works across a user's think time (edit form open for 5 minutes) | No, can't hold a DB lock that long | Yes: carry the version in the form |
+| Hot row, heavy contention | Queues fairly, no wasted work | Retry storm: most attempts fail and redo work |
+| Deadlocks | Possible | Not from this mechanism |
+
+Rule of thumb: optimistic for **low-contention** data and for anything spanning user interaction or HTTP requests (profile edits, wiki pages, admin panels). Pessimistic, or better an atomic update, for **high-contention** hot rows (inventory counters, seat maps).
+
+## MVCC
+
+How can readers at read committed or snapshot isolation avoid blocking writers? Most modern databases (Postgres, MySQL InnoDB, Oracle, SQL Server's snapshot mode, CockroachDB) use **multi-version concurrency control**.
+
+Instead of overwriting a row in place, an update creates a **new version** and keeps the old one around. Each version is tagged with the transaction that created it (and, in Postgres, the one that deleted or replaced it):
+
+```
+products id=7
+  version A: stock=40   created by tx 100   replaced by tx 205
+  version B: stock=39   created by tx 205   (current)
+```
+
+Each transaction reads from a **snapshot**: the set of transactions that had committed when the snapshot was taken. A reader whose snapshot predates tx 205 sees version A; a newer one sees version B. Neither waits for the other.
+
+- **Read committed** takes a fresh snapshot for **each statement**, so later statements see newer commits (hence non-repeatable reads).
+- **Repeatable read / snapshot isolation** takes **one snapshot for the whole transaction**, so every read is consistent with one moment.
+
+The headline property: **readers don't block writers and writers don't block readers.** Writers still conflict with writers on the same row: the second waits for a row lock, and at snapshot isolation it aborts if the first committed (the "first committer wins" rule), which is how snapshot isolation prevents lost updates.
+
+The costs:
+
+- **Old versions pile up.** Postgres stores them in the table itself and needs **VACUUM** to reclaim space; InnoDB keeps them in undo logs. A long-running transaction pins old versions and causes bloat.
+- **Write skew remains** at snapshot isolation, because each transaction's snapshot is internally consistent but the combination is not. Serializable snapshot isolation (Postgres SSI, CockroachDB) adds tracking of read-write dependencies to catch it.
+
+## Distributed locking
+
+Everything above lives inside **one database**. When the thing being protected spans services or machines (only one worker should process this payout, only one node should run the nightly job, only one instance should refresh this cache key), there's no single transaction manager. You need a **distributed lock**: a lock held in a shared service everyone can reach.
+
+### Common implementations
+
+| Tool | How | Notes |
+|---|---|---|
+| **Redis** | `SET lock:key <token> NX PX 30000`; release with a compare-and-delete script | Fast and simple; single-node Redis is a single point of failure, and failover can lose a lock |
+| **ZooKeeper / etcd** | Ephemeral nodes or leases tied to a client session, built on a consensus protocol | Stronger guarantees; the lock disappears when the session dies |
+| **Database row** | `SELECT ... FOR UPDATE` on a lock table, or Postgres advisory locks | Easy if you already have the DB; lock lives as long as the connection |
+| **DynamoDB / cloud** | Conditional put with a lease expiry | Managed, no extra infra |
+
+```lua
+-- Safe release in Redis: delete only if I still own it
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+  return redis.call("DEL", KEYS[1])
+else
+  return 0
+end
+```
+
+### The pitfalls
+
+Distributed locks are harder than they look because the lock holder can't know for certain that it still holds the lock.
+
+1. **No expiry means deadlock forever.** If the holder crashes, a lock with no TTL is never released. So every distributed lock is really a **lease** with a timeout.
+2. **Expiry means two holders.** A holder pauses (a GC pause, a VM migration, a slow network) longer than the lease. The lease expires, someone else acquires the lock, and then the first holder wakes up still believing it owns the lock. Both now act.
+3. **Releasing someone else's lock.** If the first holder then runs a plain `DEL`, it deletes the second holder's lock. Always store a unique token and release with compare-and-delete.
+4. **Failover loses locks.** Redis replication is asynchronous. A lock written to the primary may not reach the replica before the primary dies; the promoted replica has no lock, and a second client acquires it. Redlock (majority of independent Redis nodes) tries to address this but still depends on timing assumptions about clocks and pauses.
+5. **Clock drift** shortens or lengthens leases on different machines.
+
+### Fencing tokens
+
+The robust fix for pitfall 2 is a **fencing token**: every time the lock is granted, the lock service hands out a **monotonically increasing number**. The holder sends that number with every write to the protected resource, and the resource **rejects any write carrying a token lower than one it has already seen**.
+
+A zombie holder with token 33 wakes up after the lock moved to a new holder with token 34; its write is refused. The lock alone can't guarantee mutual exclusion, but the lock plus a resource that checks tokens can guarantee that stale holders cannot do damage. ZooKeeper's `zxid` and etcd's revision numbers make natural fencing tokens.
+
+<SdFencingLock />
+
+<Callout kind="warn">
+Before reaching for a distributed lock, ask whether you can avoid it. Often the database already gives you what you need: a unique constraint, a conditional update with a version column, `SKIP LOCKED` for job claiming, or an idempotency key. Those are atomic in one place and have none of the lease and failover problems.
+</Callout>
+
+### Efficiency locks and correctness locks
+
+It helps to classify why you want the lock:
+
+- **Efficiency:** avoid doing the same work twice (two nodes regenerating the same report). If the lock occasionally fails, you waste some CPU. A single Redis instance with a TTL is fine.
+- **Correctness:** two holders would corrupt data or charge money twice. You need a consensus-backed lock service (etcd, ZooKeeper) **and** fencing tokens or idempotent writes at the resource, because no lock alone can be trusted through pauses and partitions.
+
+## Cheat sheet
+
+- Serializability is the target: concurrent results must match some serial order.
+- Lost update: two read-modify-writes overwrite each other. Fix with atomic SQL, FOR UPDATE, or a version check.
+- Dirty read sees uncommitted data; non-repeatable read sees a row change; phantom sees the set of matching rows change.
+- Write skew: two transactions read the same facts and write different rows, breaking an invariant; snapshot isolation allows it, serializable stops it.
+- Isolation levels: read uncommitted, read committed, repeatable read, serializable. Know your database's actual behaviour, not just the standard.
+- Pessimistic locking waits (FOR UPDATE, shared and exclusive locks); good for hot rows, risks blocking and deadlocks.
+- Optimistic locking fails and retries (version column compare-and-set, ETag with If-Match); good for low contention and long user edits.
+- MVCC keeps old row versions so readers and writers don't block each other; costs cleanup (VACUUM, undo logs).
+- Distributed locks are leases: expiry can create two holders, so use unique tokens, safe release and fencing tokens.
+- Prefer database constraints, conditional writes and idempotency over distributed locks when you can.

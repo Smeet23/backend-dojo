@@ -1,0 +1,276 @@
+import { PgIndexScanLab } from "@/components/widgets/PgIndexScanLab";
+import { HldCompositeIndexLab } from "@/components/widgets/HldCompositeIndexLab";
+
+## Why full scans are slow
+
+A table on disk is a pile of **pages** (usually 8 KB in Postgres, 16 KB in MySQL InnoDB), each holding a few dozen to a few hundred rows. Rows land in whatever page has room, so they are in no useful order. Ask for `WHERE email = 'zoe@shop.dev'` and the database has only one honest option: read every page, check every row, and keep going even after a match (it can't know there isn't a second one).
+
+That is a **full table scan** (Postgres calls it a sequential scan). Its cost grows linearly with the table:
+
+| Rows | Pages at about 100 rows each | Scan time at roughly 1 GB/s of sequential reads |
+|---|---|---|
+| 10,000 | 100 | Under a millisecond |
+| 10 million | 100,000 (about 800 MB) | Around a second |
+| 1 billion | 10 million (about 80 GB) | Over a minute, and it evicts everything useful from the buffer cache |
+
+The interview point is not the exact numbers but the shape: **O(n) per query**. A query that runs fine in development on 5,000 rows falls over in production at 50 million, and it gets worse every day as the table grows. Worse, a scan of a large table pushes hot pages out of memory, so unrelated queries slow down too.
+
+An **index** is a separate, sorted data structure that maps column values to row locations. Because it's sorted, the database can binary-search its way to a value in O(log n) steps, then jump straight to the row.
+
+<PgIndexScanLab />
+
+<Callout kind="remember">
+An index is a **copy of some columns, kept sorted, with a pointer back to the row**. Every benefit (fast lookups, ranges, ordering) and every cost (extra writes, extra disk) follows from that one sentence.
+</Callout>
+
+## B+ trees
+
+Almost every relational database (Postgres, MySQL, SQL Server, Oracle, SQLite) uses the **B+ tree** as its default index. It is a balanced search tree designed for disks: each node is one page, and each page holds hundreds of keys, so the tree is extremely wide and extremely shallow.
+
+### Structure
+
+```
+                         [ root:  m  ]
+                        /             \
+          [ internal: f  j ]       [ internal: r  w ]
+          /      |      \           /      |      \
+     [a b d] [f g h] [j k l]   [m n p] [r s t] [w x z]   ← leaf pages
+        ↔       ↔       ↔         ↔       ↔       ↔      (linked list)
+```
+
+- **Internal nodes** hold only separator keys and child pointers. They are signposts: "keys less than f go left".
+- **Leaf nodes** hold every key, in sorted order, each with a pointer to the row (or the row itself, see clustered indexes below).
+- **Leaves are linked** to their neighbours, left to right. This is the "plus" in B+ tree and the reason range queries are cheap.
+- The tree is **balanced**: every leaf is at the same depth, so every lookup costs the same number of page reads.
+
+### Why so shallow
+
+With 8 KB pages and short keys, one internal node can point to around 300 to 500 children. That **fan-out** compounds:
+
+| Levels | Keys reachable (fan-out 500) |
+|---|---|
+| 2 | 250,000 |
+| 3 | 125 million |
+| 4 | 62 billion |
+
+A billion-row table needs a tree only **3 or 4 levels deep**. The root and upper levels are tiny and stay in memory permanently, so a point lookup usually costs one or two actual disk reads. That is why the B+ tree beat binary trees (one key per node, 30 levels for a billion rows) for disk-based storage.
+
+### Lookups and range scans
+
+**Point lookup** for `id = 4711`: start at the root, compare against separators, follow one child pointer per level, land on a leaf, find the key, follow its pointer to the row. Cost: tree height plus one.
+
+**Range scan** for `created_at BETWEEN '2026-01-01' AND '2026-01-31'`: descend once to the first matching leaf, then **walk the linked leaves sideways** until a key passes the upper bound. No re-descending. This also gives `ORDER BY` for free: the leaves are already in order, so `ORDER BY created_at LIMIT 20` can read the first 20 entries and stop, skipping the sort entirely.
+
+**Inserts** go into the right leaf. If the leaf is full, it **splits** into two half-full pages and a new separator is pushed up to the parent; splits can cascade, and when the root splits the tree grows one level. This is how the tree stays balanced without ever being rebuilt.
+
+<Callout kind="tip">
+Random primary keys (UUIDv4) insert all over the tree, causing page splits everywhere and a cold, fragmented index. Time-ordered keys (auto-increment, UUIDv7, ULID, Snowflake IDs) always append to the right-most leaf, which stays hot in memory. On write-heavy tables this difference is large.
+</Callout>
+
+## Clustered and secondary indexes
+
+Where does the actual row live? Databases answer this in two ways.
+
+### Clustered index
+
+In a **clustered index**, the leaf pages of the B+ tree **are** the table: the full row is stored in the leaf, ordered by the index key. A table can have only one, because rows can be physically sorted only one way.
+
+- **MySQL InnoDB** always clusters by primary key. Every table is a B+ tree on its PK.
+- **SQL Server** lets you choose the clustered index (default: the PK).
+- **Postgres** does not cluster. Rows live in an unordered **heap**, and every index, including the PK, is a separate structure pointing into it. (The `CLUSTER` command sorts the heap once, but it isn't maintained.)
+
+A range scan on the clustered key is ideal: matching rows sit together on adjacent pages.
+
+### Secondary indexes
+
+A **secondary** (non-clustered) index is a separate B+ tree on some other column. Its leaves store the indexed value plus a way back to the row:
+
+| Database | Secondary index leaf stores | Lookup path |
+|---|---|---|
+| InnoDB | Indexed value + **primary key** | Secondary tree, then a second descent of the PK tree |
+| Postgres | Indexed value + **TID** (page number, slot) | Index tree, then one jump into the heap |
+
+InnoDB's choice means a secondary lookup is two tree descents, and a **wide primary key bloats every secondary index** (each one repeats it). Postgres's choice means lookups are one jump, but when a row moves, every index pointing at it may need updating.
+
+The hidden cost in both: if the query matches many rows, each one needs a **random jump** back to the table. Fetching 200,000 rows by 200,000 random page reads can be slower than just scanning the table sequentially, which is why planners sometimes ignore your index (more below).
+
+## Composite indexes
+
+A **composite** (multi-column) index sorts by the first column, then by the second within ties, then the third, exactly like a phone book sorted by last name, then first name.
+
+```sql
+CREATE INDEX idx_orders_user_status_date
+  ON orders (user_id, status, created_at);
+```
+
+Entries are ordered like this:
+
+```
+(17, 'paid',    2026-01-03)
+(17, 'paid',    2026-02-11)
+(17, 'shipped', 2026-01-20)
+(42, 'paid',    2026-01-05)
+(42, 'pending', 2026-03-01)
+```
+
+### The leftmost prefix rule
+
+Because sorting is by the first column first, the index is only useful when the query constrains a **leftmost prefix** of its columns:
+
+| Query filters on | Can it seek with (user_id, status, created_at)? |
+|---|---|
+| `user_id = 42` | Yes, prefix of one column |
+| `user_id = 42 AND status = 'paid'` | Yes |
+| `user_id = 42 AND status = 'paid' AND created_at > '2026-01-01'` | Yes, all three |
+| `status = 'paid'` | No: paid rows are scattered under every user |
+| `created_at > '2026-01-01'` | No |
+| `user_id = 42 AND created_at > '2026-01-01'` | Partly: seeks on user_id, then filters created_at inside that slice |
+
+A phone book helps you find "Shah", and "Shah, Meera", but is useless for "everyone named Meera".
+
+### Choosing column order
+
+Two rules of thumb, in order of importance:
+
+1. **Equality columns before range columns.** After the first range condition, the rest of the index is no longer sorted in a way the query can use. With `(user_id, created_at, status)` and the query `user_id = 42 AND status = 'paid' AND created_at > X`, the database seeks to user 42, walks the date range, and checks `status` row by row. With `(user_id, status, created_at)`, it seeks straight to (42, paid) and walks a tight date range.
+2. **Match how queries actually filter and sort.** An index on `(user_id, created_at)` serves `WHERE user_id = ? ORDER BY created_at DESC LIMIT 20` with no sort step at all. Putting the most selective column first is a weaker heuristic than people think; what matters is which prefixes your queries use.
+
+One composite index on `(a, b)` also serves queries on `a` alone, so you usually don't need a separate index on `a`.
+
+<HldCompositeIndexLab />
+
+## Covering indexes
+
+If every column a query needs is **in the index**, the database can answer from the index alone and never touch the table. That is a **covering index**, and the plan shows it as an **index-only scan** (Postgres) or "Using index" (MySQL).
+
+```sql
+-- Query: show a user's recent order totals
+SELECT created_at, total FROM orders
+WHERE user_id = 42 ORDER BY created_at DESC LIMIT 20;
+
+-- Covering: seek on user_id, already ordered by created_at, total is right there
+CREATE INDEX idx_orders_cover
+  ON orders (user_id, created_at DESC) INCLUDE (total);
+```
+
+`INCLUDE` (Postgres 11+, SQL Server) stores extra columns in the leaves without making them part of the sort key, which keeps the upper levels of the tree small. In MySQL you get the same effect by appending the column to the key.
+
+Covering indexes eliminate the per-row random jump back to the table, which is often the most expensive part of a query. The trade-off is a fatter index. In Postgres, an index-only scan also needs the table's **visibility map** to be mostly up to date (maintained by vacuum), otherwise it still checks the heap for row visibility.
+
+## Other index types
+
+B+ trees handle equality, ranges, prefixes and ordering. Some workloads need something else.
+
+| Index type | How it works | Good for | Bad at |
+|---|---|---|---|
+| **Hash** | Hash the key into buckets | Exact equality, O(1) | Ranges, ordering, prefixes |
+| **Bitmap** | One bit-array per distinct value; bit i set if row i has that value | Low-cardinality columns in analytics (country, status), combining many filters with AND/OR bit operations | Frequent updates: changing one row can lock or rewrite large bitmaps |
+| **Inverted** | Map each term to the list of documents containing it | Full-text search, tags, JSON keys, array membership | Ordered ranges |
+| **LSM tree** (storage engine, not an index type you add) | Buffer writes in memory, flush sorted runs, merge in the background | Very high write throughput (Cassandra, RocksDB) | Reads may check several runs; needs compaction |
+| **Geospatial** (R-tree, GiST, geohash) | Index bounding boxes or space-filling curves | "Restaurants within 2 km" | Plain equality |
+
+Some notes that come up in interviews:
+
+- **Hash indexes** exist in Postgres and in MySQL's MEMORY engine, but B+ trees are almost always good enough for equality, so hash indexes are rare in practice. Key-value stores (Redis, DynamoDB's partition key) are essentially giant hash indexes.
+- **Bitmap indexes** are an Oracle and data-warehouse staple. Postgres builds bitmaps on the fly (a "bitmap heap scan") to combine several ordinary indexes and to read heap pages in physical order.
+- **Inverted indexes** power Elasticsearch, Lucene and Postgres GIN indexes (`to_tsvector`, `jsonb`, arrays). A `LIKE '%shoe%'` query cannot use a B+ tree (no leftmost prefix), but a trigram GIN index can.
+
+## The write cost of indexes
+
+Indexes are not free. Every index is a second copy that must stay in sync.
+
+- **Each INSERT** writes the row plus one entry into **every** index on the table. A table with eight indexes does roughly nine tree writes per insert, each possibly causing a page split.
+- **Each UPDATE** of an indexed column deletes the old index entry and inserts a new one. In Postgres, an update to any indexed column defeats the HOT (heap-only tuple) optimisation, so all indexes get a new entry.
+- **Each DELETE** must remove entries (or mark them dead for later cleanup).
+- **Storage and memory.** Indexes can easily be larger than the table. They compete with table data for the buffer cache, and an index that doesn't fit in memory turns lookups into disk reads.
+- **Replication and backups** carry all of it.
+
+So the design question is never "should this column have an index" in isolation. It is "which **queries** matter, and what's the smallest set of indexes that serves them". Read-heavy tables (product catalog) can afford many; write-heavy tables (event logs, metrics) should have very few.
+
+<Callout kind="warn">
+Unused indexes are pure cost. Postgres exposes `pg_stat_user_indexes.idx_scan`; an index with zero scans after weeks in production is a candidate to drop. Also look for redundant ones: an index on `(a)` is usually redundant next to `(a, b)`.
+</Callout>
+
+## When the planner ignores an index
+
+You create an index, run the query, and the plan still says `Seq Scan`. Usually the planner is right. Common reasons:
+
+| Reason | Example | Fix |
+|---|---|---|
+| **Low selectivity** | `WHERE status = 'active'` matches 70% of rows; random jumps for each would cost more than a sequential read | Nothing to fix; or a partial index on the rare value |
+| **Function on the column** | `WHERE LOWER(email) = 'a@b.com'` or `WHERE DATE(created_at) = '2026-01-01'` | Index the expression, or rewrite as a range `created_at >= X AND created_at < X + 1 day` |
+| **Type mismatch or implicit cast** | `WHERE phone = 9876543210` on a text column | Compare with the right type |
+| **Leading wildcard** | `WHERE name LIKE '%son'` | Trigram or full-text index |
+| **Not a leftmost prefix** | Query on `status` with an index on `(user_id, status)` | Different index or column order |
+| **OR across columns** | `WHERE a = 1 OR b = 2` | Separate indexes plus a bitmap OR, or UNION |
+| **Stale statistics** | Planner thinks the table has 100 rows; it has 10 million | `ANALYZE` the table |
+| **Tiny table** | 50 rows fit in one page | Nothing; a scan is cheapest |
+
+The planner is a **cost-based optimiser**: it estimates how many rows each step returns (from statistics such as histograms and distinct counts) and picks the cheapest plan. Indexes win when they're **selective**, roughly when a query returns a small fraction of the table. Past that point, a sequential scan's fast, in-order reads beat millions of random ones.
+
+### Partial and expression indexes
+
+Two tools fix many of the cases above:
+
+```sql
+-- Only index the rows you query: tiny, and very selective
+CREATE INDEX idx_orders_pending ON orders (created_at) WHERE status = 'pending';
+
+-- Index the expression the query uses
+CREATE INDEX idx_users_email_lower ON users (LOWER(email));
+```
+
+## Reading EXPLAIN
+
+`EXPLAIN` shows the plan the optimiser chose; `EXPLAIN ANALYZE` actually runs the query and adds real timings and row counts. Always use the second when debugging, but be careful with it on `UPDATE` or `DELETE` (it executes them; wrap in a transaction and roll back).
+
+```sql
+EXPLAIN ANALYZE
+SELECT id, total FROM orders
+WHERE user_id = 42 AND status = 'paid'
+ORDER BY created_at DESC LIMIT 20;
+```
+
+```
+Limit  (cost=0.56..42.10 rows=20 width=16) (actual time=0.031..0.080 rows=20 loops=1)
+  ->  Index Scan using idx_orders_user_status_date on orders
+        (cost=0.56..1840.22 rows=886 width=16) (actual time=0.030..0.075 rows=20 loops=1)
+        Index Cond: ((user_id = 42) AND (status = 'paid'))
+Planning Time: 0.15 ms
+Execution Time: 0.10 ms
+```
+
+What to look for:
+
+| In the plan | Meaning |
+|---|---|
+| `Seq Scan` on a big table | No usable index, or the planner decided the index wasn't worth it |
+| `Index Scan` | Walks the index, then fetches each row from the table |
+| `Index Only Scan` | Covering index; table not touched (check `Heap Fetches`) |
+| `Bitmap Index Scan` + `Bitmap Heap Scan` | Collects matching row locations first, then reads pages in physical order; common for medium selectivity |
+| `Index Cond` vs `Filter` | `Index Cond` narrowed the search; `Filter` was checked row by row after fetching. A big `Rows Removed by Filter` means wasted work |
+| `Sort` | Rows were sorted after fetching; an index matching the `ORDER BY` could remove it |
+| Estimated `rows` far from `actual rows` | Bad statistics; run `ANALYZE` |
+
+MySQL's `EXPLAIN` shows similar information as columns: `type` (`ALL` is a full scan, `ref` and `range` use an index, `const` is a PK hit), `key` (the index chosen), `rows` (estimated rows examined), and `Extra` (`Using index` means covering, `Using filesort` means an extra sort).
+
+### A practical workflow
+
+1. Find the slow queries (Postgres `pg_stat_statements`, MySQL slow query log).
+2. Run `EXPLAIN ANALYZE` and look for the biggest actual time and the largest gap between rows examined and rows returned.
+3. Design an index for the query's **equality filters, then range or sort, then selected columns** if covering is worth it.
+4. Re-run the plan, then check write latency and index size didn't regress.
+5. On large production tables create indexes without blocking writes (`CREATE INDEX CONCURRENTLY` in Postgres, online DDL in MySQL).
+
+## Cheat sheet
+
+- Without an index, a filter is a full scan: O(n) pages, and it gets worse as the table grows.
+- B+ tree: wide, shallow, balanced; leaves sorted and linked, so point lookups take 3 to 4 page reads and range scans walk sideways.
+- Clustered index: the leaves are the rows (InnoDB PK). Secondary index: leaves point back to the row (PK in InnoDB, TID in Postgres).
+- Composite index works for leftmost prefixes only; put equality columns first, then the range or sort column.
+- Covering index: every needed column in the index, giving an index-only scan with no table lookups.
+- Hash for pure equality, bitmap for low-cardinality analytics, inverted for full text, JSON and arrays.
+- Every index slows inserts, updates and deletes and takes memory; index for real queries, drop unused ones.
+- The planner skips indexes for low selectivity, functions on columns, casts, leading wildcards, non-prefix columns and stale stats.
+- Use `EXPLAIN ANALYZE`; watch Seq Scan, Filter vs Index Cond, Sort, and estimated vs actual rows.
+- Prefer time-ordered keys over random UUIDs for write-heavy B+ tree tables.

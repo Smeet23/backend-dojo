@@ -1,0 +1,132 @@
+import { HldDesignLevelSorter } from "@/components/widgets/HldDesignLevelSorter";
+
+## Two kinds of design
+
+"System design" is used for two quite different skills. Interviewers usually separate them into two rounds, and preparing for one does surprisingly little for the other.
+
+**Low-level design (LLD)** is about the inside of one program. Given a problem like a parking lot, a vending machine or a splitwise clone, you produce the classes, their responsibilities, the interfaces between them and the patterns that keep the code easy to change. The unit of design is a **class or module**, and the main forces are readability, extensibility and correctness.
+
+**High-level design (HLD)** is about how many programs and machines work together. Given a problem like a URL shortener, a chat app or a ride-hailing service, you produce the components (clients, load balancers, services, databases, caches, queues), how data flows between them, and how the whole thing survives scale and failure. The unit of design is a **service or data store**, and the main forces are throughput, latency, availability, consistency and cost.
+
+| | Low-level design | High-level design |
+|---|---|---|
+| Scope | One codebase or process | Many services and machines |
+| Typical output | Class diagram, interfaces, method signatures, some code | Box-and-arrow architecture, APIs, data model, capacity numbers |
+| Core vocabulary | SOLID, design patterns, UML, concurrency inside a process | Scaling, replication, partitioning, caching, queues, CAP |
+| Main failure you design against | Code that is rigid, tangled or buggy | Systems that fall over under load or lose data when parts fail |
+| Example prompt | "Design a parking lot" | "Design Instagram's feed" |
+
+The two meet in the middle. An HLD answer eventually has to say what lives inside a service, and an LLD answer for something like a rate limiter has to admit it might run on many machines. But the **level of zoom** is different, and recognising which level a question is asking for is the first skill.
+
+<HldDesignLevelSorter />
+
+## How interviews assess them
+
+### The LLD round
+
+A typical LLD round lasts 45 to 60 minutes. You clarify requirements, identify the main entities, draw relationships, and then write real code for the core flows (often in Java, C++ or Python). Interviewers look for:
+
+- **Clear entities with single responsibilities.** A `ParkingSpot` should not also calculate fees.
+- **Programming to interfaces.** Adding a new vehicle type or payment method should mean adding a class, not editing a switch statement.
+- **Appropriate patterns, not pattern-stuffing.** Strategy for interchangeable algorithms, state for lifecycles, observer for notifications, factory where construction varies.
+- **Correctness under concurrency** when the prompt involves shared resources, such as two cars grabbing the same spot.
+- **Working code** for at least the happy path, with sensible names.
+
+### The HLD round
+
+An HLD round is a conversation, not a coding exercise. It usually follows a recognisable shape, and interviewers grade each phase:
+
+1. **Requirements.** Functional (what the system does) and non-functional (scale, latency, availability, consistency). Asking good questions here is graded.
+2. **Estimates.** Rough numbers for requests per second, storage and bandwidth, so later choices are grounded in reality.
+3. **API and data model.** The main endpoints and the entities they read and write.
+4. **High-level architecture.** The boxes and arrows for the core flows.
+5. **Deep dives.** Two or three hard parts, explored in detail: how to shard, how to keep a cache consistent, how to deliver messages exactly once to the user.
+6. **Bottlenecks and trade-offs.** What breaks first, what you would monitor, what you would do differently at 10x scale.
+
+<Callout kind="remember">
+HLD interviews reward **reasoning about trade-offs** far more than naming technologies. "I'd use Kafka" earns little. "I need ordered, replayable events per user, so a log partitioned by user id fits, and here's what that costs" earns a lot.
+</Callout>
+
+Seniority changes the weighting. Junior candidates are often asked LLD only or a light HLD. Senior candidates are expected to drive the HLD conversation themselves, pick the deep dives, and defend choices with numbers.
+
+## A learning order
+
+HLD topics build on each other. Trying to design WhatsApp before you understand replication and queues means memorising someone else's diagram. This course is arranged so each topic leans on earlier ones. A sensible order:
+
+### Stage 1: foundations
+
+- **Network protocols.** TCP, UDP, HTTP versions, WebSockets, gRPC. Everything else is built on how bytes move.
+- **DNS, proxies and load balancers.** How a request finds a server and gets spread across many.
+- **Back-of-the-envelope estimation.** Turning "100 million users" into requests per second and terabytes.
+
+### Stage 2: data and distribution
+
+- **SQL vs NoSQL** and **database indexing.** What each store is good at and why queries are fast or slow.
+- **CAP theorem** and consistency levels. The vocabulary for every replication trade-off that follows.
+- **Consistent hashing**, sharding and replication. How data spreads across machines.
+- **Caching** and the **thundering herd.** The biggest latency lever, and the way it bites back.
+- **Concurrency control** and locking. What happens when two writers touch the same data.
+
+### Stage 3: services and messaging
+
+- **Microservices patterns**, **API gateway**, **service discovery** and **service mesh.** How a system is split up and how the pieces find and talk to each other.
+- **Message queues**, the **dual write problem**, **SAGA** and **distributed transactions.** Keeping data correct when a business operation spans services.
+- **Idempotent APIs.** Making retries safe.
+
+### Stage 4: resilience and security
+
+- **High availability**, **rate limiting**, **retries**, **circuit breakers** and **bulkheads.** Designing for the failures that will happen.
+- **Encryption**, **OAuth 2.0**, **JWT** and common **web attacks.** Who is allowed to do what, and how to stop people who aren't.
+
+### Stage 5: full designs
+
+- **Scaling from zero to millions**, then classic case studies: **URL shortener**, **key-value store**, **rate limiter**, **WhatsApp**. These combine everything above, and they are where interview practice pays off most.
+
+For LLD, a parallel track works well: object-oriented basics and SOLID first, then the common design patterns, then concurrency inside one process, then classic LLD problems. You can run the two tracks side by side; they rarely compete for the same mental space.
+
+## How to practise
+
+Reading about design is not the same as being able to do it under a clock. A few habits make the difference.
+
+### Design out loud, on a timer
+
+Pick a prompt, set 45 minutes, and talk through it as if an interviewer were listening. Draw on paper or a whiteboard tool. The point is to practise the **sequence** (requirements, estimates, API, architecture, deep dives) until it's automatic, so your attention can go to the hard parts.
+
+### Always ask "what breaks first?"
+
+After drawing any design, push it to 10x traffic and kill a component. Which box falls over? A single database writer, a hot cache key, one overloaded partition, a synchronous call chain? Practising this question is what turns diagrams into designs.
+
+### Justify every box
+
+For each component, be able to say **why it's there** and **what you'd lose without it**. If you can't, remove it. Interviewers notice when a cache or queue appears out of habit.
+
+### Learn a few systems deeply
+
+Knowing how a handful of real systems behave (Postgres replication, Redis, Kafka, a CDN, DynamoDB-style stores) gives you concrete anchors. You can then reason by analogy: "this needs something like Kafka's per-partition ordering" is far stronger than a vague "a queue".
+
+### Practise with feedback
+
+Mock interviews with a friend, or recording yourself and reviewing it, expose habits you can't see from inside: skipping requirements, going silent while thinking, diving into detail too early. The lessons in this course end with scenario quizzes for the same reason. Recognising a pattern in a fresh situation is the skill being tested.
+
+<Callout kind="tip">
+A good rhythm is to learn one concept, then immediately apply it to a design you already know. After learning consistent hashing, revisit the URL shortener and ask how its storage would shard.
+</Callout>
+
+## Common mistakes
+
+- **Jumping to the diagram.** Without requirements and numbers, every choice is a guess.
+- **Name-dropping.** Listing technologies without saying what problem each solves.
+- **Designing for Google scale by default.** If the estimate says 50 requests per second, one Postgres instance with a replica is a strong answer.
+- **Ignoring failure.** Every network call can time out, every node can die. A design that only works when everything is up isn't finished.
+- **Treating it as a monologue.** The interviewer is a collaborator. Check in, offer options, and let them steer the deep dives.
+
+## Cheat sheet
+
+- LLD designs the inside of one program: classes, interfaces, patterns, in-process concurrency.
+- HLD designs how services, stores and machines work together under scale and failure.
+- LLD rounds end in code; HLD rounds are structured conversations graded on trade-offs.
+- HLD flow: requirements, estimates, API and data model, architecture, deep dives, bottlenecks.
+- Learn in layers: networking, then data and distribution, then services and messaging, then resilience and security, then full case studies.
+- Practise on a timer, out loud, and always ask what breaks first at 10x.
+- Justify every component; remove anything you can't defend.
+- Size the design to the numbers, not to the biggest company you can name.

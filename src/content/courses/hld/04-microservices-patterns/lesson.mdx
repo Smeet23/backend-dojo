@@ -1,0 +1,287 @@
+import { HldBoundarySorter } from "@/components/widgets/HldBoundarySorter";
+import { HldSagaStepper } from "@/components/widgets/HldSagaStepper";
+import { HldStranglerRouter } from "@/components/widgets/HldStranglerRouter";
+
+## Monolith vs microservices
+
+A **monolith** is one deployable application containing every feature. A **microservices** architecture splits the application into small services, each owning one business capability, deployed independently and talking over the network.
+
+Microservices don't make code simpler. They move complexity from inside the codebase to **between** services, in exchange for independence. Whether that trade is worth it depends on the organisation more than the technology.
+
+| | Monolith | Microservices |
+|---|---|---|
+| Deploy | One artifact; every change ships everything | Each service ships on its own schedule |
+| Scaling | Scale the whole app, even if one part is hot | Scale each service to its own load |
+| Failure | A memory leak in one feature can take down all of them | Failures can be contained to one service, if designed for |
+| Data | One database, ACID transactions across features | Each service owns its data; cross-service consistency is eventual |
+| Calls | In-process, nanoseconds, never "partially fail" | Network calls: latency, timeouts, retries, partial failure |
+| Teams | Everyone shares one codebase and release train | Teams own services end to end |
+| Operations | One thing to deploy, monitor and debug | Many deploys, distributed tracing, service discovery, more infrastructure |
+| Refactoring across boundaries | An IDE operation | An API negotiation and a migration |
+
+The patterns in this lesson exist because of the right-hand column. Each one solves a problem that only appears once a system is split: how to draw the lines, who owns which data, how clients find and reach services, how to keep data consistent without shared transactions, and how to get from a monolith to services without a big-bang rewrite.
+
+<Callout kind="remember">
+Start with a well-modularised monolith unless you have a concrete reason to split: teams blocking each other, very different scaling or reliability needs, or a compliance boundary. A badly split system (a **distributed monolith**) has all the costs of both and the benefits of neither.
+</Callout>
+
+## Decomposition patterns
+
+The most important decision is where the boundaries go. Get them right and services rarely need to change together. Get them wrong and every feature touches five services and three teams.
+
+### By business capability
+
+A **business capability** is something the business does to create value: taking orders, managing inventory, processing payments, shipping, handling customer support. Capabilities are stable; the way they're implemented changes, but an online shop will always need to take orders and collect money.
+
+Decomposing by capability gives one service per capability: an Order service, an Inventory service, a Payment service. Because capabilities map to how the organisation is structured, this also lines up with **Conway's law**: systems mirror the communication structure of the teams that build them. A team that owns "payments" can own the Payment service end to end.
+
+### By subdomain
+
+**Domain-driven design (DDD)** gives a finer tool. It splits the business domain into **subdomains**:
+
+- **Core**: what makes the business different (a ride-hailing company's dispatch and pricing). Invest the most here and build it yourself.
+- **Supporting**: needed but not differentiating (driver onboarding). Build simply.
+- **Generic**: the same everywhere (email sending, payments processing, identity). Buy or use a SaaS.
+
+Each subdomain is modelled inside a **bounded context**: a boundary within which every term has one meaning. "Product" means title and images in the catalogue context, quantity per warehouse in inventory, and weight and dimensions in shipping. Rather than one giant `Product` model shared everywhere, each context keeps its own, and they map ids between them. A bounded context is the natural upper size of a microservice: a service rarely spans two of them.
+
+### Signs of a bad split
+
+- **Chatty calls.** Rendering one page takes 30 synchronous calls between services. The boundary cut through something that's really one capability.
+- **Lockstep deploys.** You can't ship service A without shipping B and C at the same time. They're one service wearing three deploy pipelines.
+- **Shared database tables.** Two services read and write the same tables, so neither can change its schema.
+- **Entity services.** A "Customer service" that's just CRUD over a table, called by everyone for everything, becomes a bottleneck with no business logic of its own.
+
+<HldBoundarySorter />
+
+## Database per service
+
+Each service owns its data, and **no other service touches that data directly**: not through shared tables, not through a reporting connection, only through the owning service's API or the events it publishes.
+
+This is the pattern that makes services genuinely independent:
+
+- A service can change its schema, add indexes or migrate to another database without coordinating with anyone.
+- Each service picks the store that fits: Postgres for orders, Elasticsearch for search, Redis for sessions, Cassandra for an activity feed.
+- A slow query in one service's database doesn't lock tables another service needs.
+
+"Own database" doesn't have to mean "own server". Options, from cheapest to most isolated:
+
+| Option | Isolation | Notes |
+|---|---|---|
+| Private tables in a shared database | Low | Enforced by convention and permissions; easy to cheat |
+| Schema per service in a shared server | Medium | Separate credentials per schema; shared CPU and failure |
+| Database server per service | High | Full independence, more to operate |
+
+What you give up:
+
+- **No joins across services.** "Orders with customer names" becomes either an **API composition** (call Orders, then Customers, and join in memory) or a **local copy**: the Order service stores the customer's name, kept up to date by subscribing to `CustomerUpdated` events.
+- **No ACID transactions across services.** Placing an order and reserving stock can't be one database transaction anymore. That's what the saga pattern is for.
+- **Duplicated data is normal**, and it's eventually consistent. The order should show the product name **as it was at purchase**, which is a feature, not a compromise.
+
+<Callout kind="warn">
+Publishing an event after a database write has its own trap: if the service crashes between the commit and the publish, the event is lost. Use the **transactional outbox** (write the event to an outbox table in the same transaction, relay it afterwards) or change data capture. The dual write problem lesson covers this in depth.
+</Callout>
+
+## API gateway
+
+With dozens of services, clients shouldn't need to know every hostname, call eight services to render one screen, or implement auth eight times. An **API gateway** is a single entry point that sits in front of the services.
+
+```text
+Mobile app ─┐
+Web app ────┼──▶ API gateway ──▶ /orders/*    → Order service
+Partners ───┘     (auth, limits,   /catalog/*   → Catalogue service
+                   routing, TLS)   /payments/*  → Payment service
+```
+
+What it typically does:
+
+- **Routing** requests by path, host or header to the right service.
+- **Cross-cutting concerns** in one place: TLS termination, authentication (validate the JWT once), rate limiting, request logging, CORS.
+- **Aggregation**: one client call fans out to several services and returns a combined response, saving mobile clients many round trips.
+- **Protocol translation**: REST or GraphQL outside, gRPC inside.
+- **Hiding internals**: services can be split, merged or moved without changing the public API.
+
+A common variant is the **Backend for Frontend (BFF)**: a separate gateway per client type (web, iOS, partner API), each owned by the team building that client, shaping responses for exactly what that screen needs.
+
+Risks to manage: the gateway is on every request, so it must be **highly available and horizontally scaled**; it adds a hop of latency; and it must stay thin. Putting business logic in the gateway recreates a monolith at the edge. The API gateway lesson goes deeper.
+
+## Service discovery
+
+Service instances come and go constantly: autoscaling adds them, deploys replace them, crashes remove them, and each gets a new IP address. Hard-coding addresses doesn't work. **Service discovery** lets a caller find healthy instances of a service by name.
+
+The core piece is a **service registry**: a database of `service name → list of healthy instances`. Instances get into it either by **self-registration** (the instance registers on startup and sends heartbeats) or by **third-party registration** (the platform, such as Kubernetes, registers pods as they start and pass health checks).
+
+| | Client-side discovery | Server-side discovery |
+|---|---|---|
+| How | Caller queries the registry and picks an instance itself | Caller sends to a load balancer or proxy, which queries the registry |
+| Examples | Netflix Eureka with a client library, gRPC client-side balancing | Kubernetes Services, AWS ALB, a service mesh sidecar |
+| Pros | One fewer hop; smart, per-request balancing | Clients stay simple and language-agnostic |
+| Cons | Discovery logic in every language you use | Extra hop; the balancer must be highly available |
+
+On Kubernetes, the simplest form is DNS: `orders.default.svc.cluster.local` resolves to a stable virtual IP that load-balances across healthy pods. The service discovery lesson covers registries and health checks in detail.
+
+## Saga
+
+A business operation like "place an order" now spans services, each with its own database: create the order, reserve stock, charge the card, schedule delivery. Two-phase commit across those databases would lock resources across the network and stall whenever a participant or the coordinator fails, so microservices use a **saga** instead.
+
+A saga is a **sequence of local transactions**. Each step commits in its own service's database and then triggers the next step. If a step fails, the saga runs **compensating transactions** for the steps that already completed, in reverse order.
+
+```text
+Step               Compensation
+1 CreateOrder      CancelOrder
+2 ReserveStock     ReleaseStock
+3 ChargeCard       RefundCard
+4 ScheduleDelivery (last step; nothing after it can fail)
+```
+
+Compensation is a **semantic undo**, not a rollback. A refund is a new transaction that appears on the customer's statement; the original charge still happened. Some actions can't be compensated at all (an email that was sent), which is why such steps go last, or why you send "order confirmed" only after the saga completes.
+
+There are two ways to coordinate a saga.
+
+### Choreography
+
+No coordinator. Each service listens for events and reacts: Orders publishes `OrderCreated`, Inventory hears it, reserves stock and publishes `StockReserved`, Payments hears that and charges the card, and so on. Failures publish events too (`PaymentDeclined`), and earlier services listen for them to compensate.
+
+- **Pros**: simple for short flows, loosely coupled, no central component.
+- **Cons**: the flow exists only as the sum of everyone's subscriptions. With many steps it's hard to see, test or change, and cyclic dependencies between services creep in.
+
+### Orchestration
+
+A **saga orchestrator** (often part of the service that owns the flow, or a workflow engine like Temporal or AWS Step Functions) tells each participant what to do and waits for the reply. It stores the saga's state, so it knows which steps completed and which compensations to run.
+
+- **Pros**: the whole flow is in one place; easy to monitor ("which orders are stuck at payment?"), test and change.
+- **Cons**: the orchestrator is another component to run, and it can grow into a god service if it starts holding business logic that belongs to participants.
+
+<HldSagaStepper />
+
+### Making sagas safe
+
+- **Idempotent steps.** Messages are delivered at least once, so "charge card for order 42" must not charge twice when redelivered. Use an idempotency key per saga step.
+- **Retryable compensations.** A compensation must eventually succeed; retry it rather than giving up.
+- **No isolation.** Other requests can see intermediate states (stock reserved, payment not yet taken). Use explicit **pending states** (`order.status = PENDING`) as a semantic lock, so other flows know the data is mid-saga.
+- **Reliable messaging.** Use the outbox pattern so a step's local commit and its outgoing message can't diverge.
+
+The SAGA and distributed transactions lessons go deeper into both styles.
+
+## CQRS
+
+**Command Query Responsibility Segregation** separates the model that **changes** data (commands) from the model that **reads** it (queries).
+
+Why? Reads and writes often want very different shapes. Writes need a normalised model that enforces invariants ("can't ship a cancelled order"). Reads want denormalised views tailored to screens: an order history page with product names, images, shipping status and review stars, assembled from four services. Forcing both through one model makes both worse.
+
+```text
+Commands ──▶ Write model (normalised, validates rules) ──▶ events
+                                                           │
+                                                           ▼
+Queries  ◀── Read model(s) (denormalised views) ◀── projector updates views
+```
+
+In microservices, CQRS is also the answer to "how do I query across services without joins?": a dedicated query service subscribes to events from Orders, Catalogue and Shipping and maintains a ready-made `order_history_view` in a store suited to the query (a document store, Elasticsearch, a materialised table).
+
+Costs:
+
+- **Eventual consistency.** The read model lags the write model by the event-processing delay. A user who just placed an order might not see it in their history for a moment, so design for that (show the result of the command directly, or read your own writes from the write side).
+- **More moving parts**: projectors, event handling, rebuilding views when their shape changes.
+
+Use CQRS where read and write needs genuinely diverge or read load dwarfs write load. For plain CRUD, it's overhead.
+
+## Event sourcing
+
+In a normal service you store the **current state** and overwrite it. With **event sourcing**, you store the **sequence of events** that led to the state, and the current state is derived by replaying them.
+
+```text
+Account 7 event stream:
+1 AccountOpened   {owner: "Ana"}
+2 MoneyDeposited  {amount: 500}
+3 MoneyWithdrawn  {amount: 120}
+4 MoneyDeposited  {amount: 40}
+→ current balance = 500 - 120 + 40 = 420
+```
+
+The event store is append-only and is the source of truth. Benefits:
+
+- **A complete audit log** for free, which matters in finance, healthcare and anything regulated.
+- **Time travel**: rebuild the state as of any past moment, and debug by replaying exactly what happened.
+- **New read models from old data**: a new projection can be built by replaying the entire history.
+- **Events are already there to publish**, so it combines naturally with CQRS and with sagas.
+
+Costs:
+
+- **Replaying long streams is slow**, so you take periodic **snapshots** and replay only events after the latest one.
+- **Event schemas live forever.** You can't edit history, so you must version events and handle old formats (upcasting).
+- **Querying current state needs projections**, which means CQRS and eventual consistency come along.
+- **Deleting personal data** is awkward in an immutable log; techniques like crypto-shredding (encrypt per user, delete the key) are needed.
+- It's an unfamiliar model for most teams, and hard to back out of.
+
+<Callout kind="tip">
+CQRS and event sourcing are often mentioned together but are independent. You can do CQRS with an ordinary database plus an outbox. Event sourcing almost always needs CQRS, because a stream of events is a poor thing to query directly.
+</Callout>
+
+## Strangler fig
+
+How do you move a large monolith to services without a risky big-bang rewrite? The **strangler fig** pattern is named after a vine that grows around a tree until it can stand on its own and the tree inside dies away.
+
+1. **Put a routing facade in front of the monolith**: a reverse proxy or API gateway. At first it sends everything to the monolith.
+2. **Pick one capability** to extract, ideally with clear boundaries and real value (high change rate, or different scaling needs).
+3. **Build the new service** and route that capability's traffic to it through the facade, gradually: shadow traffic first, then a small canary percentage, then all of it.
+4. **Migrate or sync its data** so the new service owns it. During the transition, the monolith and the service may need a sync (often CDC or events) so both see consistent data.
+5. **Delete the old code** from the monolith.
+6. Repeat until the monolith is gone, or until what's left is small enough to keep.
+
+Why it works: every step is small and **reversible** (flip the route back), the system keeps running throughout, and you deliver value early instead of after a two-year rewrite. Watch for an **anti-corruption layer** where the new service must talk to the monolith: a translation layer that stops the monolith's model leaking into the new design.
+
+<HldStranglerRouter />
+
+## Sidecar
+
+Every service needs the same plumbing: TLS between services, retries and timeouts, metrics, tracing, log shipping, config reloading. Implementing that in every language your services use is duplicated work, and it drifts.
+
+The **sidecar** pattern deploys a helper process **next to each service instance**, sharing its lifecycle and network namespace (on Kubernetes, a second container in the same pod). The service talks to `localhost`; the sidecar handles the cross-cutting concern.
+
+- **Envoy proxy as a sidecar**: mutual TLS, retries, circuit breaking, load balancing and metrics for every call in and out.
+- **Log or metrics agents** (Fluent Bit, OpenTelemetry Collector) that ship data without the app knowing.
+- **Secret or config agents** that fetch and refresh credentials.
+
+Benefits: language-agnostic, upgraded independently of the app, consistent behaviour across services. Costs: extra CPU and memory per instance, an extra hop of latency on every call, and more to debug.
+
+When every service gets a proxy sidecar and a central **control plane** configures them all, you have a **service mesh** (Istio, Linkerd). The service mesh lesson covers it.
+
+## Patterns that keep it running
+
+Splitting a system multiplies network calls, and every network call can fail. A few more patterns appear in nearly every microservices design; each has its own lesson in this course.
+
+| Pattern | Problem it solves |
+|---|---|
+| Circuit breaker | Stop calling a failing dependency so threads don't pile up waiting |
+| Retry with backoff and jitter | Ride out brief failures without stampeding the dependency |
+| Bulkhead | Separate resource pools so one slow dependency can't exhaust them all |
+| Transactional outbox | Commit data and publish its event atomically |
+| Distributed tracing and correlation ids | Follow one request across many services |
+| Health checks | Let discovery and load balancers route only to healthy instances |
+
+## Choosing patterns in an interview
+
+Don't list patterns; let the problem pull them in.
+
+1. **Decide whether to split at all.** Name the driver: team scale, scaling or reliability differences, compliance.
+2. **Draw boundaries by capability or bounded context**, each service with its own data.
+3. **Put a gateway at the edge** for routing, auth and limits, and say how services discover each other.
+4. **Find the operations that span services** and use sagas with compensations; mention idempotency and the outbox.
+5. **Find the queries that span services** and use API composition for simple cases, CQRS views for heavy ones.
+6. **Reach for event sourcing only** when audit history or temporal queries are real requirements.
+7. **If migrating**, describe a strangler fig path, one capability at a time.
+
+## Cheat sheet
+
+- Microservices trade in-process simplicity for independent deploys, scaling, failure and ownership; split only for a concrete reason.
+- Decompose by business capability or DDD subdomain; a bounded context is the natural maximum size of a service.
+- Chatty calls, lockstep deploys and shared tables are signs of a distributed monolith.
+- Database per service: only the owner touches its data; no cross-service joins or ACID transactions.
+- API gateway: one entry point for routing, auth, rate limits, aggregation and protocol translation; keep it thin; BFF per client type.
+- Service discovery: a registry of healthy instances, used client-side or through a load balancer or DNS.
+- Saga: local transactions plus compensations in reverse order; choreography (events) or orchestration (coordinator).
+- Saga steps must be idempotent, compensations retryable, and intermediate states explicit.
+- CQRS: separate write model from denormalised read models; reads are eventually consistent.
+- Event sourcing: store events, derive state; gives audit and replay, costs snapshots, schema versioning and projections.
+- Strangler fig: route through a facade and move one capability at a time, reversibly.
+- Sidecar: cross-cutting plumbing in a helper process per instance; many sidecars plus a control plane make a mesh.
