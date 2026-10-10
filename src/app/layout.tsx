@@ -3,6 +3,7 @@ import Link from "next/link";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { SyncBadge } from "@/components/SyncBadge";
+import { ThemeToggle, themeScript } from "@/components/ThemeToggle";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -30,7 +31,11 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
-    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}>
+    // The theme script sets the "dark" class before React hydrates, hence suppressHydrationWarning.
+    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`} suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+      </head>
       <body className="min-h-full flex flex-col font-sans">
         <header className="sticky top-0 z-20 border-b border-border bg-bg/90 backdrop-blur">
           <nav className="mx-auto flex h-14 max-w-3xl items-center justify-between px-4">
@@ -42,6 +47,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
                 Practice
               </Link>
               <SyncBadge />
+              <ThemeToggle />
             </div>
           </nav>
         </header>

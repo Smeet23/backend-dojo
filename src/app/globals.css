@@ -1,6 +1,9 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
+/* Dark mode follows the .dark class on <html> (set by the theme script / toggle). */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --bg: #fafaf9;
   --surface: #ffffff;
@@ -18,23 +21,22 @@
   --bad-soft: #fbe7e7;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #121211;
-    --surface: #1a1a19;
-    --surface-2: #222220;
-    --border: #2e2e2b;
-    --text: #ececea;
-    --muted: #9a9a94;
-    --accent: #7c9dff;
-    --accent-soft: #1d2640;
-    --good: #4fc27f;
-    --good-soft: #15291e;
-    --warn: #e0a640;
-    --warn-soft: #2e2412;
-    --bad: #f07272;
-    --bad-soft: #321a1a;
-  }
+:root.dark {
+  --bg: #121211;
+  --surface: #1a1a19;
+  --surface-2: #222220;
+  --border: #2e2e2b;
+  --text: #ececea;
+  --muted: #9a9a94;
+  --accent: #7c9dff;
+  --accent-soft: #1d2640;
+  --good: #4fc27f;
+  --good-soft: #15291e;
+  --warn: #e0a640;
+  --warn-soft: #2e2412;
+  --bad: #f07272;
+  --bad-soft: #321a1a;
+  color-scheme: dark;
 }
 
 @theme inline {
