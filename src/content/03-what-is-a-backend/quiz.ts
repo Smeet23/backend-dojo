@@ -1,6 +1,6 @@
 import type { Question } from "@/lib/types";
 
-export const backendQuiz: Question[] = [
+export const quiz: Question[] = [
   {
     id: "backend-request-hops",
     lectures: [3],

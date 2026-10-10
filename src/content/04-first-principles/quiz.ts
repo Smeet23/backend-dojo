@@ -1,6 +1,6 @@
 import type { Question } from "@/lib/types";
 
-export const principlesQuiz: Question[] = [
+export const quiz: Question[] = [
   {
     id: "principles-tool-choice",
     lectures: [4],

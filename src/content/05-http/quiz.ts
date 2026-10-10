@@ -3,7 +3,7 @@ import type { Question } from "@/lib/types";
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 const CODES_2XX_4XX = ["200 OK", "201 Created", "204 No Content", "400 Bad Request", "401 Unauthorized", "403 Forbidden", "404 Not Found", "409 Conflict"];
 
-export const httpQuiz: Question[] = [
+export const quiz: Question[] = [
   {
     id: "http-create-folder",
     lectures: [5],

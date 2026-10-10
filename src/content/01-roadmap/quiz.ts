@@ -1,6 +1,6 @@
 import type { Question } from "@/lib/types";
 
-export const roadmapQuiz: Question[] = [
+export const quiz: Question[] = [
   {
     id: "roadmap-middleware-order",
     lectures: [1],

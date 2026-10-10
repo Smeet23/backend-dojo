@@ -1,6 +1,6 @@
 import type { Question } from "@/lib/types";
 
-export const pathQuiz: Question[] = [
+export const quiz: Question[] = [
   {
     id: "path-phase-order",
     lectures: [2],
