@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from "next";
 import Link from "next/link";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { SyncBadge } from "@/components/SyncBadge";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -36,9 +37,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
             <Link href="/" className="font-semibold tracking-tight">
               Backend <span className="text-accent">Dojo</span>
             </Link>
-            <Link href="/practice" className="text-sm text-muted hover:text-text">
-              Mixed practice
-            </Link>
+            <div className="flex items-center gap-4">
+              <Link href="/practice" className="text-sm text-muted hover:text-text">
+                Practice
+              </Link>
+              <SyncBadge />
+            </div>
           </nav>
         </header>
         <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-6 sm:py-10">{children}</main>

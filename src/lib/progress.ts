@@ -1,153 +1,192 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
+import {
+  applyEvents,
+  emptyProgress,
+  PROGRESS_VERSION,
+  type LessonProgress,
+  type Progress,
+  type ProgressEvent,
+} from "./progress-model";
+
+export type { LessonProgress, Progress } from "./progress-model";
 
 /**
- * All progress reads and writes go through this file.
- * Swapping localStorage for a database later only changes this module.
+ * Progress lives in Postgres once this device is unlocked with the passcode.
+ * The browser keeps a cached copy so pages render instantly and work offline;
+ * anything done while locked or offline is merged into the database later.
  */
 
+export type SyncStatus = "loading" | "synced" | "locked" | "offline";
+
 const KEY = "backend-dojo:progress";
-const VERSION = 1;
+const DIRTY_KEY = "backend-dojo:dirty";
 
-export type LessonProgress = {
-  visited: boolean;
-  /** Quiz finished at least once. */
-  done: boolean;
-  /** Best quiz score as a percentage. */
-  quizBest: number | null;
-};
+type State = { progress: Progress; sync: SyncStatus; storageOk: boolean };
 
-export type Progress = {
-  version: number;
-  lessons: Record<string, LessonProgress>;
-  /** Question id -> net miss count; drives weak-topic weighting. */
-  misses: Record<string, number>;
-  lastLecture: number | null;
-};
-
-const empty = (): Progress => ({ version: VERSION, lessons: {}, misses: {}, lastLecture: null });
-
-let state: Progress = empty();
-let storageOk = true;
-let loaded = false;
+let state: State = { progress: emptyProgress(), sync: "loading", storageOk: true };
+let started = false;
+let dirty = false; // local changes the server hasn't seen
+let queue: ProgressEvent[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
 const listeners = new Set<() => void>();
 
-function load() {
-  if (loaded) return;
-  loaded = true;
-  try {
-    const raw = window.localStorage.getItem(KEY);
-    if (!raw) return;
-    const parsed = JSON.parse(raw) as Progress;
-    // Unknown versions or malformed data: start fresh rather than crash.
-    if (parsed?.version === VERSION && parsed.lessons && parsed.misses) state = parsed;
-  } catch {
-    storageOk = false;
-  }
-}
-
-function save() {
-  try {
-    window.localStorage.setItem(KEY, JSON.stringify(state));
-  } catch {
-    storageOk = false;
-  }
+function set(patch: Partial<State>) {
+  state = { ...state, ...patch };
   listeners.forEach((l) => l());
 }
 
-function update(fn: (draft: Progress) => Progress) {
-  load();
-  state = fn(state);
-  save();
+function readCache() {
+  try {
+    const raw = window.localStorage.getItem(KEY);
+    dirty = window.localStorage.getItem(DIRTY_KEY) === "1";
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as Progress;
+    if (parsed?.version === PROGRESS_VERSION && parsed.lessons && parsed.misses) state = { ...state, progress: parsed };
+  } catch {
+    state = { ...state, storageOk: false };
+  }
 }
 
-function lesson(p: Progress, id: number): LessonProgress {
-  return p.lessons[id] ?? { visited: false, done: false, quizBest: null };
+function writeCache() {
+  try {
+    window.localStorage.setItem(KEY, JSON.stringify(state.progress));
+    window.localStorage.setItem(DIRTY_KEY, dirty ? "1" : "0");
+  } catch {
+    if (state.storageOk) set({ storageOk: false });
+  }
+}
+
+function hasLocalData(p: Progress) {
+  return Object.keys(p.lessons).length > 0 || Object.keys(p.misses).length > 0;
+}
+
+/** Loads progress from the server, first merging in anything done locally. */
+async function sync() {
+  try {
+    let res: Response;
+    if (dirty && hasLocalData(state.progress)) {
+      res = await fetch("/api/progress/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(state.progress),
+      });
+    } else {
+      res = await fetch("/api/progress", { cache: "no-store" });
+    }
+    if (res.status === 401) return set({ sync: "locked" });
+    if (!res.ok) return set({ sync: "offline" });
+    dirty = false;
+    queue = [];
+    set({ progress: (await res.json()) as Progress, sync: "synced" });
+    writeCache();
+  } catch {
+    set({ sync: "offline" });
+  }
+}
+
+function start() {
+  if (started || typeof window === "undefined") return;
+  started = true;
+  readCache();
+  void sync();
+  // Retry when the tab regains focus or the network comes back.
+  window.addEventListener("online", () => state.sync !== "locked" && void sync());
+  window.addEventListener("focus", () => state.sync === "offline" && void sync());
+}
+
+async function flush() {
+  flushTimer = null;
+  if (queue.length === 0 || state.sync !== "synced") return;
+  const events = queue.splice(0, 50);
+  try {
+    const res = await fetch("/api/progress/events", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ events }),
+    });
+    if (res.status === 401) throw Object.assign(new Error("locked"), { locked: true });
+    if (!res.ok) throw new Error(`events failed: ${res.status}`);
+    if (queue.length) void flush();
+  } catch (err) {
+    // The local copy already has these changes; mark it for a merge on next sync.
+    dirty = true;
+    queue = [];
+    writeCache();
+    set({ sync: (err as { locked?: boolean }).locked ? "locked" : "offline" });
+  }
+}
+
+function record(...events: ProgressEvent[]) {
+  start();
+  set({ progress: applyEvents(state.progress, events) });
+  if (state.sync === "synced") {
+    queue.push(...events);
+    flushTimer ??= setTimeout(flush, 300);
+  } else {
+    dirty = true;
+  }
+  writeCache();
 }
 
 export function markVisited(lectureId: number) {
-  update((p) => ({
-    ...p,
-    lastLecture: lectureId,
-    lessons: { ...p.lessons, [lectureId]: { ...lesson(p, lectureId), visited: true } },
-  }));
+  record({ type: "visit", lectureId });
 }
 
-/** Records a finished lecture quiz (score in percent). */
-export function recordLectureQuiz(lectureId: number, scorePct: number) {
-  update((p) => {
-    const prev = lesson(p, lectureId);
-    return {
-      ...p,
-      lessons: {
-        ...p.lessons,
-        [lectureId]: {
-          ...prev,
-          visited: true,
-          done: true,
-          quizBest: Math.max(prev.quizBest ?? 0, scorePct),
-        },
-      },
-    };
-  });
-}
-
-/** A miss adds one; a fully correct answer pays one back. */
+/** One answered question: misses add up, fully correct answers pay one back. */
 export function recordAnswer(questionId: string, score: number) {
-  update((p) => {
-    const current = p.misses[questionId] ?? 0;
-    const next = score < 1 ? current + 1 : Math.max(0, current - 1);
-    const misses = { ...p.misses };
-    if (next === 0) delete misses[questionId];
-    else misses[questionId] = next;
-    return { ...p, misses };
-  });
+  record({ type: "answer", questionId, score });
 }
 
-export function resetProgress() {
-  update(() => empty());
+/** A finished quiz; `lectureId` is null for mixed practice. */
+export function recordQuizFinished(lectureId: number | null, scorePct: number, questionCount: number) {
+  record({ type: "quiz", lectureId, scorePct, questionCount });
+}
+
+/** Unlocks this device; returns false for a wrong passcode. */
+export async function unlock(passcode: string): Promise<boolean> {
+  const res = await fetch("/api/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ passcode }),
+  });
+  if (res.status === 401) return false;
+  if (!res.ok) throw new Error(`Unlock failed (${res.status})`);
+  set({ sync: "loading" });
+  await sync();
+  return true;
+}
+
+export async function lock() {
+  await fetch("/api/session", { method: "DELETE" });
+  set({ sync: "locked" });
 }
 
 function subscribe(listener: () => void) {
+  start();
   listeners.add(listener);
-  const onStorage = (e: StorageEvent) => {
-    if (e.key !== KEY) return;
-    loaded = false;
-    load();
-    listener();
-  };
-  window.addEventListener("storage", onStorage);
-  return () => {
-    listeners.delete(listener);
-    window.removeEventListener("storage", onStorage);
-  };
+  return () => listeners.delete(listener);
 }
 
-const serverSnapshot = empty();
+const serverState: State = { progress: emptyProgress(), sync: "loading", storageOk: true };
+
+function useStore(): State {
+  return useSyncExternalStore(subscribe, () => state, () => serverState);
+}
 
 export function useProgress(): Progress {
-  return useSyncExternalStore(
-    subscribe,
-    () => {
-      load();
-      return state;
-    },
-    () => serverSnapshot,
-  );
+  return useStore().progress;
+}
+
+export function useSyncStatus(): SyncStatus {
+  return useStore().sync;
 }
 
 export function useStorageAvailable(): boolean {
-  return useSyncExternalStore(
-    subscribe,
-    () => {
-      load();
-      return storageOk;
-    },
-    () => true,
-  );
+  return useStore().storageOk;
 }
 
 export function getLessonProgress(p: Progress, id: number): LessonProgress {
-  return lesson(p, id);
+  return p.lessons[String(id)] ?? { visited: false, done: false, quizBest: null };
 }

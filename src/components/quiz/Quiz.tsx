@@ -4,7 +4,7 @@ import { useState } from "react";
 import Link from "next/link";
 import type { Question, Response } from "@/lib/types";
 import { grade } from "@/lib/quiz";
-import { recordAnswer, recordLectureQuiz } from "@/lib/progress";
+import { recordAnswer, recordQuizFinished } from "@/lib/progress";
 import { QuestionView, emptyResponse, isComplete } from "./QuestionView";
 import { lectures } from "@/content/lectures";
 
@@ -41,7 +41,7 @@ export function Quiz({ questions, lectureId, title, onRestart }: Props) {
 
   function next() {
     if (index === questions.length - 1) {
-      if (lectureId !== undefined) recordLectureQuiz(lectureId, percent([...results]));
+      recordQuizFinished(lectureId ?? null, percent(results), results.length);
       setFinished(true);
       return;
     }
