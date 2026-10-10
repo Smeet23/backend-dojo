@@ -103,7 +103,7 @@ export function CircuitBreakerLab() {
         <p className="mt-1 text-sm">{stateHelp[state]}</p>
       </div>
       <div className="mt-3 flex flex-wrap gap-2">
-        <button type="button" onClick={send} className="min-h-10 flex-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground">
+        <button type="button" onClick={send} className="min-h-10 flex-1 rounded-lg bg-accent px-3 text-sm font-medium text-white dark:text-bg">
           Send request
         </button>
         <button type="button" onClick={wait} className="min-h-10 flex-1 rounded-lg border border-border px-3 text-sm">
@@ -114,20 +114,20 @@ export function CircuitBreakerLab() {
         </button>
       </div>
       <div className="mt-3 grid grid-cols-3 gap-2 text-center text-sm">
-        <div className="rounded-lg bg-muted p-2">
-          <p className="text-xs text-muted-foreground">Clock</p>
+        <div className="rounded-lg bg-surface-2 p-2">
+          <p className="text-xs text-muted">Clock</p>
           <p className="font-mono">t={clock}s</p>
         </div>
-        <div className="rounded-lg bg-muted p-2">
-          <p className="text-xs text-muted-foreground">Reached provider</p>
+        <div className="rounded-lg bg-surface-2 p-2">
+          <p className="text-xs text-muted">Reached provider</p>
           <p className="font-mono">{reached}</p>
         </div>
-        <div className="rounded-lg bg-muted p-2">
-          <p className="text-xs text-muted-foreground">Failed fast</p>
+        <div className="rounded-lg bg-surface-2 p-2">
+          <p className="text-xs text-muted">Failed fast</p>
           <p className="font-mono">{shortCircuited}</p>
         </div>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">
+      <p className="mt-2 text-xs text-muted">
         Opens after {THRESHOLD} consecutive failures · cool-down {COOLDOWN} s · each request takes 1 s
       </p>
       <ol className="mt-3 space-y-1">
@@ -135,10 +135,10 @@ export function CircuitBreakerLab() {
           <li
             key={`${log.length - i}-${line.t}`}
             className={`rounded-md px-2 py-1 text-[0.8rem] ${
-              line.tone === "good" ? "bg-good-soft" : line.tone === "warn" ? "bg-warn-soft" : line.tone === "bad" ? "bg-bad-soft" : "bg-muted"
+              line.tone === "good" ? "bg-good-soft" : line.tone === "warn" ? "bg-warn-soft" : line.tone === "bad" ? "bg-bad-soft" : "bg-surface-2"
             }`}
           >
-            <span className="font-mono text-muted-foreground">t={line.t}s</span> {line.text}
+            <span className="font-mono text-muted">t={line.t}s</span> {line.text}
           </li>
         ))}
       </ol>

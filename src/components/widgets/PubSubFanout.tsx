@@ -79,13 +79,13 @@ export function PubSubFanout() {
     <Widget title="Fan-out across instances" hint="Four teammates watch board 412, spread over three instances. Ana moves tasks. Add a broker, then restart instance 3 mid-stream.">
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Broker</span>
+          <span className="w-20 text-muted">Broker</span>
           {(Object.keys(BROKERS) as Broker[]).map((b) => (
             <Pill key={b} active={broker === b} onClick={() => { setBroker(b); setState(fresh()); }}>{BROKERS[b]}</Pill>
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Reconnect</span>
+          <span className="w-20 text-muted">Reconnect</span>
           <Pill active={!catchUp} onClick={() => { setCatchUp(false); setState(fresh()); }}>Just reconnect</Pill>
           <Pill active={catchUp} onClick={() => { setCatchUp(true); setState(fresh()); }}>Send last seq seen</Pill>
         </div>
@@ -95,8 +95,8 @@ export function PubSubFanout() {
         {[1, 2, 3].map((inst) => {
           const down = inst === 3 && !state.instance3Up;
           return (
-            <div key={inst} className={`rounded-lg border p-3 ${down ? "border-warn bg-warn-soft" : "border-border bg-muted"}`}>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Instance {inst} {down ? "· restarting" : ""}</p>
+            <div key={inst} className={`rounded-lg border p-3 ${down ? "border-warn bg-warn-soft" : "border-border bg-surface-2"}`}>
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted">Instance {inst} {down ? "· restarting" : ""}</p>
               <ul className="mt-2 space-y-1 text-sm">
                 {CLIENTS.filter((c) => c.instance === inst).map((c) => {
                   const miss = missing(c.name);
@@ -116,7 +116,7 @@ export function PubSubFanout() {
       </div>
 
       <div className="mt-3 flex flex-wrap gap-2">
-        <button type="button" onClick={() => setState((s) => publish(s, broker))} className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground">
+        <button type="button" onClick={() => setState((s) => publish(s, broker))} className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white dark:text-bg">
           Ana moves a task
         </button>
         <button
@@ -130,9 +130,9 @@ export function PubSubFanout() {
       </div>
 
       {state.log.length > 0 && (
-        <pre className="mt-3 whitespace-pre-wrap break-all rounded-lg bg-muted px-3 py-2 font-mono text-[0.75rem] leading-5">{state.log.join("\n")}</pre>
+        <pre className="mt-3 whitespace-pre-wrap break-all rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.75rem] leading-5">{state.log.join("\n")}</pre>
       )}
-      <p className="mt-2 text-xs text-muted-foreground">Every delivered event costs one socket write per watcher: fan-out is events times subscribers.</p>
+      <p className="mt-2 text-xs text-muted">Every delivered event costs one socket write per watcher: fan-out is events times subscribers.</p>
     </Widget>
   );
 }

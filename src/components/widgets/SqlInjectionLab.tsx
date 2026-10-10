@@ -68,22 +68,22 @@ export function SqlInjectionLab() {
     <Widget title="SQL injection lab" hint="Pick an input and a query style. Watch what the database actually receives.">
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-16 text-muted-foreground">Input</span>
+          <span className="w-16 text-muted">Input</span>
           {INPUTS.map((i) => (
             <Pill key={i.label} active={input === i.value} onClick={() => setInput(i.value)}>{i.label}</Pill>
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-16 text-muted-foreground">Query</span>
+          <span className="w-16 text-muted">Query</span>
           <Pill active={mode === "concat"} onClick={() => setMode("concat")}>String concatenation</Pill>
           <Pill active={mode === "param"} onClick={() => setMode("param")}>Parameterized</Pill>
         </div>
       </div>
 
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Email field contains</p>
-      <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-muted px-3 py-2 font-mono text-[0.8rem]">{input}</pre>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">Email field contains</p>
+      <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.8rem]">{input}</pre>
 
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Database receives</p>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">Database receives</p>
       <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg border border-border px-3 py-2 font-mono text-[0.8rem] leading-6">
         {r.sql}
         {r.params && `\nparams: ${r.params}`}

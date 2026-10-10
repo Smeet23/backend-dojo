@@ -46,7 +46,7 @@ function run(mode: Mode): Row[] {
 }
 
 function Cell({ v }: { v: string | null }) {
-  return v === null ? <span className="text-muted-foreground italic">NULL</span> : <span>{v}</span>;
+  return v === null ? <span className="text-muted italic">NULL</span> : <span>{v}</span>;
 }
 
 export function SqlJoinLab() {
@@ -58,7 +58,7 @@ export function SqlJoinLab() {
     <Widget title="INNER vs LEFT JOIN" hint="Same two tables, four queries. Watch which users survive.">
       <div className="grid gap-3 sm:grid-cols-2">
         <div>
-          <p className="mb-1 text-xs text-muted-foreground">users</p>
+          <p className="mb-1 text-xs text-muted">users</p>
           <ul className="space-y-1 text-[0.75rem] font-mono">
             {USERS.map((u) => (
               <li key={u.id} className="rounded border border-border px-2 py-1">
@@ -68,7 +68,7 @@ export function SqlJoinLab() {
           </ul>
         </div>
         <div>
-          <p className="mb-1 text-xs text-muted-foreground">user_profiles</p>
+          <p className="mb-1 text-xs text-muted">user_profiles</p>
           <ul className="space-y-1 text-[0.75rem] font-mono">
             {PROFILES.map((p) => (
               <li key={p.user_id} className="rounded border border-border px-2 py-1 break-all">
@@ -86,12 +86,12 @@ export function SqlJoinLab() {
         <Pill active={mode === "leftOn"} onClick={() => setMode("leftOn")}>LEFT + condition in ON</Pill>
       </div>
 
-      <pre className="mt-3 overflow-x-auto rounded-lg bg-muted p-3 font-mono text-[0.75rem] leading-5">{SQL[mode]}</pre>
+      <pre className="mt-3 overflow-x-auto rounded-lg bg-surface-2 p-3 font-mono text-[0.75rem] leading-5">{SQL[mode]}</pre>
 
-      <p className="mt-3 mb-1 text-xs text-muted-foreground">Result ({rows.length} rows)</p>
+      <p className="mt-3 mb-1 text-xs text-muted">Result ({rows.length} rows)</p>
       <div className="overflow-x-auto rounded-lg border border-border">
         <table className="w-full text-left text-[0.8rem]">
-          <thead className="bg-muted">
+          <thead className="bg-surface-2">
             <tr>
               <th className="px-2 py-1.5">name</th>
               <th className="px-2 py-1.5">bio</th>

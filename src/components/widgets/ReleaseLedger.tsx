@@ -66,7 +66,7 @@ export function ReleaseLedger() {
           type="button"
           onClick={merge}
           disabled={full || builds.length >= COMMITS.length}
-          className="min-h-10 flex-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground disabled:opacity-40"
+          className="min-h-10 flex-1 rounded-lg bg-accent px-3 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
         >
           {nextIsBuggy ? "Merge PRs and deploy" : "Merge a fix and deploy"}
         </button>
@@ -90,13 +90,13 @@ export function ReleaseLedger() {
           return (
             <li
               key={r.id}
-              className={`flex flex-wrap items-center gap-2 rounded-lg border p-2 text-sm ${isLive ? "border-primary bg-primary/10" : "border-border"}`}
+              className={`flex flex-wrap items-center gap-2 rounded-lg border p-2 text-sm ${isLive ? "border-accent bg-accent-soft" : "border-border"}`}
             >
               <span className="font-mono font-semibold">#{r.id}</span>
               <span className="font-mono text-[0.75rem]">
                 {b.id}@{b.commit} + config v{r.config}
               </span>
-              <span className="w-full text-muted-foreground sm:w-auto sm:flex-1">{r.note}</span>
+              <span className="w-full text-muted sm:w-auto sm:flex-1">{r.note}</span>
               {b.buggy && <span className="rounded bg-bad-soft px-2 text-xs">buggy build</span>}
               <button
                 type="button"
@@ -110,7 +110,7 @@ export function ReleaseLedger() {
           );
         })}
       </ol>
-      <p className="mt-3 text-sm text-muted-foreground">
+      <p className="mt-3 text-sm text-muted">
         Rolling back rebuilds nothing and edits nothing: an old release ID still means exactly the same build and config it always
         did, so it can be live again in seconds.
       </p>

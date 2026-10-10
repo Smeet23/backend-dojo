@@ -51,9 +51,9 @@ export function IdempotencyLab() {
           <Pill key={m} active={method === m} onClick={() => setMethod(m)}>{m}</Pill>
         ))}
       </div>
-      <p className="mt-3 rounded-lg bg-muted px-3 py-2 font-mono text-[0.8rem]">{describe[method]}</p>
+      <p className="mt-3 rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.8rem]">{describe[method]}</p>
       <div className="mt-3 flex gap-2">
-        <button type="button" onClick={send} className="min-h-10 flex-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground">
+        <button type="button" onClick={send} className="min-h-10 flex-1 rounded-lg bg-accent px-3 text-sm font-medium text-white dark:text-bg">
           Send
         </button>
         <button type="button" onClick={() => { setNotes(START); setSent([]); }} className="min-h-10 rounded-lg border border-border px-3 text-sm">
@@ -62,16 +62,16 @@ export function IdempotencyLab() {
       </div>
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Server state</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Server state</p>
           <ul className="mt-1 space-y-1 text-sm">
-            {notes.length === 0 && <li className="text-muted-foreground">(no notes)</li>}
+            {notes.length === 0 && <li className="text-muted">(no notes)</li>}
             {notes.map((n) => (
-              <li key={n.id} className="rounded-md bg-muted px-2 py-1 font-mono text-[0.8rem]">#{n.id} {n.title}</li>
+              <li key={n.id} className="rounded-md bg-surface-2 px-2 py-1 font-mono text-[0.8rem]">#{n.id} {n.title}</li>
             ))}
           </ul>
         </div>
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Responses</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Responses</p>
           <ul className="mt-1 space-y-1 font-mono text-[0.8rem]">
             {sent.map((s, i) => <li key={sent.length - i}>{s}</li>)}
           </ul>

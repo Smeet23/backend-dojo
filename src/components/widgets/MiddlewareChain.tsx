@@ -126,25 +126,25 @@ export function MiddlewareChain() {
     <Widget title="Middleware chain" hint="A request for GET /notes/42 runs through the chain. Break something, change the order, and step through.">
       <div className="space-y-2 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Order</span>
+          <span className="w-20 text-muted">Order</span>
           {ORDERS.map((o, i) => <Pill key={o.label} active={orderIdx === i} onClick={() => reset(setOrderIdx)(i)}>{o.label}</Pill>)}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Origin</span>
+          <span className="w-20 text-muted">Origin</span>
           <Pill active={originOk} onClick={() => reset(setOriginOk)(true)}>app.notes.dev</Pill>
           <Pill active={!originOk} onClick={() => reset(setOriginOk)(false)}>evil.example</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Token</span>
+          <span className="w-20 text-muted">Token</span>
           {(["valid", "expired", "missing"] as Token[]).map((t) => <Pill key={t} active={token === t} onClick={() => reset(setToken)(t)}>{t}</Pill>)}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Traffic</span>
+          <span className="w-20 text-muted">Traffic</span>
           <Pill active={!limited} onClick={() => reset(setLimited)(false)}>Normal</Pill>
           <Pill active={limited} onClick={() => reset(setLimited)(true)}>Flooding</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Service</span>
+          <span className="w-20 text-muted">Service</span>
           <Pill active={outcome === "ok"} onClick={() => reset(setOutcome)("ok")}>Works</Pill>
           <Pill active={outcome === "notFound"} onClick={() => reset(setOutcome)("notFound")}>Throws NotFound</Pill>
           <Pill active={outcome === "bug"} onClick={() => reset(setOutcome)("bug")}>Has a bug</Pill>
@@ -155,21 +155,21 @@ export function MiddlewareChain() {
         <ol className="space-y-2">
           {sim.steps.slice(0, current + 1).map((s, i) => (
             <li key={i} className={`rounded-lg border p-3 text-sm ${TONE[s.tone]}`}>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{order.indexOf(s.mw) + 1} · {LABEL[s.mw]}</p>
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted">{order.indexOf(s.mw) + 1} · {LABEL[s.mw]}</p>
               <p className="mt-1">{s.text}</p>
             </li>
           ))}
         </ol>
         <div className="space-y-3">
-          <div className="rounded-lg bg-muted p-3">
-            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Request context</p>
+          <div className="rounded-lg bg-surface-2 p-3">
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted">Request context</p>
             <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[0.78rem] leading-6">
               {Object.keys(sim.steps[current]?.ctx ?? {}).length ? JSON.stringify(sim.steps[current].ctx, null, 2) : "{ }"}
             </pre>
           </div>
           {done && (
-            <div className="rounded-lg bg-muted p-3">
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Log file</p>
+            <div className="rounded-lg bg-surface-2 p-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted">Log file</p>
               <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all font-mono text-[0.78rem] leading-6">{sim.logs.length ? sim.logs.join("\n") : "(empty: this request was never logged)"}</pre>
             </div>
           )}
@@ -177,8 +177,8 @@ export function MiddlewareChain() {
       </div>
 
       {done && (
-        <div className={`mt-3 rounded-lg px-3 py-2 text-sm ${sim.uncaught ? "bg-bad-soft" : "bg-primary/10"}`}>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Response</p>
+        <div className={`mt-3 rounded-lg px-3 py-2 text-sm ${sim.uncaught ? "bg-bad-soft" : "bg-accent-soft"}`}>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Response</p>
           <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[0.78rem] leading-6">{sim.response}</pre>
           {sim.uncaught && <p className="mt-1">The error handler was registered before the handler, so it never saw this error.</p>}
           {!originOk && !sim.uncaught && <p className="mt-1">No CORS headers were added, so the browser hides this response from the page.</p>}
@@ -191,7 +191,7 @@ export function MiddlewareChain() {
           type="button"
           onClick={() => setStep(current + 1)}
           disabled={done}
-          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40"
+          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
         >
           {done ? "Done" : `Next step (${current + 1}/${sim.steps.length})`}
         </button>

@@ -91,10 +91,10 @@ export function RaceConditionLab() {
       </div>
 
       <p className="mt-3 text-sm font-semibold">{script.title}</p>
-      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-lg bg-muted p-2 font-mono text-[0.75rem]">{script.code}</pre>
+      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap rounded-lg bg-surface-2 p-2 font-mono text-[0.75rem]">{script.code}</pre>
 
-      <div className="mt-3 flex items-center justify-between gap-2 rounded-lg bg-muted px-3 py-2">
-        <span className="text-sm text-muted-foreground">Shared {script.label}</span>
+      <div className="mt-3 flex items-center justify-between gap-2 rounded-lg bg-surface-2 px-3 py-2">
+        <span className="text-sm text-muted">Shared {script.label}</span>
         <span className={`font-mono text-lg font-semibold ${wrong ? "text-bad" : finished ? "text-good" : ""}`}>{value}</span>
       </div>
 
@@ -102,7 +102,7 @@ export function RaceConditionLab() {
         {steps.slice(0, shown).map((s, i) => (
           <li
             key={i}
-            className={`flex gap-2 rounded-md px-2 py-1 text-sm ${s.who === "A" ? "bg-primary/10" : "bg-muted"} ${s.blocked ? "border border-warn" : ""}`}
+            className={`flex gap-2 rounded-md px-2 py-1 text-sm ${s.who === "A" ? "bg-accent-soft" : "bg-surface-2"} ${s.blocked ? "border border-warn" : ""}`}
           >
             <span className="font-mono text-xs font-semibold">{s.who}</span>
             <span>{s.text}</span>
@@ -115,7 +115,7 @@ export function RaceConditionLab() {
           type="button"
           disabled={finished}
           onClick={() => setShown((n) => Math.min(steps.length, n + 1))}
-          className="min-h-10 flex-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground disabled:opacity-50"
+          className="min-h-10 flex-1 rounded-lg bg-accent px-3 text-sm font-medium text-white disabled:opacity-50 dark:text-bg"
         >
           Next step ({shown}/{steps.length})
         </button>

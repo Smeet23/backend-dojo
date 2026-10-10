@@ -103,15 +103,15 @@ export function RealtimeTimeline() {
       </div>
 
       <div className="mt-5 space-y-1">
-        <p className="text-xs text-muted-foreground">Requests the client opens</p>
-        <div className="relative h-6 rounded bg-muted">
+        <p className="text-xs text-muted">Requests the client opens</p>
+        <div className="relative h-6 rounded bg-surface-2">
           {sim.requests.map((r, i) => (
             <span key={i} className="absolute top-1 h-4 w-0.5 bg-muted" style={{ left: pct(r) }} />
           ))}
-          {(tech === "sse" || tech === "ws") && <span className="absolute inset-y-2 left-0 right-0 rounded bg-primary/10" />}
+          {(tech === "sse" || tech === "ws") && <span className="absolute inset-y-2 left-0 right-0 rounded bg-accent-soft" />}
         </div>
-        <p className="pt-2 text-xs text-muted-foreground">Task moves (top) and when the other teammate sees them (bottom)</p>
-        <div className="relative h-10 rounded bg-muted">
+        <p className="pt-2 text-xs text-muted">Task moves (top) and when the other teammate sees them (bottom)</p>
+        <div className="relative h-10 rounded bg-surface-2">
           {EVENTS.map((e) => (
             <span key={e} className="absolute top-1 h-3 w-3 -translate-x-1/2 rounded-full bg-warn" style={{ left: pct(e) }} />
           ))}
@@ -119,7 +119,7 @@ export function RealtimeTimeline() {
             <span key={d.event} className="absolute bottom-1 h-3 w-3 -translate-x-1/2 rounded-full bg-good" style={{ left: pct(d.at) }} />
           ))}
         </div>
-        <div className="flex justify-between text-[0.7rem] text-muted-foreground"><span>0 s</span><span>30 s</span><span>60 s</span></div>
+        <div className="flex justify-between text-[0.7rem] text-muted"><span>0 s</span><span>30 s</span><span>60 s</span></div>
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-2 text-sm sm:grid-cols-4">
@@ -128,8 +128,8 @@ export function RealtimeTimeline() {
         <Stat label="Avg delay" value={`${avg.toFixed(2)} s`} />
         <Stat label="Worst delay" value={`${max.toFixed(2)} s`} />
       </div>
-      <p className="mt-3 rounded-lg bg-muted px-3 py-2 text-sm">{NOTES[tech]}</p>
-      <p className="mt-2 text-xs text-muted-foreground">At 10,000 open boards, multiply the request count by 10,000 every minute.</p>
+      <p className="mt-3 rounded-lg bg-surface-2 px-3 py-2 text-sm">{NOTES[tech]}</p>
+      <p className="mt-2 text-xs text-muted">At 10,000 open boards, multiply the request count by 10,000 every minute.</p>
     </Widget>
   );
 }
@@ -137,7 +137,7 @@ export function RealtimeTimeline() {
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-border px-3 py-2">
-      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="text-xs text-muted">{label}</p>
       <p className="font-mono text-base">{value}</p>
     </div>
   );

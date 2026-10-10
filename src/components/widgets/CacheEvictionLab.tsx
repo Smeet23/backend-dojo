@@ -109,15 +109,15 @@ export function CacheEvictionLab() {
         {Array.from({ length: CAPACITY }).map((_, i) => {
           const e = state.cache[i];
           return (
-            <div key={i} className={`min-h-16 rounded-lg border p-2 text-[0.72rem] ${e ? "border-primary bg-primary/10" : "border-dashed border-border"}`}>
+            <div key={i} className={`min-h-16 rounded-lg border p-2 text-[0.72rem] ${e ? "border-accent bg-accent-soft" : "border-dashed border-border"}`}>
               {e ? (
                 <>
                   <p className="font-mono font-semibold break-all">{e.key}</p>
-                  <p className="text-muted-foreground">used t{e.lastUsed} · {e.uses}×</p>
-                  {ttlOn && <p className="text-muted-foreground">expires t{e.expiresAt}</p>}
+                  <p className="text-muted">used t{e.lastUsed} · {e.uses}×</p>
+                  {ttlOn && <p className="text-muted">expires t{e.expiresAt}</p>}
                 </>
               ) : (
-                <p className="text-muted-foreground">empty slot</p>
+                <p className="text-muted">empty slot</p>
               )}
             </div>
           );
@@ -126,32 +126,32 @@ export function CacheEvictionLab() {
 
       <div className="mt-3 flex flex-wrap gap-2">
         {KEYS.map((k) => (
-          <button key={k} type="button" onClick={() => setState((s) => request(s, k, policy, ttlOn))} className="min-h-10 rounded-lg border border-border px-3 font-mono text-[0.75rem] hover:bg-muted">
+          <button key={k} type="button" onClick={() => setState((s) => request(s, k, policy, ttlOn))} className="min-h-10 rounded-lg border border-border px-3 font-mono text-[0.75rem] hover:bg-surface-2">
             GET {k}
           </button>
         ))}
       </div>
       <div className="mt-2 flex flex-wrap gap-2">
-        <button type="button" onClick={playPattern} className="min-h-10 flex-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground">
+        <button type="button" onClick={playPattern} className="min-h-10 flex-1 rounded-lg bg-accent px-3 text-sm font-medium text-white dark:text-bg">
           Play traffic pattern
         </button>
         <button type="button" onClick={() => setState(START)} className="min-h-10 rounded-lg border border-border px-3 text-sm">
           Reset
         </button>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground break-words">Pattern: {PATTERN.map((k) => k.split(":")[1]).join(" ")} (product:1 is the hot item)</p>
+      <p className="mt-2 text-xs text-muted break-words">Pattern: {PATTERN.map((k) => k.split(":")[1]).join(" ")} (product:1 is the hot item)</p>
 
       <div className="mt-3 grid grid-cols-3 gap-2 text-center text-sm">
-        <div className="rounded-lg bg-good-soft p-2"><p className="text-xs text-muted-foreground">Hits</p><p className="font-mono">{state.hits}</p></div>
-        <div className="rounded-lg bg-warn-soft p-2"><p className="text-xs text-muted-foreground">Misses</p><p className="font-mono">{state.misses}</p></div>
-        <div className="rounded-lg bg-muted p-2"><p className="text-xs text-muted-foreground">Hit rate</p><p className="font-mono">{rate}%</p></div>
+        <div className="rounded-lg bg-good-soft p-2"><p className="text-xs text-muted">Hits</p><p className="font-mono">{state.hits}</p></div>
+        <div className="rounded-lg bg-warn-soft p-2"><p className="text-xs text-muted">Misses</p><p className="font-mono">{state.misses}</p></div>
+        <div className="rounded-lg bg-surface-2 p-2"><p className="text-xs text-muted">Hit rate</p><p className="font-mono">{rate}%</p></div>
       </div>
 
       <ol className="mt-3 space-y-1">
         {state.log.map((l, i) => (
           <li
             key={`${state.clock}-${i}`}
-            className={`rounded px-2 py-1 font-mono text-[0.72rem] break-all ${l.tone === "good" ? "bg-good-soft" : l.tone === "warn" ? "bg-warn-soft" : l.tone === "bad" ? "bg-bad-soft" : "bg-muted"}`}
+            className={`rounded px-2 py-1 font-mono text-[0.72rem] break-all ${l.tone === "good" ? "bg-good-soft" : l.tone === "warn" ? "bg-warn-soft" : l.tone === "bad" ? "bg-bad-soft" : "bg-surface-2"}`}
           >
             {l.text}
           </li>

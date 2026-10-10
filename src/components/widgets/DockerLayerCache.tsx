@@ -52,12 +52,12 @@ export function DockerLayerCache() {
     <Widget title="Docker layer cache" hint="Each instruction is a cached layer. The first layer whose inputs changed, and every layer after it, rebuilds.">
       <div className="space-y-2 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted-foreground">Dockerfile</span>
+          <span className="w-24 text-muted">Dockerfile</span>
           <Pill active={order === "bad"} onClick={() => setOrder("bad")}>Copy everything first</Pill>
           <Pill active={order === "good"} onClick={() => setOrder("good")}>Copy lock file first</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted-foreground">You changed</span>
+          <span className="w-24 text-muted">You changed</span>
           {CHANGES.map((c) => <Pill key={c.id} active={change === c.id} onClick={() => setChange(c.id)}>{c.label}</Pill>)}
         </div>
       </div>
@@ -68,7 +68,7 @@ export function DockerLayerCache() {
           return (
             <li
               key={l.line}
-              className={`flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border px-3 py-2 ${rebuilt ? "border-warn bg-warn-soft" : "border-border bg-muted"}`}
+              className={`flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border px-3 py-2 ${rebuilt ? "border-warn bg-warn-soft" : "border-border bg-surface-2"}`}
             >
               <code className="break-all font-mono text-[0.78rem]">{l.line}</code>
               <span className={`text-xs font-semibold ${rebuilt ? "text-warn" : "text-good"}`}>
@@ -81,15 +81,15 @@ export function DockerLayerCache() {
 
       <div className="mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2">
         <div className={`rounded-lg px-3 py-2 ${seconds > 30 ? "bg-bad-soft" : "bg-good-soft"}`}>
-          <p className="text-xs text-muted-foreground">Build time</p>
+          <p className="text-xs text-muted">Build time</p>
           <p className="font-mono">~{seconds}s</p>
         </div>
         <div className={`rounded-lg px-3 py-2 ${mb > 50 ? "bg-bad-soft" : "bg-good-soft"}`}>
-          <p className="text-xs text-muted-foreground">New layers each server must pull</p>
+          <p className="text-xs text-muted">New layers each server must pull</p>
           <p className="font-mono">~{Math.round(mb)} MB</p>
         </div>
       </div>
-      <p className="mt-3 text-sm text-muted-foreground">
+      <p className="mt-3 text-sm text-muted">
         {order === "bad" && change === "src"
           ? "A one-line code change reinstalls every dependency, because npm ci sits after COPY . . in the cache chain."
           : change === "src"

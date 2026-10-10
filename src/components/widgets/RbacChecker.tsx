@@ -43,21 +43,21 @@ export function RbacChecker() {
     <Widget title="RBAC checker" hint="Choose who is calling and what they try. The server checks identity, then role, then ownership.">
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Identity</span>
+          <span className="w-20 text-muted">Identity</span>
           <Pill active={signedIn} onClick={() => setSignedIn(true)}>Signed in</Pill>
           <Pill active={!signedIn} onClick={() => setSignedIn(false)}>No / expired token</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Role</span>
+          <span className="w-20 text-muted">Role</span>
           {ROLES.map((r) => <Pill key={r} active={role === r} onClick={() => setRole(r)}>{r}</Pill>)}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Note 42</span>
+          <span className="w-20 text-muted">Note 42</span>
           <Pill active={owns} onClick={() => setOwns(true)}>Caller owns it</Pill>
           <Pill active={!owns} onClick={() => setOwns(false)}>Someone else&apos;s</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Action</span>
+          <span className="w-20 text-muted">Action</span>
           {ACTIONS.map((a, i) => <Pill key={a.label} active={actionIdx === i} onClick={() => setActionIdx(i)}>{a.label}</Pill>)}
         </div>
       </div>
@@ -65,14 +65,14 @@ export function RbacChecker() {
       <div className="mt-4 overflow-x-auto">
         <table className="w-full min-w-[20rem] text-left text-[0.78rem]">
           <thead>
-            <tr className="border-b border-border text-muted-foreground">
+            <tr className="border-b border-border text-muted">
               <th className="py-1.5 pr-2 font-medium">Permission</th>
-              {ROLES.map((r) => <th key={r} className={`px-2 py-1.5 font-medium ${r === role ? "text-primary" : ""}`}>{r}</th>)}
+              {ROLES.map((r) => <th key={r} className={`px-2 py-1.5 font-medium ${r === role ? "text-accent" : ""}`}>{r}</th>)}
             </tr>
           </thead>
           <tbody>
             {(["notes:write:own", "notes:hide:any", "deadzone:read", "deadzone:purge"] as Permission[]).map((p) => (
-              <tr key={p} className={`border-b border-border ${p === action.needs ? "bg-primary/10" : ""}`}>
+              <tr key={p} className={`border-b border-border ${p === action.needs ? "bg-accent-soft" : ""}`}>
                 <td className="py-1.5 pr-2 font-mono">{p}</td>
                 {ROLES.map((r) => <td key={r} className="px-2 py-1.5">{GRANTS[r].includes(p) ? "✓" : "–"}</td>)}
               </tr>
@@ -82,7 +82,7 @@ export function RbacChecker() {
       </div>
 
       <div className={`mt-4 rounded-lg p-3 text-sm ${tone}`}>
-        <p className="font-mono text-[0.78rem] text-muted-foreground">{action.request}</p>
+        <p className="font-mono text-[0.78rem] text-muted">{action.request}</p>
         <p className="font-semibold">{result.status}</p>
         <p>{result.why}</p>
       </div>

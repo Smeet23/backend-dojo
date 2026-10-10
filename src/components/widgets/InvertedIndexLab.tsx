@@ -107,40 +107,40 @@ export function InvertedIndexLab() {
     <Widget title="Inverted index builder" hint="Edit the products, then search. Toggle stemming, fuzzy matching and the title boost to see what changes.">
       <div className="grid gap-2 sm:grid-cols-2">
         {docs.map((d, i) => (
-          <div key={i} className="rounded-lg border border-border bg-muted p-2">
-            <p className="text-xs font-semibold text-muted-foreground">Doc {i + 1}</p>
+          <div key={i} className="rounded-lg border border-border bg-surface-2 p-2">
+            <p className="text-xs font-semibold text-muted">Doc {i + 1}</p>
             <input
               aria-label={`Doc ${i + 1} title`}
               value={d.title}
               onChange={(e) => edit(i, "title", e.target.value)}
-              className="mt-1 min-h-10 w-full rounded-md border border-border bg-card px-2 text-sm font-medium"
+              className="mt-1 min-h-10 w-full rounded-md border border-border bg-surface px-2 text-sm font-medium"
             />
             <textarea
               aria-label={`Doc ${i + 1} description`}
               value={d.description}
               onChange={(e) => edit(i, "description", e.target.value)}
               rows={2}
-              className="mt-1 w-full rounded-md border border-border bg-card px-2 py-1 text-sm"
+              className="mt-1 w-full rounded-md border border-border bg-surface px-2 py-1 text-sm"
             />
           </div>
         ))}
       </div>
 
-      <label className="mt-4 block text-xs font-semibold uppercase tracking-wide text-muted-foreground" htmlFor="iil-query">
+      <label className="mt-4 block text-xs font-semibold uppercase tracking-wide text-muted" htmlFor="iil-query">
         Search query
       </label>
       <input
         id="iil-query"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
-        className="mt-1 min-h-10 w-full rounded-lg border border-border bg-card px-3 text-sm"
+        className="mt-1 min-h-10 w-full rounded-lg border border-border bg-surface px-3 text-sm"
       />
       <div className="mt-2 flex flex-wrap gap-2">
         <Pill active={useStem} onClick={() => setUseStem((v) => !v)}>Stemming</Pill>
         <Pill active={fuzzy} onClick={() => setFuzzy((v) => !v)}>Fuzzy (typos)</Pill>
         <Pill active={boost} onClick={() => setBoost((v) => !v)}>Title boost ×3</Pill>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">
+      <p className="mt-2 text-xs text-muted">
         Query terms after analysis:{" "}
         {expanded.length === 0
           ? "(none)"
@@ -149,23 +149,23 @@ export function InvertedIndexLab() {
 
       <div className="mt-3 grid gap-3 sm:grid-cols-2">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Results (BM25-style score)</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Results (BM25-style score)</p>
           <ol className="mt-1 space-y-1">
-            {results.length === 0 && <li className="text-sm text-muted-foreground">No matches</li>}
+            {results.length === 0 && <li className="text-sm text-muted">No matches</li>}
             {results.map((r, rank) => (
               <li key={r.id} className={`rounded-md border px-2 py-1 text-sm ${rank === 0 ? "border-good bg-good-soft" : "border-border"}`}>
-                <span className="font-mono text-muted-foreground">{r.score.toFixed(2)}</span> · Doc {r.id}: {docs[r.id - 1].title}
+                <span className="font-mono text-muted">{r.score.toFixed(2)}</span> · Doc {r.id}: {docs[r.id - 1].title}
               </li>
             ))}
           </ol>
         </div>
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Inverted index (term → docs)</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Inverted index (term → docs)</p>
           <ul className="mt-1 flex max-h-56 flex-wrap gap-1 overflow-y-auto">
             {index.map(([term, ids]) => (
               <li
                 key={term}
-                className={`rounded px-1.5 py-0.5 font-mono text-[0.75rem] ${usedTerms.has(term) ? "bg-primary text-primary-foreground" : "bg-muted"}`}
+                className={`rounded px-1.5 py-0.5 font-mono text-[0.75rem] ${usedTerms.has(term) ? "bg-accent text-white dark:text-bg" : "bg-surface-2"}`}
               >
                 {term} → {[...ids].join(",")}
               </li>

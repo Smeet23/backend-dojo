@@ -100,7 +100,7 @@ export function TwelveFactorAudit() {
           return (
             <li key={i} className={`rounded-lg border p-3 text-sm ${tone}`}>
               <p className="mb-2 leading-6">
-                <span className="font-semibold text-muted-foreground">{i + 1}. </span>
+                <span className="font-semibold text-muted">{i + 1}. </span>
                 {f.text}
               </p>
               <select
@@ -110,7 +110,7 @@ export function TwelveFactorAudit() {
                   const v = e.target.value;
                   setPicks((prev) => prev.map((p, k) => (k === i ? v : p)));
                 }}
-                className="min-h-10 w-full rounded-lg border border-border bg-card px-2 sm:w-auto"
+                className="min-h-10 w-full rounded-lg border border-border bg-surface px-2 sm:w-auto"
               >
                 <option value="">Which factor?</option>
                 {FACTORS.map((x) => (
@@ -122,7 +122,7 @@ export function TwelveFactorAudit() {
               {checked && (
                 <p className="mt-2 leading-6">
                   {right ? "Right. " : `It's ${f.answer}. `}
-                  <span className="text-muted-foreground">{f.fix}</span>
+                  <span className="text-muted">{f.fix}</span>
                 </p>
               )}
             </li>
@@ -133,7 +133,7 @@ export function TwelveFactorAudit() {
         <button
           type="button"
           onClick={() => setChecked(true)}
-          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground"
+          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white dark:text-bg"
         >
           Check my audit
         </button>

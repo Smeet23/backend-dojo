@@ -53,19 +53,19 @@ export function NPlusOneCounter() {
 
   return (
     <Widget title="N+1 query counter" hint="A blog homepage lists posts with each author's name. Count the queries your ORM really sends.">
-      <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">How the code loads authors</p>
+      <p className="text-xs font-semibold uppercase tracking-wide text-muted">How the code loads authors</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {STRATEGIES.map((s) => (
           <Pill key={s.id} active={strategy === s.id} onClick={() => setStrategy(s.id)}>{s.label}</Pill>
         ))}
       </div>
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Posts on the page</p>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">Posts on the page</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {SIZES.map((s) => (
           <Pill key={s} active={n === s} onClick={() => setN(s)}>{s}</Pill>
         ))}
       </div>
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cost of one round trip</p>
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">Cost of one round trip</p>
       <div className="mt-1 flex flex-wrap gap-2">
         {COSTS.map((c) => (
           <Pill key={c.ms} active={cost === c.ms} onClick={() => setCost(c.ms)}>{c.label}</Pill>
@@ -73,21 +73,21 @@ export function NPlusOneCounter() {
       </div>
 
       <div className="mt-4 grid grid-cols-2 gap-2 text-sm">
-        <div className="rounded-lg bg-muted p-2">
-          <p className="text-xs text-muted-foreground">Queries sent</p>
+        <div className="rounded-lg bg-surface-2 p-2">
+          <p className="text-xs text-muted">Queries sent</p>
           <p className="font-mono text-lg">{queries.toLocaleString("en-US")}</p>
         </div>
         <div className={`rounded-lg p-2 ${tone}`}>
-          <p className="text-xs text-muted-foreground">Time in round trips</p>
+          <p className="text-xs text-muted">Time in round trips</p>
           <p className="font-mono text-lg">{total >= 1000 ? `${(total / 1000).toFixed(1)} s` : `${total} ms`}</p>
         </div>
       </div>
 
-      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">SQL log</p>
-      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-muted p-3 font-mono text-[0.75rem] leading-relaxed">
+      <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-muted">SQL log</p>
+      <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-lg bg-surface-2 p-3 font-mono text-[0.75rem] leading-relaxed">
         {sql.join("\n")}
       </pre>
-      <p className="mt-2 text-xs text-muted-foreground">
+      <p className="mt-2 text-xs text-muted">
         Round-trip time only. Each query also pays parsing, planning and execution, so real numbers are worse.
       </p>
     </Widget>

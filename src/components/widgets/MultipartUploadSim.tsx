@@ -68,8 +68,8 @@ export function tick(statuses: Status[], attempts: number[], concurrency: number
 }
 
 const CELL: Record<Status, string> = {
-  waiting: "bg-muted border-border",
-  flight: "bg-primary/10 border-primary animate-pulse",
+  waiting: "bg-surface-2 border-border",
+  flight: "bg-accent-soft border-accent animate-pulse",
   done: "bg-good-soft border-good",
   failed: "bg-bad-soft border-bad",
 };
@@ -122,11 +122,11 @@ export function MultipartUploadSim() {
     <Widget title="Multipart upload planner" hint="First pick a part-size strategy and see if it fits the 10,000-part cap. Then upload a file part by part.">
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">File</span>
+          <span className="w-20 text-muted">File</span>
           {FILE_SIZES.map((f, i) => <Pill key={f.label} active={fileIdx === i} onClick={() => setFileIdx(i)}>{f.label}</Pill>)}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Part size</span>
+          <span className="w-20 text-muted">Part size</span>
           <Pill active={strategy === "fixed5"} onClick={() => setStrategy("fixed5")}>Fixed 5 MB</Pill>
           <Pill active={strategy === "dynamic16"} onClick={() => setStrategy("dynamic16")}>max(16 MB, size / 10,000)</Pill>
         </div>
@@ -141,7 +141,7 @@ export function MultipartUploadSim() {
       <div className="mt-5 border-t border-border pt-4">
         <p className="text-sm font-medium">Upload simulation: 512 MB file, {SIM_PARTS} parts of {SIM_PART_MB} MB</p>
         <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
-          <span className="w-20 text-muted-foreground">Parallel</span>
+          <span className="w-20 text-muted">Parallel</span>
           {[1, 5].map((c) => <Pill key={c} active={concurrency === c} onClick={() => { setConcurrency(c); reset(); }}>{c} at a time</Pill>)}
           <Pill active={flaky} onClick={() => { setFlaky(!flaky); reset(); }}>{flaky ? "Flaky network: on" : "Flaky network: off"}</Pill>
         </div>
@@ -153,19 +153,19 @@ export function MultipartUploadSim() {
             </div>
           ))}
         </div>
-        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
           <span>grey: waiting</span><span>blue: in flight</span><span>green: done (ETag kept)</span><span>red: failed</span>
         </div>
 
-        <div className="mt-3 h-2 overflow-hidden rounded-full bg-muted">
-          <div className="h-full bg-primary transition-all" style={{ width: `${(done / SIM_PARTS) * 100}%` }} />
+        <div className="mt-3 h-2 overflow-hidden rounded-full bg-surface-2">
+          <div className="h-full bg-accent transition-all" style={{ width: `${(done / SIM_PARTS) * 100}%` }} />
         </div>
-        <p className="mt-1 text-sm text-muted-foreground">
+        <p className="mt-1 text-sm text-muted">
           {done}/{SIM_PARTS} parts · round {rounds} · {sentMb} MB sent for a 512 MB file
         </p>
 
         {log.length > 0 && (
-          <pre className="mt-2 whitespace-pre-wrap break-all rounded-lg bg-muted px-3 py-2 font-mono text-[0.75rem] leading-5">{log.join("\n")}</pre>
+          <pre className="mt-2 whitespace-pre-wrap break-all rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.75rem] leading-5">{log.join("\n")}</pre>
         )}
         {finished && (
           <pre className="mt-2 whitespace-pre-wrap break-all rounded-lg border border-good bg-good-soft px-3 py-2 font-mono text-[0.75rem] leading-5">
@@ -176,7 +176,7 @@ export function MultipartUploadSim() {
         <div className="mt-3 flex flex-wrap gap-2">
           <button type="button" onClick={reset} className="min-h-10 rounded-lg border border-border px-4 text-sm">Reset</button>
           <button type="button" onClick={runAll} disabled={finished} className="min-h-10 rounded-lg border border-border px-4 text-sm disabled:opacity-40">Run to end</button>
-          <button type="button" onClick={step} disabled={finished} className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40">
+          <button type="button" onClick={step} disabled={finished} className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg">
             {finished ? "All parts uploaded" : "Next round"}
           </button>
         </div>

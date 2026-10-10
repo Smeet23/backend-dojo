@@ -61,22 +61,22 @@ export function UtilizationCurve() {
         type="button"
         onClick={() => setBurst((b) => !b)}
         aria-pressed={burst}
-        className={`mt-1 min-h-10 w-full rounded-lg border px-3 text-sm font-medium ${burst ? "border-primary bg-primary text-primary-foreground" : "border-border"}`}
+        className={`mt-1 min-h-10 w-full rounded-lg border px-3 text-sm font-medium ${burst ? "border-accent bg-accent text-white dark:text-bg" : "border-border"}`}
       >
         {burst ? "Burst on: +20% traffic (tap to end)" : "Simulate a traffic burst (+20%)"}
       </button>
 
       <div className="mt-3 grid grid-cols-2 gap-2 text-sm sm:grid-cols-3">
-        <div className="rounded-lg bg-muted p-2">
-          <p className="text-xs text-muted-foreground">Utilization now</p>
+        <div className="rounded-lg bg-surface-2 p-2">
+          <p className="text-xs text-muted">Utilization now</p>
           <p className="font-mono text-base">{effective}%</p>
         </div>
-        <div className="rounded-lg bg-muted p-2">
-          <p className="text-xs text-muted-foreground">Avg response time</p>
+        <div className="rounded-lg bg-surface-2 p-2">
+          <p className="text-xs text-muted">Avg response time</p>
           <p className="font-mono text-base">{Math.round(latency)} ms</p>
         </div>
-        <div className="col-span-2 rounded-lg bg-muted p-2 sm:col-span-1">
-          <p className="text-xs text-muted-foreground">Of which is queueing</p>
+        <div className="col-span-2 rounded-lg bg-surface-2 p-2 sm:col-span-1">
+          <p className="text-xs text-muted">Of which is queueing</p>
           <p className="font-mono text-base">{Math.round(latency - SERVICE_MS)} ms</p>
         </div>
       </div>

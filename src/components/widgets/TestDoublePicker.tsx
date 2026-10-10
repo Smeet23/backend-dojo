@@ -72,18 +72,18 @@ export function TestDoublePicker() {
               type="button"
               onClick={() => setI(k)}
               aria-label={`Situation ${k + 1}`}
-              className={`min-h-10 min-w-10 rounded-lg border px-2 ${k === i ? "border-primary font-semibold text-primary" : "border-border"} ${tone}`}
+              className={`min-h-10 min-w-10 rounded-lg border px-2 ${k === i ? "border-accent font-semibold text-accent" : "border-border"} ${tone}`}
             >
               {k + 1}
             </button>
           );
         })}
-        <span className="ml-auto text-muted-foreground">
+        <span className="ml-auto text-muted">
           {score}/{CASES.length} right · {answered} answered
         </span>
       </div>
 
-      <p className="mt-4 rounded-lg bg-muted px-3 py-3 text-sm leading-6">{c.situation}</p>
+      <p className="mt-4 rounded-lg bg-surface-2 px-3 py-3 text-sm leading-6">{c.situation}</p>
 
       <div className="mt-3 flex flex-wrap gap-2">
         {KINDS.map((k) => (
@@ -110,7 +110,7 @@ export function TestDoublePicker() {
         <button
           type="button"
           onClick={() => setI((i + 1) % CASES.length)}
-          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground"
+          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white dark:text-bg"
         >
           Next situation
         </button>

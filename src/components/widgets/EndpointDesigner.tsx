@@ -69,23 +69,23 @@ export function EndpointDesigner() {
     <Widget title="Endpoint designer" hint="Pick a resource and an action. Guess the method and success status, then compare with the conventional design.">
       <div className="space-y-2 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Resource</span>
+          <span className="w-20 text-muted">Resource</span>
           {(Object.keys(SINGULAR) as Resource[]).map((r) => (
             <Pill key={r} active={resource === r} onClick={() => { setResource(r); clear(); }}>{r}</Pill>
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Action</span>
+          <span className="w-20 text-muted">Action</span>
           {actions.map((a) => (
             <Pill key={a.id} active={action === a.id} onClick={() => { setAction(a.id); clear(); }}>{a.label}</Pill>
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Your method</span>
+          <span className="w-20 text-muted">Your method</span>
           {METHODS.map((m) => <Pill key={m} active={method === m} onClick={() => setMethod(m)}>{m}</Pill>)}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-20 text-muted-foreground">Your status</span>
+          <span className="w-20 text-muted">Your status</span>
           {STATUSES.map((s) => <Pill key={s} active={status === s} onClick={() => setStatus(s)}>{s}</Pill>)}
         </div>
       </div>
@@ -96,21 +96,21 @@ export function EndpointDesigner() {
             {d.method} {d.url}
           </p>
           {(method || status) && (
-            <p className="mt-1 text-xs text-muted-foreground">
+            <p className="mt-1 text-xs text-muted">
               You picked {method ?? "–"}{mark(method, d.method)} and {status ?? "–"}{mark(status, d.status)}
             </p>
           )}
           <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Request body</p>
-              <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted p-2 font-mono text-[0.78rem] leading-6">{d.body}</pre>
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted">Request body</p>
+              <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-surface-2 p-2 font-mono text-[0.78rem] leading-6">{d.body}</pre>
             </div>
             <div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Response · {d.status}</p>
-              <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted p-2 font-mono text-[0.78rem] leading-6">{d.response}</pre>
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted">Response · {d.status}</p>
+              <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-surface-2 p-2 font-mono text-[0.78rem] leading-6">{d.response}</pre>
             </div>
           </div>
-          <p className="mt-3 rounded-md bg-primary/10 px-3 py-2">{d.why}</p>
+          <p className="mt-3 rounded-md bg-accent-soft px-3 py-2">{d.why}</p>
         </div>
       ) : (
         <button type="button" onClick={() => setReveal(true)} className="mt-4 min-h-10 w-full rounded-lg border border-border px-4 text-sm">

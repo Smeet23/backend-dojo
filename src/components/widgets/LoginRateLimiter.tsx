@@ -65,7 +65,7 @@ export function LoginRateLimiter() {
           <Pill key={k} active={key === k} onClick={() => setKey(k)}>{SCENARIOS[k].label}</Pill>
         ))}
       </div>
-      <p className="mt-2 text-sm text-muted-foreground">{s.desc}</p>
+      <p className="mt-2 text-sm text-muted">{s.desc}</p>
 
       <div className="mt-4 grid gap-2 sm:grid-cols-3">
         {[
@@ -78,10 +78,10 @@ export function LoginRateLimiter() {
             type="button"
             onClick={() => l.set(!l.on)}
             aria-pressed={l.on}
-            className={`min-h-10 rounded-lg border p-3 text-left text-sm ${l.on ? "border-primary bg-primary/10" : "border-border bg-card"}`}
+            className={`min-h-10 rounded-lg border p-3 text-left text-sm ${l.on ? "border-accent bg-accent-soft" : "border-border bg-surface"}`}
           >
             <span className="block font-semibold">{l.on ? "✓ " : ""}{l.title}</span>
-            <span className="block text-xs text-muted-foreground">{l.rule}</span>
+            <span className="block text-xs text-muted">{l.rule}</span>
             {l.on && l.blocked > 0 && <span className="mt-1 block text-xs">blocks {l.blocked.toLocaleString()} / min</span>}
             {l.on && l.blocked === -1 && <span className="mt-1 block text-xs">{r.tripped ? "tripped" : "not tripped"}</span>}
           </button>

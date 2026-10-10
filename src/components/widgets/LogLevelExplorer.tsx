@@ -28,8 +28,8 @@ const EVENTS: Event[] = [
 ];
 
 const TONE: Record<Level, string> = {
-  debug: "text-muted-foreground",
-  info: "text-primary",
+  debug: "text-muted",
+  info: "text-accent",
   warn: "text-warn",
   error: "text-bad",
   fatal: "text-bad font-bold",
@@ -59,18 +59,18 @@ export function LogLevelExplorer() {
     <Widget title="Log explorer" hint="Change the minimum level and format, then try finding every error for user 81.">
       <div className="space-y-3 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted-foreground">Min level</span>
+          <span className="w-24 text-muted">Min level</span>
           {LEVELS.map((l) => (
             <Pill key={l} active={min === l} onClick={() => setMin(l)}>{l.toUpperCase()}</Pill>
           ))}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted-foreground">Format</span>
+          <span className="w-24 text-muted">Format</span>
           <Pill active={format === "console"} onClick={() => setFormat("console")}>Console (dev)</Pill>
           <Pill active={format === "json"} onClick={() => setFormat("json")}>JSON (prod)</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted-foreground">Search</span>
+          <span className="w-24 text-muted">Search</span>
           <Pill active={query === "none"} onClick={() => setQuery("none")}>Show all</Pill>
           <Pill active={query === "user81"} onClick={() => setQuery("user81")}>Errors for user 81</Pill>
         </div>
@@ -93,14 +93,14 @@ export function LogLevelExplorer() {
         </div>
       )}
 
-      <div className="mt-3 rounded-lg border border-border bg-muted p-3">
-        {found.length === 0 && <p className="text-sm text-muted-foreground">No lines.</p>}
+      <div className="mt-3 rounded-lg border border-border bg-surface-2 p-3">
+        {found.length === 0 && <p className="text-sm text-muted">No lines.</p>}
         <ul className="space-y-1.5">
           {found.map((e, i) => (
             <li key={i} className="font-mono text-[0.75rem] leading-5">
               {format === "console" ? (
                 <span className="whitespace-pre-wrap break-all">
-                  <span className="text-muted-foreground">{e.ts} </span>
+                  <span className="text-muted">{e.ts} </span>
                   <span className={TONE[e.level]}>{e.level.toUpperCase().padEnd(5)} </span>
                   {e.text}
                 </span>
@@ -113,7 +113,7 @@ export function LogLevelExplorer() {
           ))}
         </ul>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">
+      <p className="mt-2 text-xs text-muted">
         {visible.length} of {EVENTS.length} events pass the {min.toUpperCase()} threshold.
         {min === "info" && " This is the usual production setting: DEBUG noise is gone, business events stay."}
         {min === "debug" && " Everything is printed, which is what you want on a laptop."}

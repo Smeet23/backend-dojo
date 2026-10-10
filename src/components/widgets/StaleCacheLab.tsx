@@ -92,23 +92,23 @@ export function StaleCacheLab() {
       </div>
 
       <div className="mt-3 grid grid-cols-3 gap-2 text-sm">
-        <div className="rounded-lg bg-muted p-2">
-          <p className="text-xs text-muted-foreground">Database</p>
+        <div className="rounded-lg bg-surface-2 p-2">
+          <p className="text-xs text-muted">Database</p>
           <p className="font-mono">${s.db}</p>
         </div>
-        <div className={`rounded-lg p-2 ${stale ? "bg-bad-soft" : cacheLive ? "bg-good-soft" : "bg-muted"}`}>
-          <p className="text-xs text-muted-foreground">Cache</p>
+        <div className={`rounded-lg p-2 ${stale ? "bg-bad-soft" : cacheLive ? "bg-good-soft" : "bg-surface-2"}`}>
+          <p className="text-xs text-muted">Cache</p>
           <p className="font-mono">{cacheLive ? `$${cacheLive.price}` : "empty"}</p>
-          {cacheLive && <p className="text-[0.7rem] text-muted-foreground">{cacheLive.expiresAt - s.minute} min left</p>}
+          {cacheLive && <p className="text-[0.7rem] text-muted">{cacheLive.expiresAt - s.minute} min left</p>}
         </div>
-        <div className="rounded-lg bg-muted p-2">
-          <p className="text-xs text-muted-foreground">Clock</p>
+        <div className="rounded-lg bg-surface-2 p-2">
+          <p className="text-xs text-muted">Clock</p>
           <p className="font-mono">{s.minute} min</p>
         </div>
       </div>
 
       <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
-        <button type="button" onClick={read} className="min-h-10 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground">
+        <button type="button" onClick={read} className="min-h-10 rounded-lg bg-accent px-3 text-sm font-medium text-white dark:text-bg">
           Shopper reads price
         </button>
         <button type="button" onClick={adminUpdate} className="min-h-10 rounded-lg border border-border px-3 text-sm">
@@ -119,7 +119,7 @@ export function StaleCacheLab() {
         </button>
       </div>
 
-      <p className="mt-2 text-xs text-muted-foreground">
+      <p className="mt-2 text-xs text-muted">
         DB reads: {s.dbReads} · cache writes: {s.cacheWrites} · stale responses served: <span className={s.staleServed ? "font-semibold text-bad" : ""}>{s.staleServed}</span>
       </p>
       <button type="button" onClick={() => setS(START)} className="mt-2 min-h-10 rounded-lg border border-border px-3 text-sm">
@@ -130,7 +130,7 @@ export function StaleCacheLab() {
         {s.log.map((l, i) => (
           <li
             key={`${s.log.length}-${i}-${l.text}`}
-            className={`rounded px-2 py-1 font-mono text-[0.72rem] break-all ${l.tone === "good" ? "bg-good-soft" : l.tone === "warn" ? "bg-warn-soft" : l.tone === "bad" ? "bg-bad-soft" : "bg-muted"}`}
+            className={`rounded px-2 py-1 font-mono text-[0.72rem] break-all ${l.tone === "good" ? "bg-good-soft" : l.tone === "warn" ? "bg-warn-soft" : l.tone === "bad" ? "bg-bad-soft" : "bg-surface-2"}`}
           >
             {l.text}
           </li>

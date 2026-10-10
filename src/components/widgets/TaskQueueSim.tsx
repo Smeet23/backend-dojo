@@ -85,7 +85,7 @@ export function TaskQueueSim() {
   function status(task: Task) {
     if (task.hiddenUntil !== undefined) return { text: `in flight, hidden until t=${task.hiddenUntil}`, cls: "border-bad bg-bad-soft" };
     if (task.readyAt > clock) return { text: `retry at t=${task.readyAt}`, cls: "border-warn bg-warn-soft" };
-    return { text: "ready", cls: "border-border bg-muted" };
+    return { text: "ready", cls: "border-border bg-surface-2" };
   }
 
   return (
@@ -104,21 +104,21 @@ export function TaskQueueSim() {
         <button type="button" onClick={enqueue} className="min-h-10 flex-1 rounded-lg border border-border px-3 text-sm">
           Sign up a user
         </button>
-        <button type="button" onClick={tick} className="min-h-10 flex-1 rounded-lg bg-primary px-3 text-sm font-medium text-primary-foreground">
+        <button type="button" onClick={tick} className="min-h-10 flex-1 rounded-lg bg-accent px-3 text-sm font-medium text-white dark:text-bg">
           Step 1 minute
         </button>
         <button type="button" onClick={reset} className="min-h-10 rounded-lg border border-border px-3 text-sm">
           Reset
         </button>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">
+      <p className="mt-2 text-xs text-muted">
         Clock: t={clock} min · max retries {MAX_RETRIES} · backoff 1, 2, 4 min · visibility timeout {VISIBILITY_TIMEOUT} min
       </p>
       <div className="mt-3 grid gap-3 sm:grid-cols-3">
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Queue</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Queue</p>
           <ul className="mt-1 space-y-1">
-            {queue.length === 0 && <li className="text-sm text-muted-foreground">(empty)</li>}
+            {queue.length === 0 && <li className="text-sm text-muted">(empty)</li>}
             {queue.map((task) => {
               const s = status(task);
               return (
@@ -130,12 +130,12 @@ export function TaskQueueSim() {
           </ul>
         </div>
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Delivered</p>
-          <p className="mt-1 text-sm">{done.length === 0 ? <span className="text-muted-foreground">(none)</span> : done.map((id) => `#${id}`).join(", ")}</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Delivered</p>
+          <p className="mt-1 text-sm">{done.length === 0 ? <span className="text-muted">(none)</span> : done.map((id) => `#${id}`).join(", ")}</p>
         </div>
         <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Dead-letter queue</p>
-          <p className="mt-1 text-sm">{dlq.length === 0 ? <span className="text-muted-foreground">(none)</span> : dlq.map((id) => `#${id}`).join(", ")}</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Dead-letter queue</p>
+          <p className="mt-1 text-sm">{dlq.length === 0 ? <span className="text-muted">(none)</span> : dlq.map((id) => `#${id}`).join(", ")}</p>
         </div>
       </div>
       <ol className="mt-3 space-y-1">
@@ -143,10 +143,10 @@ export function TaskQueueSim() {
           <li
             key={`${log.length - i}-${line.t}`}
             className={`rounded-md px-2 py-1 text-[0.8rem] ${
-              line.tone === "good" ? "bg-good-soft" : line.tone === "warn" ? "bg-warn-soft" : line.tone === "bad" ? "bg-bad-soft" : "bg-muted"
+              line.tone === "good" ? "bg-good-soft" : line.tone === "warn" ? "bg-warn-soft" : line.tone === "bad" ? "bg-bad-soft" : "bg-surface-2"
             }`}
           >
-            <span className="font-mono text-muted-foreground">t={line.t}</span> {line.text}
+            <span className="font-mono text-muted">t={line.t}</span> {line.text}
           </li>
         ))}
       </ol>

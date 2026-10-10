@@ -82,19 +82,19 @@ export function ErrorHandlerMapper() {
           </Pill>
         ))}
       </div>
-      <p className="mt-3 rounded-lg bg-muted px-3 py-2 font-mono text-[0.8rem] break-all">{c.request}</p>
+      <p className="mt-3 rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.8rem] break-all">{c.request}</p>
 
       <div className="mt-3 flex flex-wrap items-center gap-1 text-sm">
         {LAYERS.map((l, i) => (
           <span key={l} className="flex items-center gap-1">
             <span className={`rounded-md border px-2 py-1 ${l === c.layer ? "border-bad bg-bad-soft font-semibold" : "border-border"}`}>{l}</span>
-            {i < LAYERS.length - 1 && <span className="text-muted-foreground">→</span>}
+            {i < LAYERS.length - 1 && <span className="text-muted">→</span>}
           </span>
         ))}
-        <span className="text-muted-foreground">→ DB</span>
+        <span className="text-muted">→ DB</span>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">Error raised in the {c.layer.toLowerCase()} and bubbled up unchanged:</p>
-      <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-muted px-3 py-2 font-mono text-[0.75rem]">{c.raw}</pre>
+      <p className="mt-2 text-xs text-muted">Error raised in the {c.layer.toLowerCase()} and bubbled up unchanged:</p>
+      <pre className="mt-1 whitespace-pre-wrap break-all rounded-lg bg-surface-2 px-3 py-2 font-mono text-[0.75rem]">{c.raw}</pre>
 
       <div className="mt-3 flex flex-wrap gap-2">
         <Pill active={globalHandler} onClick={() => setGlobalHandler(true)}>Global handler on</Pill>

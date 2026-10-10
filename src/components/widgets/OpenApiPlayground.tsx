@@ -91,15 +91,15 @@ export function OpenApiPlayground() {
       hint="One spec for the move endpoint. Send requests through a spec-driven validator, then rename a field and watch the generated client react."
     >
       <div className="flex flex-wrap items-center gap-2 text-sm">
-        <span className="w-24 text-muted-foreground">Spec field</span>
+        <span className="w-24 text-muted">Spec field</span>
         <Pill active={field === "to"} onClick={() => setField("to")}>to</Pill>
         <Pill active={field === "column"} onClick={() => setField("column")}>renamed to column</Pill>
       </div>
 
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
         <div className="min-w-0">
-          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">openapi.yaml (excerpt)</p>
-          <pre className="overflow-x-auto rounded-lg bg-muted p-3 font-mono text-[0.72rem] leading-5">{specYaml(field)}</pre>
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted">openapi.yaml (excerpt)</p>
+          <pre className="overflow-x-auto rounded-lg bg-surface-2 p-3 font-mono text-[0.72rem] leading-5">{specYaml(field)}</pre>
         </div>
 
         <div className="min-w-0">
@@ -127,8 +127,8 @@ export function OpenApiPlayground() {
             </div>
           ) : (
             <div className="space-y-2 text-sm">
-              <pre className="overflow-x-auto rounded-lg bg-muted p-3 font-mono text-[0.72rem] leading-5">{generatedTs(field)}</pre>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Existing frontend code</p>
+              <pre className="overflow-x-auto rounded-lg bg-surface-2 p-3 font-mono text-[0.72rem] leading-5">{generatedTs(field)}</pre>
+              <p className="text-xs font-semibold uppercase tracking-wide text-muted">Existing frontend code</p>
               <pre className="overflow-x-auto rounded-lg border border-border p-3 font-mono text-[0.72rem] leading-5">
                 {`await client.POST("/api/move", {\n  body: { taskId: 7, to: "done" },\n});`}
               </pre>

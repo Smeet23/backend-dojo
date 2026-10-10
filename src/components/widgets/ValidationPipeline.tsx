@@ -71,19 +71,19 @@ function validate(c: Clean): Issue[] {
 const KIND_STYLE: Record<Kind, string> = {
   required: "bg-bad-soft",
   type: "bg-warn-soft",
-  syntactic: "bg-primary/10",
-  semantic: "bg-muted",
+  syntactic: "bg-accent-soft",
+  semantic: "bg-surface-2",
   complex: "bg-good-soft",
 };
 
 function Field({ label, value, onChange }: { label: string; value: string; onChange: (v: string) => void }) {
   return (
     <label className="block text-sm">
-      <span className="text-muted-foreground">{label}</span>
+      <span className="text-muted">{label}</span>
       <input
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="mt-1 block min-h-10 w-full rounded-lg border border-border bg-card px-3 font-mono text-[0.8rem]"
+        className="mt-1 block min-h-10 w-full rounded-lg border border-border bg-surface px-3 font-mono text-[0.8rem]"
       />
     </label>
   );
@@ -119,17 +119,17 @@ export function ValidationPipeline() {
 
       <div className="mt-3 space-y-2 text-sm">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted-foreground">Shipping</span>
+          <span className="w-24 text-muted">Shipping</span>
           <Pill active={!raw.delivery} onClick={() => setRaw((r) => ({ ...r, delivery: false }))}>pickup</Pill>
           <Pill active={raw.delivery} onClick={() => setRaw((r) => ({ ...r, delivery: true }))}>delivery</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted-foreground">Transform</span>
+          <span className="w-24 text-muted">Transform</span>
           <Pill active={transformOn} onClick={() => setTransformOn(true)}>On (cast + normalize)</Pill>
           <Pill active={!transformOn} onClick={() => setTransformOn(false)}>Off</Pill>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="w-24 text-muted-foreground">Errors</span>
+          <span className="w-24 text-muted">Errors</span>
           <Pill active={allErrors} onClick={() => setAllErrors(true)}>Report all</Pill>
           <Pill active={!allErrors} onClick={() => setAllErrors(false)}>Stop at first</Pill>
         </div>
@@ -137,24 +137,24 @@ export function ValidationPipeline() {
 
       <div className="mt-4 grid gap-3 sm:grid-cols-2">
         <div className="rounded-lg border border-border p-3">
-          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">1 · After transform</p>
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted">1 · After transform</p>
           <pre className="overflow-x-auto whitespace-pre-wrap break-all font-mono text-[0.78rem] leading-6">{JSON.stringify(clean, null, 2)}</pre>
         </div>
         <div className={`rounded-lg border p-3 ${ok ? "border-good bg-good-soft" : "border-bad bg-bad-soft"}`}>
-          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">2 · Validate → response</p>
+          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted">2 · Validate → response</p>
           <p className="font-mono text-sm font-semibold">{ok ? "201 Created" : "400 Bad Request"}</p>
           {ok ? (
             <p className="mt-1 text-sm">Clean data goes to the service layer.</p>
           ) : (
             <ul className="mt-2 space-y-1.5">
               {shown.map((i) => (
-                <li key={i.field + i.kind} className="rounded-md bg-card px-2 py-1.5 text-sm">
+                <li key={i.field + i.kind} className="rounded-md bg-surface px-2 py-1.5 text-sm">
                   <span className={`mr-2 rounded px-1.5 py-0.5 text-xs ${KIND_STYLE[i.kind]}`}>{i.kind}</span>
                   <span className="font-mono text-[0.78rem]">{i.field}</span>: {i.message}
                 </li>
               ))}
               {!allErrors && issues.length > 1 && (
-                <li className="text-xs text-muted-foreground">{issues.length - 1} more problem(s) hidden. The user will find them one resubmit at a time.</li>
+                <li className="text-xs text-muted">{issues.length - 1} more problem(s) hidden. The user will find them one resubmit at a time.</li>
               )}
             </ul>
           )}

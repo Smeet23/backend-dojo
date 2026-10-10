@@ -86,7 +86,7 @@ export function CoverageMutationLab() {
       hint="Business rule: free shipping from 50 (inclusive), +10 outside India. Toggle tests and compare the numbers."
     >
       <div className="grid gap-4 sm:grid-cols-2">
-        <pre className="overflow-x-auto rounded-lg bg-muted p-3 font-mono text-[0.75rem] leading-6">
+        <pre className="overflow-x-auto rounded-lg bg-surface-2 p-3 font-mono text-[0.75rem] leading-6">
           {SOURCE.map((line, idx) => {
             const exec = EXEC_LINES.includes(idx);
             const ran = ranLines.has(idx);
@@ -100,7 +100,7 @@ export function CoverageMutationLab() {
         </pre>
 
         <div className="space-y-2 text-sm">
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Test suite</p>
+          <p className="text-xs font-semibold uppercase tracking-wide text-muted">Test suite</p>
           {TESTS.map((t) => (
             <label key={t.id} className="flex min-h-10 cursor-pointer items-start gap-2 rounded-lg border border-border px-2 py-2">
               <input
@@ -142,7 +142,7 @@ export function CoverageMutationLab() {
           </li>
         ))}
       </ul>
-      <p className="mt-3 text-sm text-muted-foreground">
+      <p className="mt-3 text-sm text-muted">
         Notice that test A alone reaches 100% line coverage and kills nothing. Mutant M1 is a real bug: an order of exactly 50 gets
         charged. Only the boundary test C catches it.
       </p>
@@ -152,8 +152,8 @@ export function CoverageMutationLab() {
 
 function Stat({ label, value, good }: { label: string; value: string; good: boolean }) {
   return (
-    <div className={`rounded-lg border px-3 py-2 ${good ? "border-good bg-good-soft" : "border-border bg-muted"}`}>
-      <p className="text-xs text-muted-foreground">{label}</p>
+    <div className={`rounded-lg border px-3 py-2 ${good ? "border-good bg-good-soft" : "border-border bg-surface-2"}`}>
+      <p className="text-xs text-muted">{label}</p>
       <p className="text-lg font-semibold">{value}</p>
     </div>
   );

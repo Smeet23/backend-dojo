@@ -85,7 +85,7 @@ export function deployPhases(strategy: Strategy, buggy: boolean): Phase[] {
 
 function podClass(p: Pod) {
   const base = "flex h-10 w-10 items-center justify-center rounded-md border text-xs font-semibold";
-  const color = p.v === 1 ? "border-border bg-muted" : "border-primary bg-primary/10 text-primary";
+  const color = p.v === 1 ? "border-border bg-surface-2" : "border-accent bg-accent-soft text-accent";
   const state = p.state === "starting" ? "border-dashed opacity-60" : p.state === "stopping" ? "line-through opacity-40" : "";
   return `${base} ${color} ${state}`;
 }
@@ -116,35 +116,35 @@ export function DeployStrategySim() {
       </div>
 
       <div className="mt-4 rounded-lg border border-border p-3">
-        <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Phase {current + 1}/{phases.length} · {phase.label}</p>
+        <p className="text-xs font-semibold uppercase tracking-wide text-muted">Phase {current + 1}/{phases.length} · {phase.label}</p>
         <div className="mt-2 flex flex-wrap gap-2">
           {phase.pods.map((p, i) => (
             <div key={i} className="flex flex-col items-center gap-0.5">
               <span className={podClass(p)}>v{p.v}</span>
-              {p.group && <span className="text-[0.65rem] text-muted-foreground">{p.group}</span>}
+              {p.group && <span className="text-[0.65rem] text-muted">{p.group}</span>}
             </div>
           ))}
         </div>
-        <div className="mt-3 flex h-3 w-full overflow-hidden rounded-full bg-muted" aria-label="Traffic split">
+        <div className="mt-3 flex h-3 w-full overflow-hidden rounded-full bg-surface-2" aria-label="Traffic split">
           <div className="bg-muted" style={{ width: `${phase.v1}%` }} />
-          <div className="bg-primary" style={{ width: `${phase.v2}%` }} />
+          <div className="bg-accent" style={{ width: `${phase.v2}%` }} />
           <div className="bg-bad" style={{ width: `${phase.down}%` }} />
         </div>
-        <p className="mt-1 text-xs text-muted-foreground">Traffic: v1 {phase.v1}% · v2 {phase.v2}%{phase.down > 0 && ` · nobody home ${phase.down}%`}</p>
+        <p className="mt-1 text-xs text-muted">Traffic: v1 {phase.v1}% · v2 {phase.v2}%{phase.down > 0 && ` · nobody home ${phase.down}%`}</p>
         <p className="mt-2 text-sm">{phase.note}</p>
       </div>
 
       <div className="mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-3">
         <div className={`rounded-lg px-3 py-2 ${errors > 0 ? "bg-bad-soft" : "bg-good-soft"}`}>
-          <p className="text-xs text-muted-foreground">Requests failing</p>
+          <p className="text-xs text-muted">Requests failing</p>
           <p className="font-mono">{errors}%</p>
         </div>
-        <div className={`rounded-lg px-3 py-2 ${mixed ? "bg-warn-soft" : "bg-muted"}`}>
-          <p className="text-xs text-muted-foreground">Versions serving</p>
+        <div className={`rounded-lg px-3 py-2 ${mixed ? "bg-warn-soft" : "bg-surface-2"}`}>
+          <p className="text-xs text-muted">Versions serving</p>
           <p className="font-mono">{mixed ? "v1 + v2 mixed" : phase.v2 > 0 ? "v2 only" : phase.v1 > 0 ? "v1 only" : "none"}</p>
         </div>
-        <div className={`rounded-lg px-3 py-2 ${running > BASELINE_PODS + 1 ? "bg-warn-soft" : "bg-muted"}`}>
-          <p className="text-xs text-muted-foreground">Pods running</p>
+        <div className={`rounded-lg px-3 py-2 ${running > BASELINE_PODS + 1 ? "bg-warn-soft" : "bg-surface-2"}`}>
+          <p className="text-xs text-muted">Pods running</p>
           <p className="font-mono">{running} (normal: {BASELINE_PODS})</p>
         </div>
       </div>
@@ -155,7 +155,7 @@ export function DeployStrategySim() {
           type="button"
           onClick={() => setStep(current + 1)}
           disabled={finished}
-          className="min-h-10 flex-1 rounded-lg bg-primary px-4 text-sm font-medium text-primary-foreground disabled:opacity-40"
+          className="min-h-10 flex-1 rounded-lg bg-accent px-4 text-sm font-medium text-white disabled:opacity-40 dark:text-bg"
         >
           {finished ? "Done" : "Next phase"}
         </button>

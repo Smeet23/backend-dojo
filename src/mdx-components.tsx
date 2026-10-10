@@ -13,7 +13,7 @@ const components: MDXComponents = {
   // Wide tables scroll inside their own box instead of the page.
   table: (props) => (
     <div className="not-prose my-6 overflow-x-auto rounded-lg border border-border">
-      <table className="w-full min-w-[32rem] text-sm [&_td]:border-t [&_td]:border-border [&_td]:px-3 [&_td]:py-2 [&_td]:align-top [&_th]:bg-muted [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold" {...props} />
+      <table className="w-full min-w-[32rem] text-sm [&_td]:border-t [&_td]:border-border [&_td]:px-3 [&_td]:py-2 [&_td]:align-top [&_th]:bg-surface-2 [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-semibold" {...props} />
     </div>
   ),
   Callout,
