@@ -144,18 +144,21 @@ export function recordQuizFinished(lectureId: number | null, scorePct: number, q
   record({ type: "quiz", lectureId, scorePct, questionCount });
 }
 
-/** Unlocks this device; returns false for a wrong passcode. */
-export async function unlock(passcode: string): Promise<boolean> {
+export type UnlockResult = { ok: true } | { ok: false; reason: "wrong" } | { ok: false; reason: "locked"; retryAfter: number };
+
+/** Unlocks this device. Wrong passcodes are rate limited by the server (429 + Retry-After). */
+export async function unlock(passcode: string): Promise<UnlockResult> {
   const res = await fetch("/api/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ passcode }),
   });
-  if (res.status === 401) return false;
+  if (res.status === 401) return { ok: false, reason: "wrong" };
+  if (res.status === 429) return { ok: false, reason: "locked", retryAfter: Number(res.headers.get("Retry-After")) || 900 };
   if (!res.ok) throw new Error(`Unlock failed (${res.status})`);
   set({ sync: "loading" });
   await sync();
-  return true;
+  return { ok: true };
 }
 
 export async function lock() {

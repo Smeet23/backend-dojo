@@ -41,6 +41,14 @@ export const questionMisses = pgTable(
   (t) => [check("misses_positive", sql`${t.misses} > 0`)],
 );
 
+/** Failed unlock attempts per key ("ip:<addr>" or "global"), for rate limiting. */
+export const loginAttempts = pgTable("login_attempts", {
+  key: text("key").primaryKey(),
+  failures: integer("failures").notNull(),
+  windowStart: timestamp("window_start", { withTimezone: true }).notNull(),
+  lockedUntil: timestamp("locked_until", { withTimezone: true }),
+});
+
 /** Small key/value settings, e.g. the last lecture opened. */
 export const appState = pgTable("app_state", {
   key: text("key").primaryKey(),

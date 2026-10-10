@@ -18,8 +18,10 @@ export function UnlockForm() {
     setBusy(true);
     setError(null);
     try {
-      if (!(await unlock(passcode))) setError("Wrong passcode.");
-      else setPasscode("");
+      const result = await unlock(passcode);
+      if (result.ok) setPasscode("");
+      else if (result.reason === "wrong") setError("Wrong passcode.");
+      else setError(`Too many wrong attempts. Try again in ${Math.ceil(result.retryAfter / 60)} minute${result.retryAfter > 60 ? "s" : ""}.`);
     } catch {
       setError("Couldn't reach the server. Try again in a moment.");
     } finally {
