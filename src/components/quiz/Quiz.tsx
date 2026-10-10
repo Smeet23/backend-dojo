@@ -6,24 +6,26 @@ import type { Question, Response } from "@/lib/types";
 import { grade } from "@/lib/quiz";
 import { recordAnswer, recordQuizFinished } from "@/lib/progress";
 import { QuestionView, emptyResponse, isComplete } from "./QuestionView";
-import { lectures } from "@/content/lectures";
 
 type Props = {
   questions: Question[];
   /** Set for an end-of-lecture quiz; omitted for mixed practice. */
   lectureId?: number;
+  courseId: string;
+  /** Lecture id -> slug for this course, for "review this section" links. */
+  lectureSlugs: Record<string, string>;
   title: string;
   onRestart?: () => void;
 };
 
 type Result = { question: Question; score: number };
 
-function lessonHref(q: Question) {
-  const lecture = lectures.find((l) => l.id === q.lectures[0]);
-  return lecture ? `/lectures/${lecture.slug}#${q.lessonAnchor}` : "/";
+function lessonHref(courseId: string, slugs: Record<string, string>, q: Question) {
+  const slug = slugs[String(q.lectures[0])];
+  return slug ? `/courses/${courseId}/${slug}#${q.lessonAnchor}` : `/courses/${courseId}`;
 }
 
-export function Quiz({ questions, lectureId, title, onRestart }: Props) {
+export function Quiz({ questions, lectureId, courseId, lectureSlugs, title, onRestart }: Props) {
   const [index, setIndex] = useState(0);
   const [response, setResponse] = useState<Response>(() => emptyResponse(questions[0]));
   const [checked, setChecked] = useState(false);
@@ -41,7 +43,7 @@ export function Quiz({ questions, lectureId, title, onRestart }: Props) {
 
   function next() {
     if (index === questions.length - 1) {
-      recordQuizFinished(lectureId ?? null, percent(results), results.length);
+      recordQuizFinished(courseId, lectureId === undefined ? null : `${courseId}:${lectureId}`, percent(results), results.length);
       setFinished(true);
       return;
     }
@@ -78,7 +80,7 @@ export function Quiz({ questions, lectureId, title, onRestart }: Props) {
                   <p className="line-clamp-2">{q.prompt}</p>
                   <div className="mt-1 flex items-center justify-between gap-2">
                     <span className="text-muted">{Math.round(score * 100)}% correct</span>
-                    <Link href={lessonHref(q)} className="font-medium text-accent">Review section →</Link>
+                    <Link href={lessonHref(courseId, lectureSlugs, q)} className="font-medium text-accent">Review section →</Link>
                   </div>
                 </li>
               ))}
@@ -111,7 +113,7 @@ export function Quiz({ questions, lectureId, title, onRestart }: Props) {
         <div className={`mt-4 rounded-lg px-3 py-3 text-sm ${score === 1 ? "bg-good-soft" : score > 0 ? "bg-warn-soft" : "bg-bad-soft"}`}>
           <p className="font-semibold">{score === 1 ? "✅ Correct" : score > 0 ? `⚠️ Partly right (${Math.round(score * 100)}%)` : "❌ Not quite"}</p>
           <p className="mt-1 leading-relaxed">{question.explanation}</p>
-          <Link href={lessonHref(question)} className="mt-1 inline-block font-medium text-accent">Review this in the lesson →</Link>
+          <Link href={lessonHref(courseId, lectureSlugs, question)} className="mt-1 inline-block font-medium text-accent">Review this in the lesson →</Link>
         </div>
       )}
 

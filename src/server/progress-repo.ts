@@ -15,15 +15,15 @@ export async function getProgress(db: Db): Promise<Progress> {
   const p = emptyProgress();
   for (const l of lessons) p.lessons[l.lectureId] = { visited: l.visited, done: l.done, quizBest: l.quizBest };
   for (const m of misses) p.misses[m.questionId] = m.misses;
-  p.lastLecture = last[0] ? Number(last[0].value) : null;
+  p.lastLecture = last[0]?.value ?? null;
   return p;
 }
 
-function setLastLecture(db: Db, lectureId: number) {
+function setLastLecture(db: Db, lectureKey: string) {
   return db
     .insert(appState)
-    .values({ key: LAST_LECTURE, value: String(lectureId) })
-    .onConflictDoUpdate({ target: appState.key, set: { value: String(lectureId) } });
+    .values({ key: LAST_LECTURE, value: lectureKey })
+    .onConflictDoUpdate({ target: appState.key, set: { value: lectureKey } });
 }
 
 /** Applies events with the same rules as `applyEvents` in progress-model. */
@@ -31,22 +31,23 @@ export async function recordEvents(db: Db, events: ProgressEvent[]): Promise<voi
   // Applied in order: a miss followed by a correct answer must net out.
   for (const e of events) {
     if (e.type === "visit") {
-      const id = String(e.lectureId);
+      const id = e.lectureKey;
       await db
         .insert(lessonProgress)
         .values({ lectureId: id, visited: true })
         .onConflictDoUpdate({ target: lessonProgress.lectureId, set: { visited: true, updatedAt: sql`now()` } });
-      await setLastLecture(db, e.lectureId);
+      await setLastLecture(db, e.lectureKey);
     } else if (e.type === "quiz") {
       await db.insert(quizAttempts).values({
-        lectureId: e.lectureId === null ? null : String(e.lectureId),
+        course: e.course,
+        lectureId: e.lectureKey,
         scorePct: e.scorePct,
         questionCount: e.questionCount,
       });
-      if (e.lectureId !== null) {
+      if (e.lectureKey !== null) {
         await db
           .insert(lessonProgress)
-          .values({ lectureId: String(e.lectureId), visited: true, done: true, quizBest: e.scorePct })
+          .values({ lectureId: e.lectureKey, visited: true, done: true, quizBest: e.scorePct })
           .onConflictDoUpdate({
             target: lessonProgress.lectureId,
             set: {

@@ -4,7 +4,7 @@ import { useSyncExternalStore } from "react";
 import {
   applyEvents,
   emptyProgress,
-  PROGRESS_VERSION,
+  parseProgress,
   type LessonProgress,
   type Progress,
   type ProgressEvent,
@@ -42,8 +42,9 @@ function readCache() {
     const raw = window.localStorage.getItem(KEY);
     dirty = window.localStorage.getItem(DIRTY_KEY) === "1";
     if (!raw) return;
-    const parsed = JSON.parse(raw) as Progress;
-    if (parsed?.version === PROGRESS_VERSION && parsed.lessons && parsed.misses) state = { ...state, progress: parsed };
+    // parseProgress validates the cache and upgrades pre-course snapshots to backend keys.
+    const parsed = parseProgress(JSON.parse(raw));
+    if (parsed) state = { ...state, progress: parsed };
   } catch {
     state = { ...state, storageOk: false };
   }
@@ -130,8 +131,8 @@ function record(...events: ProgressEvent[]) {
   writeCache();
 }
 
-export function markVisited(lectureId: number) {
-  record({ type: "visit", lectureId });
+export function markVisited(lectureKey: string) {
+  record({ type: "visit", lectureKey });
 }
 
 /** One answered question: misses add up, fully correct answers pay one back. */
@@ -139,9 +140,9 @@ export function recordAnswer(questionId: string, score: number) {
   record({ type: "answer", questionId, score });
 }
 
-/** A finished quiz; `lectureId` is null for mixed practice. */
-export function recordQuizFinished(lectureId: number | null, scorePct: number, questionCount: number) {
-  record({ type: "quiz", lectureId, scorePct, questionCount });
+/** A finished quiz; `lectureKey` is null for a course's mixed practice. */
+export function recordQuizFinished(course: string, lectureKey: string | null, scorePct: number, questionCount: number) {
+  record({ type: "quiz", course, lectureKey, scorePct, questionCount });
 }
 
 export type UnlockResult = { ok: true } | { ok: false; reason: "wrong" } | { ok: false; reason: "locked"; retryAfter: number };
@@ -190,6 +191,6 @@ export function useStorageAvailable(): boolean {
   return useStore().storageOk;
 }
 
-export function getLessonProgress(p: Progress, id: number): LessonProgress {
-  return p.lessons[String(id)] ?? { visited: false, done: false, quizBest: null };
+export function getLessonProgress(p: Progress, lectureKey: string): LessonProgress {
+  return p.lessons[lectureKey] ?? { visited: false, done: false, quizBest: null };
 }

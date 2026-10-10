@@ -3,6 +3,7 @@ import Link from "next/link";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { SyncBadge } from "@/components/SyncBadge";
+import { PracticeLink } from "@/components/PracticeLink";
 import { ThemeToggle, themeScript } from "@/components/ThemeToggle";
 
 const geistSans = Geist({
@@ -43,9 +44,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               Backend <span className="text-accent">Dojo</span>
             </Link>
             <div className="flex items-center gap-4">
-              <Link href="/practice" className="text-sm text-muted hover:text-text">
-                Practice
-              </Link>
+              <PracticeLink />
               <SyncBadge />
               <ThemeToggle />
             </div>

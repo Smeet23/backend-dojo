@@ -3,12 +3,12 @@
 import { useEffect } from "react";
 import { markVisited, useStorageAvailable } from "@/lib/progress";
 
-export function VisitTracker({ lectureId }: { lectureId: number }) {
+export function VisitTracker({ lectureKey }: { lectureKey: string }) {
   const storageOk = useStorageAvailable();
 
   useEffect(() => {
-    markVisited(lectureId);
-  }, [lectureId]);
+    markVisited(lectureKey);
+  }, [lectureKey]);
 
   if (storageOk) return null;
   return (

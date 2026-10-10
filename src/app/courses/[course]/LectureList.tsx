@@ -1,19 +1,28 @@
 "use client";
 
 import Link from "next/link";
-import { lectures } from "@/content/lectures";
+import type { Lecture } from "@/lib/types";
 import { getLessonProgress, useProgress } from "@/lib/progress";
 
-export function LectureList() {
+type Props = {
+  courseId: string;
+  lectures: Lecture[];
+  /** This course's question ids, so weak spots are counted per course. */
+  questionIds: string[];
+};
+
+export function LectureList({ courseId, lectures, questionIds }: Props) {
   const progress = useProgress();
-  const last = lectures.find((l) => l.id === progress.lastLecture && l.available);
-  const weak = Object.keys(progress.misses).length;
+  const key = (l: Lecture) => `${courseId}:${l.id}`;
+  const href = (l: Lecture) => `/courses/${courseId}/${l.slug}`;
+  const last = lectures.find((l) => key(l) === progress.lastLecture && l.available);
+  const weak = questionIds.filter((id) => progress.misses[id]).length;
 
   return (
     <>
       {last && (
         <Link
-          href={`/lectures/${last.slug}`}
+          href={href(last)}
           prefetch={true}
           className="mt-6 flex items-center justify-between rounded-xl bg-accent px-4 py-3 text-white dark:text-bg"
         >
@@ -27,7 +36,7 @@ export function LectureList() {
 
       <ol className="mt-6 space-y-3">
         {lectures.map((l) => {
-          const p = getLessonProgress(progress, l.id);
+          const p = getLessonProgress(progress, key(l));
           const status = p.done ? "Done" : p.visited ? "In progress" : l.available ? "Not started" : "Coming soon";
           const badge = p.done
             ? "bg-good-soft text-good"
@@ -52,7 +61,7 @@ export function LectureList() {
           return (
             <li key={l.id}>
               {l.available ? (
-                <Link href={`/lectures/${l.slug}`} prefetch={true} className="block rounded-xl border border-border bg-surface p-4 transition-colors hover:border-accent">
+                <Link href={href(l)} prefetch={true} className="block rounded-xl border border-border bg-surface p-4 transition-colors hover:border-accent">
                   {body}
                 </Link>
               ) : (
@@ -63,7 +72,7 @@ export function LectureList() {
         })}
       </ol>
 
-      <Link href="/practice" className="mt-6 block rounded-xl border border-border bg-surface p-4 hover:border-accent">
+      <Link href={`/courses/${courseId}/practice`} className="mt-6 block rounded-xl border border-border bg-surface p-4 hover:border-accent">
         <span className="font-medium">Mixed practice</span>
         <span className="mt-1 block text-sm text-muted">
           Scenarios from every lecture you&apos;ve finished{weak > 0 ? `, weighted toward your ${weak} weak spot${weak === 1 ? "" : "s"}` : ""}.

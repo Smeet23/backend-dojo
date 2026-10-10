@@ -3,6 +3,13 @@ import createMDX from "@next/mdx";
 
 const nextConfig: NextConfig = {
   pageExtensions: ["ts", "tsx", "md", "mdx"],
+  // Links from before courses existed point at the backend course.
+  async redirects() {
+    return [
+      { source: "/lectures/:slug", destination: "/courses/backend/:slug", permanent: true },
+      { source: "/practice", destination: "/courses/backend/practice", permanent: true },
+    ];
+  },
   // Lets a phone on the same Wi-Fi open the dev server.
   allowedDevOrigins: ["192.168.*.*"],
   cacheComponents: true,

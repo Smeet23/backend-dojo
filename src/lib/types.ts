@@ -45,7 +45,18 @@ export type Lecture = {
   slug: string;
   title: string;
   summary: string;
-  videoUrl: string;
+  /** Source video; null when the lesson was written from the topic alone (e.g. members-only video). */
+  videoUrl: string | null;
   minutes: number;
   available: boolean;
+};
+
+export type Course = {
+  /** URL segment and progress-key prefix, e.g. "backend". */
+  id: string;
+  title: string;
+  summary: string;
+  /** Creator of the source playlist. */
+  author: string;
+  playlistUrl: string;
 };

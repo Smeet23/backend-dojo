@@ -15,6 +15,13 @@
       "when": 1791651328273,
       "tag": "0001_chief_lilith",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791656007831,
+      "tag": "0002_old_silver_samurai",
+      "breakpoints": true
     }
   ]
 }

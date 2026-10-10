@@ -1,7 +1,7 @@
 import { boolean, check, integer, pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
-/** One row per lecture the learner has opened. Lecture ids are text so "21.1" stays exact. */
+/** One row per lecture opened, keyed "<course>:<lectureId>" (e.g. "backend:21.1"). */
 export const lessonProgress = pgTable(
   "lesson_progress",
   {
@@ -19,6 +19,8 @@ export const quizAttempts = pgTable(
   "quiz_attempts",
   {
     id: serial("id").primaryKey(),
+    course: text("course").notNull().default("backend"),
+    /** Lecture key, or null for a mixed-practice round. */
     lectureId: text("lecture_id"),
     scorePct: integer("score_pct").notNull(),
     questionCount: integer("question_count").notNull(),

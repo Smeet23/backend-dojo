@@ -9,14 +9,18 @@ import { Quiz } from "@/components/quiz/Quiz";
 
 const SIZE = 10;
 
-export function MixedPractice({ pool }: { pool: Question[] }) {
+type Props = { pool: Question[]; courseId: string; lectureSlugs: Record<string, string> };
+
+export function MixedPractice({ pool, courseId, lectureSlugs }: Props) {
   const progress = useProgress();
   const [round, setRound] = useState<{ n: number; questions: Question[] } | null>(null);
 
+  // Lessons are keyed "<course>:<id>"; only this course's finished lectures count.
+  const prefix = `${courseId}:`;
   const completed = new Set(
     Object.entries(progress.lessons)
-      .filter(([, l]) => l.done)
-      .map(([id]) => Number(id)),
+      .filter(([key, l]) => l.done && key.startsWith(prefix))
+      .map(([key]) => Number(key.slice(prefix.length))),
   );
   const eligible = eligibleQuestions(pool, completed);
 
@@ -24,7 +28,7 @@ export function MixedPractice({ pool }: { pool: Question[] }) {
     return (
       <div className="rounded-xl border border-border bg-surface p-4 text-sm">
         Finish at least one lecture quiz to unlock mixed practice.{" "}
-        <Link href="/" className="font-medium text-accent">Go to lectures →</Link>
+        <Link href={`/courses/${courseId}`} className="font-medium text-accent">Go to lectures →</Link>
       </div>
     );
   }
@@ -44,5 +48,5 @@ export function MixedPractice({ pool }: { pool: Question[] }) {
     );
   }
 
-  return <Quiz key={round.n} questions={round.questions} title="Mixed practice" onRestart={start} />;
+  return <Quiz key={round.n} questions={round.questions} courseId={courseId} lectureSlugs={lectureSlugs} title="Mixed practice" onRestart={start} />;
 }

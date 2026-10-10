@@ -1,4 +1,12 @@
-import type { Lecture } from "@/lib/types";
+import type { Course, Lecture } from "@/lib/types";
+
+export const course: Course = {
+  id: "backend",
+  title: "Backend from first principles",
+  summary: "HTTP, routing, auth, databases, caching, queues, security, scaling and shipping: the building blocks of every backend.",
+  author: "Sriniously",
+  playlistUrl: "https://www.youtube.com/playlist?list=PLui3EUkuMTPgZcV0QhQrOcwMPcBCcd_Q1",
+};
 
 const yt = (id: string) => `https://www.youtube.com/watch?v=${id}`;
 
@@ -35,7 +43,3 @@ export const lectures: Lecture[] = [
   { id: 29, slug: "webhooks", title: "Webhooks", summary: "How servers call you: delivery, signatures, retries and idempotency.", videoUrl: yt("eWM0CVReP04"), minutes: 56, available: true },
   { id: 30, slug: "devops", title: "DevOps for backend engineers", summary: "Containers, CI/CD, deployments and running services in production.", videoUrl: yt("_E8X5RIJfQ4"), minutes: 108, available: true },
 ];
-
-export function getLecture(slug: string): Lecture | undefined {
-  return lectures.find((l) => l.slug === slug);
-}
