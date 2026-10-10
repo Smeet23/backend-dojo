@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq, lte, sql } from "drizzle-orm";
 import type { Db } from "@/db";
 import { appState, lessonProgress, questionMisses, quizAttempts } from "@/db/schema";
 import { emptyProgress, mergeProgress, type Progress, type ProgressEvent } from "@/lib/progress-model";
@@ -66,14 +66,14 @@ export async function recordEvents(db: Db, events: ProgressEvent[]): Promise<voi
           set: { misses: sql`${questionMisses.misses} + 1`, updatedAt: sql`now()` },
         });
     } else {
-      // A fully correct answer pays one miss back; rows at zero are removed.
-      await db.execute(sql`
-        with paid as (
-          update ${questionMisses} set misses = misses - 1, updated_at = now()
-          where question_id = ${e.questionId} returning question_id, misses
-        )
-        delete from ${questionMisses} where question_id in (select question_id from paid where misses = 0)
-      `);
+      // A fully correct answer pays one miss back. Delete at 1 instead of updating to 0,
+      // so the row never violates the misses > 0 check.
+      const byId = eq(questionMisses.questionId, e.questionId);
+      await db.delete(questionMisses).where(and(byId, lte(questionMisses.misses, 1)));
+      await db
+        .update(questionMisses)
+        .set({ misses: sql`${questionMisses.misses} - 1`, updatedAt: sql`now()` })
+        .where(byId);
     }
   }
 }
