@@ -1,0 +1,253 @@
+## Why HTTP matters
+
+Almost every backend you'll build talks HTTP. A browser loading a page, a mobile app fetching a feed, one microservice calling another: they're all HTTP messages going back and forth. Learn HTTP well and most backend topics (auth, caching, APIs, security) become variations on things you already understand.
+
+This lesson stays at the **application layer**, the part you control as a backend engineer. Networking details like TCP handshakes get a quick mention, and then we move on.
+
+## Statelessness
+
+HTTP is **stateless**: the server keeps no memory of earlier requests. Every request is treated as brand new.
+
+That means each request must be **self-contained**: it carries everything the server needs to handle it, such as the URL, the method, headers and credentials. If a user is logged in, their token or cookie travels with **every single request**, because the server doesn't "remember" them between calls.
+
+Why design it this way?
+
+- **Simplicity.** The server doesn't have to store and manage per-client sessions.
+- **Scalability.** Any server behind a load balancer can handle any request, because no single machine holds a client's state.
+- **Resilience.** If a server crashes, there's no in-memory session to lose or restore.
+
+<Callout kind="remember">
+Real apps clearly *need* state ("who is logged in?", "what's in my cart?"). We add it **on top of** HTTP with cookies, sessions and tokens. HTTP itself stays stateless.
+</Callout>
+
+## Client and server
+
+HTTP follows a strict **client–server** model:
+
+- The **client** (browser, mobile app, another service) **always starts** the conversation by sending a request.
+- The **server** hosts resources (pages, APIs, files), waits for requests, processes them and sends a response.
+
+The server never "calls" the client out of the blue over plain HTTP. When you need the server to push data, you reach for other tools (WebSockets, SSE, webhooks), which come up in later lectures.
+
+<Callout kind="tip">
+For this whole lesson you can treat **HTTP and HTTPS as the same thing**. HTTPS is HTTP wrapped in encryption (TLS); the request/response model is identical.
+</Callout>
+
+## Under the hood: TCP and HTTP versions
+
+Before messages can flow, client and server need a connection. HTTP only requires a **reliable** transport, one that doesn't silently lose messages. Of the two common internet transports, **TCP** is the reliable one (UDP is not), so classic HTTP runs on TCP. TCP opens a connection with a short **three-way handshake**.
+
+HTTP has evolved mainly to use connections more efficiently:
+
+| Version | What changed |
+|---|---|
+| HTTP/1.0 | A **new TCP connection for every request**. Slow, because every request pays the setup cost. |
+| HTTP/1.1 | **Persistent connections**: many requests reuse one connection. Also added chunked transfer and better caching. Still very common. |
+| HTTP/2 | **Multiplexing**: many requests in flight at once on one connection. Binary framing, header compression (HPACK), server push. |
+| HTTP/3 | Runs on **QUIC over UDP**. Faster setup, better on lossy networks, and no head-of-line blocking (one slow packet no longer stalls everything). |
+
+For backend work, the takeaway is simple: **a connection is established, then messages flow over it.**
+
+## Anatomy of a message
+
+Every HTTP message has the same shape:
+
+1. A **start line**: for requests, the *method, path and version*; for responses, the *version and status code*.
+2. **Headers**: `Key: value` pairs, one per line.
+3. A **blank line**, marking the end of the headers.
+4. An optional **body**: the actual data.
+
+<MessageAnatomy />
+
+## Headers
+
+Headers are **metadata about the message**, kept separate from the body.
+
+Think of a parcel. The address, phone number and PIN code are written **on the outside of the box**, so every courier handling it can route it without opening it. Headers do the same job: proxies, load balancers, browsers and servers can read them and act without parsing the body.
+
+Headers fall into a few families:
+
+| Family | What it describes | Examples |
+|---|---|---|
+| **Request headers** | The client and what it wants | `User-Agent`, `Authorization`, `Accept` |
+| **General headers** | The message itself (requests and responses) | `Date`, `Cache-Control`, `Connection` |
+| **Representation headers** | The body | `Content-Type`, `Content-Length`, `Content-Encoding`, `ETag` |
+| **Security headers** | How the browser should behave safely | `Strict-Transport-Security`, `Content-Security-Policy`, `X-Frame-Options`, `X-Content-Type-Options`, `Set-Cookie` with `HttpOnly; Secure` |
+
+What each security header protects against:
+
+- **HSTS** forces HTTPS only, which stops protocol-downgrade attacks.
+- **CSP** limits where scripts, styles and images may load from, which defends against XSS.
+- **X-Frame-Options** prevents your page being embedded in an iframe, which defends against clickjacking.
+- **X-Content-Type-Options: nosniff** stops the browser guessing a file's type, which defends against MIME sniffing.
+- **HttpOnly** cookies can't be read by JavaScript, and **Secure** cookies are only sent over HTTPS.
+
+Two ideas make headers powerful:
+
+- **Extensibility.** You can add new headers, including custom ones like `X-Request-Id`, without changing the protocol.
+- **Remote control.** The client can steer the server's behaviour: "send me JSON" (`Accept`), "in Spanish" (`Accept-Language`), "here's who I am" (`Authorization`). The server, in turn, controls the client's cache (`Cache-Control`).
+
+## Methods
+
+The method states the request's **intent**.
+
+| Method | Intent | Has a body? |
+|---|---|---|
+| `GET` | Read data. Must not change anything on the server. | No |
+| `POST` | Create something new | Yes |
+| `PATCH` | Update **part** of a resource (e.g. only the name) | Yes |
+| `PUT` | **Replace** the whole resource with what you send | Yes |
+| `DELETE` | Remove a resource | Usually no |
+| `OPTIONS` | Ask the server what it allows (used by CORS preflight) | No |
+
+<Callout kind="tip">
+**PATCH vs PUT:** PATCH changes only the fields you send; PUT replaces the entire resource. People often use PUT where they mean PATCH. Default to **PATCH** unless you really need full replacement.
+</Callout>
+
+## Idempotency
+
+A method is **idempotent** if sending the same request once or ten times leaves the server in the **same state**.
+
+- `GET` is idempotent: reading changes nothing.
+- `PUT` is idempotent: replacing with the same data again gives the same result.
+- `DELETE` is idempotent: once it's gone, it stays gone (a repeat may return `404`, but the *state* is the same).
+- `POST` is **not** idempotent: each call creates **another** resource.
+
+That's why a double-clicked "Create" button can create two notes, and why retries on POST need care (for example a unique constraint, or an idempotency key).
+
+<IdempotencyLab />
+
+## CORS
+
+Browsers enforce the **same-origin policy**: by default, JavaScript on one origin can't read responses from another. An origin is **scheme + host + port**, so `localhost:5173` and `localhost:3000` are *different origins*, and so are `app.notes.dev` and `api.notes.dev`.
+
+**CORS** (Cross-Origin Resource Sharing) is how a **server opts in** to letting other origins read its responses. The browser enforces it; servers declare the rules through headers.
+
+### Simple requests
+
+For a "simple" cross-origin request:
+
+1. The browser adds an `Origin` header automatically.
+2. The server answers. If it allows that origin, it includes `Access-Control-Allow-Origin: <origin>` (or `*`).
+3. The browser checks the response. If the header matches, your JavaScript gets the response. If it's **missing**, the browser **blocks** it and you see a CORS error.
+
+<Callout kind="warn">
+In a blocked simple request, the **server still received and processed** the request. CORS protects *reading the response* in the browser; it's not a firewall.
+</Callout>
+
+### Preflighted requests
+
+The browser sends an extra `OPTIONS` **preflight** first if the cross-origin request has **any** of:
+
+- a method other than `GET`, `POST` or `HEAD` (e.g. `PUT`, `DELETE`)
+- a non-simple header (e.g. `Authorization`, custom headers)
+- a `Content-Type` other than `text/plain`, `application/x-www-form-urlencoded` or `multipart/form-data`
+
+That third rule means **almost every JSON API call is preflighted**.
+
+The preflight asks: "will you accept this method and these headers from my origin?" The server answers `204 No Content` with:
+
+- `Access-Control-Allow-Origin`: which origin may call
+- `Access-Control-Allow-Methods`: which methods are allowed
+- `Access-Control-Allow-Headers`: which non-simple headers are allowed
+- `Access-Control-Max-Age`: how long the browser may cache this answer, so it doesn't preflight every time
+
+If everything checks out, the browser sends the **real request**.
+
+<CorsFlow />
+
+## Status codes
+
+A status code tells the client what happened **without reading the body**. Because they're standard, every client in every language can react the same way, e.g. "401 → send the user to login", "400 → show form errors".
+
+| Range | Meaning |
+|---|---|
+| 1xx | Informational |
+| 2xx | Success |
+| 3xx | Redirection |
+| 4xx | **Client** did something wrong |
+| 5xx | **Server** failed |
+
+The pairs people mix up most often:
+
+- **401 vs 403.** `401 Unauthorized` means "I don't know who you are" (missing, expired or invalid credentials). `403 Forbidden` means "I know who you are, and you're not allowed".
+- **400 vs 409.** `400` means the data itself is invalid. `409 Conflict` means the data is fine but clashes with existing state (e.g. a duplicate unique name).
+- **301 vs 302.** `301` means moved forever, so update your links. `302` means go elsewhere for now, but keep the original URL.
+- **502 vs 504.** Both come from a **proxy** such as Nginx. `502` means the upstream sent back garbage; `504` means the upstream didn't answer in time.
+
+<StatusCodeFinder />
+
+<Callout kind="warn">
+On a `500`, return a generic message. Never send stack traces or internals to the client; log them on the server instead.
+</Callout>
+
+## Caching
+
+HTTP caching lets clients **reuse** earlier responses, which means fewer bytes, faster pages and less server load.
+
+The server sends hints with the first response:
+
+- `Cache-Control: max-age=10`: the copy is fresh for 10 seconds.
+- `ETag: "abc123"`: a fingerprint (usually a hash) of this version of the resource.
+- `Last-Modified: <date>`: when the resource last changed.
+
+Later, the browser asks **conditionally**:
+
+- `If-None-Match: "abc123"`: "only send it if the ETag changed"
+- `If-Modified-Since: <date>`: "only send it if it changed after this"
+
+If nothing changed, the server replies **`304 Not Modified` with no body** and the browser uses its cached copy. If it did change, the server sends `200` with the new body and a new ETag.
+
+<CacheFlow />
+
+<Callout kind="tip">
+Hand-managing ETags is error-prone: forget to update one and clients keep showing stale data. Many frontends now handle caching on the client side instead (e.g. React Query). HTTP caching is still great for simple, static or public resources.
+</Callout>
+
+## Content negotiation and compression
+
+**Content negotiation** is how client and server agree on the best representation of a resource. The client states its preferences, and the server picks the best match or falls back to a default.
+
+| Negotiate | Client sends | Example |
+|---|---|---|
+| Format | `Accept` | `application/json`, `application/xml` |
+| Language | `Accept-Language` | `en`, `es` |
+| Compression | `Accept-Encoding` | `gzip`, `br`, `zstd` |
+
+**Compression** is negotiated the same way. If the client says `Accept-Encoding: gzip`, the server can compress the body and mark it with `Content-Encoding: gzip`, and the browser decompresses it transparently. A large JSON payload can shrink from tens of megabytes to a few, so compression is one of the cheapest performance wins there is.
+
+## Persistent connections
+
+Opening a TCP connection is expensive, so since HTTP/1.1 connections are **persistent by default**: many request/response pairs reuse the same connection.
+
+- `Connection: keep-alive` explicitly asks to keep it open, optionally with a timeout and a max request count.
+- `Connection: close` closes it after the response, which was the HTTP/1.0 behaviour.
+
+You'll rarely touch these yourself, because the defaults are sensible.
+
+## Large uploads and downloads
+
+**Uploading files (client → server): multipart.** Use `Content-Type: multipart/form-data; boundary=XYZ`. The body is split into **parts** (form fields and file bytes), separated by the **boundary** string. The server reads the parts and reassembles the file.
+
+**Sending large responses (server → client): streaming.** Instead of building one giant response, the server sends it in **chunks** over an open connection. One common setup is `Content-Type: text/event-stream` (Server-Sent Events) plus `Connection: keep-alive`, with the client appending each chunk as it arrives.
+
+## SSL, TLS and HTTPS
+
+- **SSL** was the original protocol for encrypting traffic between client and server. It's now **obsolete** because of security flaws.
+- **TLS** is its modern successor. It encrypts data in transit, uses **certificates** to prove the server's identity, and prevents eavesdropping and tampering. **TLS 1.3** is the current recommended version.
+- **HTTPS** is simply **HTTP over TLS**.
+
+At the application level, that's all you need: use HTTPS everywhere, and let your platform or proxy handle the certificates.
+
+## Cheat sheet
+
+- HTTP is **stateless**: credentials go on every request.
+- The **client always starts** the conversation.
+- A message is a **start line, headers, a blank line, then the body**.
+- Headers are **metadata**; they're extensible and act as a remote control.
+- **GET** reads, **POST** creates, **PATCH** partially updates, **PUT** replaces, **DELETE** removes.
+- GET, PUT and DELETE are **idempotent**; POST is not.
+- Cross-origin plus a non-simple method, header or content type triggers an **OPTIONS preflight**.
+- **401** means "who are you?"; **403** means "not allowed"; **409** means "conflicts with existing state".
+- **ETag + If-None-Match** returns **304** with no body.
+- Use **multipart** for uploads and **streaming** for big downloads; HTTPS is **HTTP over TLS**.
