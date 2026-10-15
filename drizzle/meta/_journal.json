@@ -22,6 +22,13 @@
       "when": 1791656007831,
       "tag": "0002_old_silver_samurai",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1792057744750,
+      "tag": "0003_strong_war_machine",
+      "breakpoints": true
     }
   ]
 }

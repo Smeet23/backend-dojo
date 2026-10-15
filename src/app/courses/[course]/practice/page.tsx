@@ -4,6 +4,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { courseQuestions, courses, getCourse } from "@/content/catalog";
 import { MixedPractice } from "./MixedPractice";
+import { AiPractice } from "./AiPractice";
 
 export function generateStaticParams() {
   return courses.map((c) => ({ course: c.course.id }));
@@ -37,6 +38,11 @@ async function PracticeContent({ params }: { params: PageProps<"/courses/[course
       <div className="mt-6">
         <MixedPractice pool={courseQuestions(courseId)} courseId={courseId} lectureSlugs={lectureSlugs} />
       </div>
+      <AiPractice
+        courseId={courseId}
+        lectures={content.lectures.filter((l) => l.available).map((l) => ({ id: l.id, title: l.title }))}
+        lectureSlugs={lectureSlugs}
+      />
     </div>
   );
 }

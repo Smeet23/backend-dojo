@@ -1,4 +1,4 @@
-import { boolean, check, integer, pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
+import { boolean, check, date, index, integer, jsonb, pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
 /** One row per lecture opened, keyed "<course>:<lectureId>" (e.g. "backend:21.1"). */
@@ -56,3 +56,39 @@ export const appState = pgTable("app_state", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),
 });
+
+/** AI calls made per day (UTC), to keep usage inside the providers' free tiers. */
+export const aiUsage = pgTable("ai_usage", {
+  day: date("day").primaryKey(),
+  calls: integer("calls").notNull(),
+});
+
+/** Practice questions written by the AI, validated, then kept so they can be replayed. */
+export const aiQuestions = pgTable(
+  "ai_questions",
+  {
+    id: text("id").primaryKey(),
+    course: text("course").notNull(),
+    /** Lecture key, e.g. "backend:13". */
+    lectureId: text("lecture_id").notNull(),
+    /** A Question (see src/lib/types.ts). */
+    question: jsonb("question").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("ai_questions_course_idx").on(t.course, t.createdAt)],
+);
+
+/** Mock-interview scorecards and design reviews, for looking back at later. */
+export const aiReports = pgTable(
+  "ai_reports",
+  {
+    id: serial("id").primaryKey(),
+    kind: text("kind", { enum: ["interview", "review"] }).notNull(),
+    course: text("course").notNull(),
+    title: text("title").notNull(),
+    /** The structured report (see src/lib/ai-schemas.ts). */
+    data: jsonb("data").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("ai_reports_course_idx").on(t.course, t.kind, t.createdAt)],
+);

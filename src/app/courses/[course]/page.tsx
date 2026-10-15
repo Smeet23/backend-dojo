@@ -4,6 +4,7 @@ import Link from "next/link";
 import { notFound } from "next/navigation";
 import { courseQuestions, courses, getCourse } from "@/content/catalog";
 import { LectureList } from "./LectureList";
+import { CourseTools } from "./CourseTools";
 
 export function generateStaticParams() {
   return courses.map((c) => ({ course: c.course.id }));
@@ -44,6 +45,7 @@ async function CourseBody({ courseId }: { courseId: string }) {
         </a>{" "}
         · lessons written for this course
       </p>
+      <CourseTools courseId={course.id} />
       <LectureList courseId={course.id} lectures={lectures} questionIds={courseQuestions(course.id).map((q) => q.id)} />
     </div>
   );

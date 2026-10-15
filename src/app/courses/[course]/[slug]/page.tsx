@@ -5,6 +5,7 @@ import { notFound } from "next/navigation";
 import { courses, getCourse, getLecture } from "@/content/catalog";
 import { LectureQuiz } from "./LectureQuiz";
 import { VisitTracker } from "./VisitTracker";
+import { LessonTutor } from "@/components/ai/LessonTutor";
 
 export function generateStaticParams() {
   return courses.flatMap((c) => c.lectures.filter((l) => l.available).map((l) => ({ course: c.course.id, slug: l.slug })));
@@ -74,6 +75,8 @@ async function LectureBody({ courseId, slug }: { courseId: string; slug: string 
       <div className="lesson prose prose-neutral mt-8 max-w-none prose-headings:tracking-tight prose-h2:mt-12 prose-pre:overflow-x-auto">
         <Lesson />
       </div>
+
+      <LessonTutor courseId={courseId} slug={slug} />
 
       <section id="quiz" className="mt-14 scroll-mt-20">
         <h2 className="mb-1 text-2xl font-semibold tracking-tight">Scenario quiz</h2>

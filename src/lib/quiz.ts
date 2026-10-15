@@ -57,3 +57,35 @@ export function pickWeighted(
   }
   return picked;
 }
+
+/** The correct answer of a question, written out (for the AI grader and the answer-key panel). */
+export function answerKey(q: Question): string {
+  switch (q.type) {
+    case "scenario":
+      return q.fields.map((f) => `${f.label}: ${f.answer}`).join("\n");
+    case "mcq":
+      return q.answer;
+    case "order":
+      return q.steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  }
+}
+
+/** The question as the learner sees it, including its choices. */
+export function questionText(q: Question): string {
+  switch (q.type) {
+    case "scenario":
+      return `${q.prompt}\n\n${q.fields.map((f) => `${f.label} — options: ${f.options.join(" | ")}`).join("\n")}`;
+    case "mcq":
+      return `${q.prompt}\n\nOptions:\n${q.options.map((o) => `- ${o}`).join("\n")}`;
+    case "order":
+      return `${q.prompt}\n\nSteps to put in order:\n${q.steps.map((s) => `- ${s}`).join("\n")}`;
+  }
+}
+
+/** What the learner submitted, written out for reading. */
+export function responseText(q: Question, r: Response): string {
+  if (q.type === "scenario" && r.type === "scenario") return q.fields.map((f, i) => `${f.label}: ${r.values[i] || "(blank)"}`).join("\n");
+  if (q.type === "mcq" && r.type === "mcq") return r.value;
+  if (q.type === "order" && r.type === "order") return r.sequence.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  return "";
+}

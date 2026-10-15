@@ -19,6 +19,10 @@ const nextConfig: NextConfig = {
   },
   // Lets a phone on the same Wi-Fi open the dev server.
   allowedDevOrigins: ["192.168.*.*"],
+  // AI routes read the generated lesson text at runtime to ground their answers.
+  outputFileTracingIncludes: {
+    "/api/ai/**": ["./src/content/generated/lesson-text.json"],
+  },
   cacheComponents: true,
   partialPrefetching: true,
   turbopack: {
