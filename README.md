@@ -12,7 +12,7 @@ Courses: Backend from first principles, System Design, and High Level Design. Se
 
 Locked behind the passcode (`APP_PASSCODE`) and capped at 300 calls a day (`ai_usage` table):
 
-- **Own-words answers**: answer any scenario in your own words; it's graded against the answer key and the lesson.
+- **Explain it**: after each lesson quiz, 3 open questions (why / trade-off / debug), written by the AI once per lesson and saved, then graded against their key points.
 - **Why was I wrong?**: explains your specific mistake after a wrong answer.
 - **Ask about this lesson**: a tutor chat grounded in the lesson you're reading.
 - **New questions**: fresh scenarios aimed at your most-missed topics, validated and saved for replay.

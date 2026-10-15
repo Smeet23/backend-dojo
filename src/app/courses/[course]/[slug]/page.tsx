@@ -6,6 +6,7 @@ import { courses, getCourse, getLecture } from "@/content/catalog";
 import { LectureQuiz } from "./LectureQuiz";
 import { VisitTracker } from "./VisitTracker";
 import { LessonTutor } from "@/components/ai/LessonTutor";
+import { ExplainIt } from "@/components/ai/ExplainIt";
 
 export function generateStaticParams() {
   return courses.flatMap((c) => c.lectures.filter((l) => l.available).map((l) => ({ course: c.course.id, slug: l.slug })));
@@ -83,6 +84,8 @@ async function LectureBody({ courseId, slug }: { courseId: string; slug: string 
         <p className="mb-5 text-sm text-muted">Real situations, engineer-style answers. 80% to pass.</p>
         <LectureQuiz questions={lesson.quiz} courseId={courseId} lectureId={lecture.id} lectureSlugs={lectureSlugs} />
       </section>
+
+      <ExplainIt courseId={courseId} slug={slug} />
     </article>
   );
 }

@@ -22,6 +22,19 @@ export const gradeSchema = z.object({
 });
 export type GradeResult = z.infer<typeof gradeSchema>;
 
+/** Open questions for a lesson's "Explain it" round, written to be answered in prose. */
+export const writtenSetSchema = z.object({
+  questions: z.array(
+    z.object({
+      prompt: z.string().describe("A realistic situation asking the learner to explain why, weigh a trade-off, or debug — not recall a fact"),
+      keyPoints: z.array(z.string()).describe("3-5 points a strong answer must make"),
+      modelAnswer: z.string().describe("A concise answer an experienced engineer would give, 4-8 sentences"),
+      lessonAnchor: z.string().describe("Exactly one of the section ids listed, copied as-is"),
+    }),
+  ),
+});
+export type WrittenQuestion = z.infer<typeof writtenSetSchema>["questions"][number] & { id: string };
+
 /** Flat question shape for generation; converted to a real Question after validation. */
 export const generatedQuestionSchema = z.object({
   type: z.enum(["scenario", "mcq"]),

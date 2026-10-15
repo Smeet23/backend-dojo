@@ -78,6 +78,15 @@ export const aiQuestions = pgTable(
   (t) => [index("ai_questions_course_idx").on(t.course, t.createdAt)],
 );
 
+/** The "Explain it" open questions for a lesson, written by the AI once and then reused. */
+export const writtenQuestions = pgTable("written_questions", {
+  /** "<course>/<slug>". */
+  lesson: text("lesson").primaryKey(),
+  /** WrittenQuestion[] (see src/lib/ai-schemas.ts). */
+  questions: jsonb("questions").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 /** Mock-interview scorecards and design reviews, for looking back at later. */
 export const aiReports = pgTable(
   "ai_reports",
