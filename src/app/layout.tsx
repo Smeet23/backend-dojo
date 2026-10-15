@@ -17,8 +17,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Backend Dojo",
-  description: "Learn backend engineering from first principles through lessons and real-world scenarios.",
+  title: "Grokstack",
+  description: "Understand backend, system design and AI engineering deeply: lessons, interactive widgets and real-world scenarios.",
 };
 
 export const viewport: Viewport = {
@@ -41,7 +41,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         <header className="sticky top-0 z-20 border-b border-border bg-bg/90 backdrop-blur">
           <nav className="mx-auto flex h-14 max-w-3xl items-center justify-between px-4">
             <Link href="/" className="font-semibold tracking-tight">
-              Backend <span className="text-accent">Dojo</span>
+              Grok<span className="text-accent">stack</span>
             </Link>
             <div className="flex items-center gap-4">
               <PracticeLink />

@@ -11,7 +11,7 @@ export function generateStaticParams() {
 
 export async function generateMetadata({ params }: PageProps<"/courses/[course]">): Promise<Metadata> {
   const { course } = await params;
-  return { title: `${getCourse(course)?.course.title ?? "Course"} · Backend Dojo` };
+  return { title: `${getCourse(course)?.course.title ?? "Course"} · Grokstack` };
 }
 
 export default function CoursePage({ params }: PageProps<"/courses/[course]">) {

@@ -20,6 +20,7 @@ export type { LessonProgress, Progress } from "./progress-model";
 
 export type SyncStatus = "loading" | "synced" | "locked" | "offline";
 
+// Keys keep the app's original name so progress already saved in browsers isn't lost.
 const KEY = "backend-dojo:progress";
 const DIRTY_KEY = "backend-dojo:dirty";
 

@@ -13,7 +13,7 @@ export function generateStaticParams() {
 export async function generateMetadata({ params }: PageProps<"/courses/[course]/[slug]">): Promise<Metadata> {
   const { course, slug } = await params;
   const lecture = getLecture(course, slug);
-  return { title: lecture ? `${lecture.id}. ${lecture.title} · Backend Dojo` : "Backend Dojo" };
+  return { title: lecture ? `${lecture.id}. ${lecture.title} · Grokstack` : "Grokstack" };
 }
 
 export default function LecturePage({ params }: PageProps<"/courses/[course]/[slug]">) {

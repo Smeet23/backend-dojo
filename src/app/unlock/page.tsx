@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { UnlockForm } from "./UnlockForm";
 
-export const metadata: Metadata = { title: "Sync · Backend Dojo" };
+export const metadata: Metadata = { title: "Sync · Grokstack" };
 
 export default function UnlockPage() {
   return (

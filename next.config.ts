@@ -6,6 +6,13 @@ const nextConfig: NextConfig = {
   // Links from before courses existed point at the backend course.
   async redirects() {
     return [
+      // The app was renamed from Backend Dojo; old links land on the new domain.
+      {
+        source: "/:path*",
+        has: [{ type: "host", value: "backend-dojo-ashen.vercel.app" }],
+        destination: "https://grokstack.vercel.app/:path*",
+        permanent: true,
+      },
       { source: "/lectures/:slug", destination: "/courses/backend/:slug", permanent: true },
       { source: "/practice", destination: "/courses/backend/practice", permanent: true },
     ];
