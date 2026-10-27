@@ -5,6 +5,7 @@ import { notFound } from "next/navigation";
 import { courseQuestions, courses, getCourse } from "@/content/catalog";
 import { LectureList } from "./LectureList";
 import { CourseTools } from "./CourseTools";
+import { PrivateCourseGate } from "@/components/PrivateCourseGate";
 
 export function generateStaticParams() {
   return courses.map((c) => ({ course: c.course.id }));
@@ -25,8 +26,13 @@ export default function CoursePage({ params }: PageProps<"/courses/[course]">) {
 
 async function CourseContent({ params }: { params: PageProps<"/courses/[course]">["params"] }) {
   const { course: courseId } = await params;
-  if (!getCourse(courseId)) notFound();
-  return <CourseBody courseId={courseId} />;
+  const content = getCourse(courseId);
+  if (!content) notFound();
+  return (
+    <PrivateCourseGate course={content.course}>
+      <CourseBody courseId={courseId} />
+    </PrivateCourseGate>
+  );
 }
 
 /** Depends only on the course id, so it's cached and prefetchable. */
@@ -41,7 +47,7 @@ async function CourseBody({ courseId }: { courseId: string }) {
       <p className="mt-2 text-xs text-muted">
         Based on the{" "}
         <a href={course.playlistUrl} target="_blank" rel="noreferrer" className="underline underline-offset-2">
-          {course.author} playlist
+          {course.author} {course.sourceKind ?? "playlist"}
         </a>{" "}
         · lessons written for this course
       </p>

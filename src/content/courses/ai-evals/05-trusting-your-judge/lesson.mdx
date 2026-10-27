@@ -1,0 +1,250 @@
+import { EvJudgeBiasCorrector } from "@/components/widgets/EvJudgeBiasCorrector";
+import { EvJudgeBootstrapLab } from "@/components/widgets/EvJudgeBootstrapLab";
+
+## Where this lesson picks up
+
+The previous lesson built an LLM judge for one failure mode. A quick recap of the pieces this lesson relies on:
+
+- **Labeled traces** (pass or fail, from your error analysis) are split into **train** (few-shot examples come only from here), **dev** (you tune the prompt against it) and **test** (untouched until the prompt is final).
+- **Pass is the positive class.** **TPR** is the share of human-pass traces the judge also passes. **TNR** is the share of human-fail traces the judge also fails.
+- A judge prompt has four parts: the task and criterion, pass/fail definitions, few-shot examples, and a structured output (a short reasoning, then the verdict).
+
+This lesson answers two questions. How do you actually push a judge's TPR and TNR up? And once the judge is as good as it will get, how do you use an *imperfect* judge to say how often your pipeline really succeeds, with an honest error bar?
+
+The running example is the apartment **leasing assistant**. Its failure mode: **every assistant message must be substantiated** by tool output, earlier messages or metadata. Error analysis found the agent confidently listing availability for a unit no tool had ever returned.
+
+## Refining the judge in practice
+
+### Labels first, and what the judge may see
+
+The labels for this judge came from 100 traces. Hand-labeling all of them was tiring, so the open codes and axial codes written during error analysis were given to a strong model, which turned them into a pass/fail label plus a rationale per trace. Every label was then reviewed by a human, and only about three were flipped. That is the safe kind of automation: the model is translating *your* notes into labels, and you check its work.
+
+Two details matter:
+
+- **The judge prompt must not contain those notes.** In production there are no open codes. The judge gets only what it will have on real traffic: the conversation, the available tools with their parameters, and metadata. Anything else inflates its scores.
+- **The labels were imbalanced**: 84 pass, 16 fail. That is too few failures to measure TNR well. If you can, label more failing traces.
+
+### The loop, as the exercise ran it
+
+The first judge was run on train and dev (test stayed hidden) and printed TPR and TNR for each split:
+
+| Split | What happened | Why |
+|---|---|---|
+| Train | Near perfect, TNR 100% | The few-shot examples come from train, so the judge is partly parroting answers it was shown. Expected, and not evidence of anything. |
+| Dev | TNR above 80%, TPR about 76% | The judge catches failures but calls too many good traces unsubstantiated. |
+
+Low TPR means the judge is **too harsh**, so the traces to read are the **false fails**: ones you labeled pass and the judge failed. There are usually only 20 or so, so read every one. Even the instructors admit to mixing up which errors are which mid-analysis; work a few TPR and TNR examples on paper until "positive means pass" is second nature.
+
+Then refine, in this order of preference:
+
+1. **Improve the definitions.** Ask what the prompt fails to explain. Here, the false fails were messages with descriptive words like "luxury", which the judge treated as factual claims needing a tool result. Spelling out that marketing language is not a factual claim is a principle the judge can generalize.
+2. **Swap few-shot examples**, always drawn from train. Prefer hard, informative boundary cases over obvious ones. If a dev failure shows a pattern train lacks, move a similar trace into train first; never paste dev traces into the prompt.
+3. **Re-measure** on the same dev set, and repeat.
+
+### More examples stop helping
+
+The exercise also tried changing only the number of few-shot examples per class: one, five and eight. Going from five down to one made alignment worse. Going from five up to eight changed almost nothing. In-context learning saturates after a handful of examples, so once you have a few good ones, the remaining gains come from a better specification, not a longer list.
+
+<Callout kind="warn">
+Don't overfit the prompt to its examples. If every fix is "add another example", the judge learns those traces, not the rule. Every few rounds, reread the prompt and ask what principle you are failing to state.
+</Callout>
+
+### Letting an agent propose edits
+
+The last step of the exercise handed the loop to a coding agent: run the script, print the false fails from train and dev with their rationales, reflect on them, propose prompt edits to raise TPR, then rerun. It found the "descriptive qualifiers" pattern and dev TPR rose from 76% to 84%. Dev TNR fell at the same time.
+
+Two lessons come out of that run:
+
+- **It is often a trade.** Making the judge more lenient (higher TPR) usually lets a few more real failures through (lower TNR). Look at both numbers after every change.
+- **Automation is fine, unreviewed automation is not.** Vendor features that auto-align a judge from your labels and prompt optimizers like DSPy run this same loop. They are not magic, and you should review every diff they propose. If a tool hides the prompt or the judge model from you, you cannot debug it when it is wrong.
+
+If the loop stalls, upgrade the judge model, split the failure mode into narrower ones, or label more data. The instructors say 100 labeled traces is a floor and 200 is often what a judge really needs, which is one more reason to do thorough error analysis up front.
+
+### Why track TPR and TNR, not accuracy
+
+LLMs drift to extremes. A judge that always says pass has TPR 100% and TNR 0%; one that always says fail has the reverse. With 84 passes and 16 fails, the always-pass judge scores **84% accuracy** while catching zero failures. Reporting both rates exposes it at once. They also map to the two costs you care about: false passes (failures you never see) and false fails (good traces flagged as broken). Which cost is worse depends on the product, so set a target for each.
+
+### When to stop
+
+- **Target: 80% on each rate, ideally 85% or more.** The book suggests 90% as a goal; in practice, with around 100 labels, 80 to 85% is about the best the instructors reach.
+- **Near 50 to 60% is a coin flip.** Do not report numbers from that judge.
+- **100% on both is a red flag**, not a win. Check for leakage (test or dev traces in the prompt) before believing it.
+
+## Why a judge's raw pass rate is biased
+
+Call the true pass rate of your pipeline on some criterion **θ** (theta). You will never know it exactly, because nobody labels every production trace. The judge is how you estimate it.
+
+The naive estimate: run the judge on 1,000 new traces, it passes 950, so θ is 95%. That number is biased by the judge's own errors. Every trace the judge marks pass is one of two kinds:
+
+```text
+p_obs = TPR × θ          (real passes the judge keeps)
+      + (1 - TNR) × (1 - θ)   (real failures the judge waves through)
+```
+
+A lenient judge (low TNR) adds fake passes, so the raw rate is **too high**. A harsh judge (low TPR) drops real passes, so it is **too low**. The errors only cancel by coincidence.
+
+<Callout kind="remember">
+This is why test-set TPR and TNR are not just a report card. They are the inputs you need to undo the judge's bias on data nobody has labeled.
+</Callout>
+
+## Estimating the true success rate
+
+### Step 1: measure TPR and TNR on the test set
+
+Freeze the judge prompt. Run it **once** on the held-out test set and compare with the human labels. Because you never tuned against the test set, these rates are unbiased estimates of how the judge behaves on new data. (Dev-set rates are optimistic: you hill-climbed on them.)
+
+A balanced test set (say 50 pass, 50 fail) is fine even if failures are rare in production. TPR and TNR are rates *within* each true class, so prevalence does not change them, and balance gives each rate enough traces to be measured.
+
+### Step 2: run the judge on new, unlabeled traces
+
+Run the same judge on a large batch of fresh traces, for example last week's production conversations. Thousands or hundreds of thousands are fine. Let **m** be the number of traces and **k** the number the judge passed. The raw observed rate is **p_obs = k / m**.
+
+### Step 3: correct for the judge's bias
+
+Solve the equation from the previous section for θ (this is the Rogan-Gladen estimator from epidemiology):
+
+```text
+θ̂ = (p_obs + TNR - 1) / (TPR + TNR - 1),   then clip to [0, 1]
+```
+
+Two conditions come with it:
+
+- **TPR + TNR - 1 must be well above 0.** At TPR = TNR = 0.5 the judge is random and the formula divides by zero. Near zero, tiny changes in p_obs swing the estimate wildly.
+- **Clip to [0, 1].** If p_obs is above TPR, or below 1 - TNR, the raw formula leaves the valid range, usually from noise in the measured rates.
+
+### A worked example
+
+The substantiation judge on the leasing assistant:
+
+1. **Test set**: 100 labeled traces, 50 pass and 50 fail. The judge passes 44 of the 50 human passes and fails 41 of the 50 human fails. **TPR = 44/50 = 0.88, TNR = 41/50 = 0.82.**
+2. **New traces**: the judge runs on m = 2,000 production conversations and passes k = 1,520. **p_obs = 1,520 / 2,000 = 0.76.**
+3. **Correct**: numerator 0.76 + 0.82 - 1 = 0.58. Denominator 0.88 + 0.82 - 1 = 0.70. **θ̂ = 0.58 / 0.70 ≈ 0.829.**
+4. **Sanity check**: if θ = 0.829, the judge should pass 0.88 × 0.829 + 0.18 × 0.171 ≈ 0.729 + 0.031 = 0.760 of traces. That matches p_obs.
+
+So the judge says 24% of conversations contain an unsubstantiated claim; the corrected estimate is about 17%. The judge is slightly harsh: it fails 12% of good conversations, and because good conversations are the majority, that outweighs the 18% of failures it lets through.
+
+Flip the errors and the correction flips direction. A lenient judge with TPR 0.95 and TNR 0.70 that reports p_obs = 0.80 gives θ̂ = 0.50 / 0.65 ≈ 0.77, lower than the raw 80%.
+
+<EvJudgeBiasCorrector />
+
+### Step 4: put a confidence interval around it
+
+θ̂ is a point estimate built from TPR and TNR that were measured on only 100 traces. A different 100 would have given slightly different rates, and a different θ̂. A **95% confidence interval** shows that uncertainty. The course uses a **bootstrap**:
+
+1. Resample the N test-set (human label, judge verdict) pairs **with replacement**, keeping N the same.
+2. Recompute TPR* and TNR* on the resample. Skip it if it has no passes or no fails, or if TPR* + TNR* - 1 ≤ 0.
+3. Compute θ* with the **original** p_obs, and clip it.
+4. Repeat B times (10,000 to 20,000 is cheap).
+5. The 2.5th and 97.5th percentiles of the θ* values are the interval.
+
+If the interval is tight and its lower bound is acceptable, you can trust the pipeline's pass rate. If it is wide, you need more test labels or a better judge, not more decimal places.
+
+The bootstrap only resamples the test set, so it captures uncertainty about the judge's accuracy, which is the main source when m is in the thousands. If you judged only a few hundred new traces, sampling noise in p_obs adds a little more on top.
+
+## Python: correction plus bootstrap
+
+```python
+import numpy as np
+
+def correct(p_obs, tpr, tnr):
+    denom = tpr + tnr - 1
+    if denom <= 0:
+        raise ValueError("judge is no better than random; fix it first")
+    return float(np.clip((p_obs + tnr - 1) / denom, 0, 1))
+
+def rates(human, judge):
+    # human, judge: boolean arrays, True = pass
+    return judge[human].mean(), (~judge[~human]).mean()
+
+def estimate_pass_rate(test_human, test_judge, new_judge, B=10_000, seed=0):
+    human = np.asarray(test_human, dtype=bool)
+    judge = np.asarray(test_judge, dtype=bool)
+    p_obs = np.mean(new_judge)                       # step 2
+    theta = correct(p_obs, *rates(human, judge))     # steps 1 and 3
+
+    rng, n, boots = np.random.default_rng(seed), len(human), []
+    for _ in range(B):                               # step 4
+        idx = rng.integers(0, n, n)
+        h, j = human[idx], judge[idx]
+        if h.all() or not h.any():
+            continue                                 # need both classes
+        tpr, tnr = rates(h, j)
+        if tpr + tnr - 1 > 0:
+            boots.append(correct(p_obs, tpr, tnr))
+    lo, hi = np.percentile(boots, [2.5, 97.5])
+    return theta, lo, hi
+```
+
+Feed it the 100 test labels, the judge's 100 test verdicts and the 2,000 production verdicts from the worked example, and it returns θ̂ ≈ 0.83 with a 95% interval of roughly 0.73 to 0.96. That is more than 20 points wide from 100 labels, and lopsided because of the clip at 1: a useful reminder of how much a small test set leaves open.
+
+### judgy: the same thing, packaged
+
+The instructors open-sourced this procedure as **judgy** (`pip install judgy`). It depends only on numpy and is essentially one function: test labels, test predictions and unlabeled predictions in; corrected rate and 95% interval out. Read its source before using it, which takes about a minute.
+
+## What happens if...
+
+The instructors built intuition with simulations: a pipeline whose true pass rate is 80% (unknown in real life), and a judge with chosen TPR and TNR. Try the same experiments here.
+
+<EvJudgeBootstrapLab />
+
+### ...I have few labels but a good judge?
+
+With TPR 0.90 and TNR 0.85 (raw rate 75%, true 80%), the interval shrinks steadily as labels grow: roughly ±14 points around 50 labels, ±9 at 100, ±5 at 400. The returns diminish, and every label costs human time, so **100 labels (50 pass, 50 fail)** is the suggested sweet spot. Notice the raw rate stays biased no matter how many labels you add; labels tighten the interval, only the correction removes the bias. With very few labels, even the corrected estimate can land well away from the truth on a given draw.
+
+### ...my judge is bad at identifying success (low TPR)?
+
+Hold TNR at 100% and drop TPR to 0.60. The judge fails 40% of good traces, so the raw rate sits at 48% when the truth is 80%: badly **under**. The correction brings the center back to about 80%, but the interval is wide (around 30 points at 100 labels). It narrows quickly as TPR improves.
+
+### ...my judge is bad at identifying failures (low TNR)?
+
+Hold TPR at 100% and drop TNR to 0.60. Now 40% of the failures pass, so the raw rate **overshoots** to 88%. The correction again recovers about 80%, and the interval is much tighter (around 10 points). It narrows only a little as TNR improves.
+
+### Why TPR hurts more here
+
+Look at how sensitive θ̂ is to an error in each rate (D = TPR + TNR - 1):
+
+- A small error in TPR moves θ̂ by about **θ / D** times that error.
+- A small error in TNR moves θ̂ by about **(1 - θ) / D** times that error.
+
+When the pipeline mostly succeeds (θ = 0.8), noise in TPR counts four times as much as noise in TNR. The book gives the TNR = 1 special case: the formula becomes θ̂ = p_obs / TPR, and dividing by a small, noisy TPR amplifies every wobble in the bootstrap. The practical rule: **for a pipeline that usually passes, improving TPR narrows the interval the most.** (For a criterion that usually fails, the roles reverse.) Either way, judge errors mostly widen the interval rather than shift the corrected estimate, as long as you correct.
+
+## Group-wise metrics for multiple outputs
+
+Sometimes the pipeline produces several candidates per input: five code completions, a ranked list of suggestions, several retrieved documents. Then you evaluate the group:
+
+| Metric | Question | Example |
+|---|---|---|
+| **Success@k** (Pass@k) | Did at least one of the top k succeed? | 1 of 5 generated functions passes the tests: Pass@5 = 1 |
+| **Precision@k** | What share of the top k are correct? | 3 of 5 proposed API calls are valid: 0.6 |
+| **Recall@k** | What share of all correct items appear in the top k? | 3 of 10 correct answers in the top 3: 0.3 |
+| **Semantic similarity** | How close is each output to a reference, in meaning? | Cosine similarity of embeddings |
+| **Diversity** | Are the outputs too alike? | Average pairwise cosine similarity (lower is more diverse) |
+
+For diversity, choose the pairs deliberately. A daily outfit recommender cares whether today's pick repeats the last seven days, so compare today with each of those seven, not every pair ever produced, which would dilute exactly the near-duplicates you want to catch.
+
+## Pitfalls of automated evaluation
+
+- **Misaligned metrics.** The judge passes while users are unhappy, because TPR and TNR were never measured or the metric misses the failure that matters. Plenty of teams have a bad judge and don't know it.
+- **Overconfidence in scores.** People trust numbers on a dashboard. If the eval says green while the product obviously feels broken, stakeholders stop trusting you and your evals, and that trust is hard to win back. Report judge quality alongside the score, and remember offline datasets never cover all of production.
+- **Evaluator drift.** Swapping in the newest model as the judge, or a provider silently updating it, shifts TPR and TNR in unknown directions. Code evals drift too, when the pipeline's output format changes. And your team's definition of quality evolves. Keep labeling a handful of traces regularly (the book suggests weekly), recompute TPR and TNR, check the interval, and re-align when needed. New failure modes found in production go into all three splits.
+- **Poor judge prompt design.** No few-shot examples (the most common mistake), randomly chosen ones, or one judge asked to grade tone, correctness and formatting in a single pass/fail. Pick examples for the information they carry, and keep one judge per narrow criterion.
+- **Skipping validation, and data leakage.** Assuming the judge "just works" (it can for generic checks like sentiment, rarely for product-specific ones), or reporting dev-set accuracy as the judge's real accuracy, or putting dev or test traces in the prompt. Any trace in the prompt must be out of the evaluation sets.
+- **Reaching for a judge when code would do.** If a deterministic check approximates the criterion well enough, it is cheaper, faster and needs none of this statistics.
+
+## Cheat sheet
+
+- Refine on dev: read every disagreement, fix definitions first, swap few-shot examples from train only, re-measure.
+- Low TPR means the judge is too harsh: read the false fails. Low TNR means too lenient: read the false passes.
+- Few-shot gains saturate after about five examples per class; then only a better specification helps.
+- Raising one rate often lowers the other. Check both after every change; review any automated prompt edits.
+- Track TPR and TNR separately: an always-pass judge can score 84% accuracy with TNR 0%.
+- Aim for 80 to 85%+ on each. 50 to 60% is a coin flip. 100% on both means suspect leakage.
+- A judge's raw pass rate is biased: p_obs = TPR·θ + (1 - TNR)·(1 - θ).
+- Estimate in four steps: test-set TPR/TNR, p_obs = k/m on new traces, θ̂ = (p_obs + TNR - 1)/(TPR + TNR - 1) clipped to [0, 1], bootstrap CI.
+- The correction is only valid when TPR + TNR - 1 is well above zero.
+- Bootstrap: resample test pairs with replacement, recompute TPR*/TNR*/θ*, take the 2.5th and 97.5th percentiles.
+- More labels shrink the interval but never remove bias; about 100 labels (50/50) is the sweet spot.
+- For a mostly-passing pipeline, low TPR widens the interval far more than low TNR.
+- judgy (`pip install judgy`) packages the correction and bootstrap in one numpy function.
+- For multiple outputs, use Success@k, Precision@k, Recall@k, similarity and diversity metrics.
+- Pitfalls: misaligned metrics, dashboard overconfidence, evaluator drift, weak judge prompts, leakage.

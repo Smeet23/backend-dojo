@@ -1,0 +1,329 @@
+import { EvEvaluatorSorter } from "@/components/widgets/EvEvaluatorSorter";
+import { EvJudgeSplitLab } from "@/components/widgets/EvJudgeSplitLab";
+
+## Where this lesson picks up
+
+Error analysis left you with a taxonomy of failure modes: named, defined, with example traces and a rough count. That is the **Analyze** step. This lesson is **Measure**: turning each failure mode into a number you can recompute whenever the pipeline changes.
+
+You cannot hand-label hundreds of traces after every prompt edit, so you need **automated evaluators**. An evaluator, in this course, has a narrow job: it takes a trace and tells you whether one specific, already-observed failure mode is present. Run it over a batch of traces and you get the **prevalence** of that failure. Run it again after a fix and you see whether the fix worked.
+
+Two consequences follow from that definition:
+
+- **Don't build an evaluator before you know the failure mode.** "Let's throw an LLM at it" without reading traces produces judges for things nobody saw go wrong. The instructors cite **criteria drift** here: people do not know what they want from an LLM until they look at its outputs, and their criteria keep shifting as they read more.
+- **The evaluator is only as good as its definition.** A metric that is not grounded in your failure definitions measures something, just not your problem.
+
+The running example is still the apartment **leasing assistant** from the previous lessons: a chat agent with a dozen or more tools (`get_tour_availability`, `schedule_tour`, `check_apartment_availability`, `get_resident_balance` and more) that talks to prospective and current residents.
+
+## What to measure
+
+Here are three failure modes from the leasing assistant's error analysis. They were picked because each one ends up handled a different way, not because they are the most frequent.
+
+| Failure mode | What happens |
+|---|---|
+| Hallucinated tool invocation | The agent tries to call a tool that does not exist, such as "reschedule a tour" when only `schedule_tour` exists |
+| Missing visual links for amenities | The user asks about the pool or gym; the agent confirms it exists but offers no photos, link, or next step |
+| Unhelpful response to ambiguous queries | The user asks something vague; the agent gives a generic, passive answer instead of clarifying or guiding |
+
+### Specification or generalization?
+
+Before writing any evaluator, sort each failure mode by the gulf it comes from (lesson 1):
+
+- **Specification failure.** The prompt never asked for the behavior. The model was left to read your mind and guessed wrong. The missing amenity links are this kind: nobody told the agent to share photos when someone asks about an amenity.
+- **Generalization failure.** The instructions are clear (or the behavior is plain common sense), and the model still fails on some inputs. Example: the user says "pets allowed, under $2,000", the prompt says to honor every stated constraint, and the generated query silently drops the price filter.
+
+The guidance: **fix specification failures first, and spend evaluator effort on generalization failures.** Two reasons.
+
+1. **Cost and benefit.** Every eval costs real time to build and maintain. If a one-line prompt edit makes a failure go away, an eval for it is mostly wasted effort.
+2. **What you are measuring.** An eval on an under-specified behavior measures how well the model reads your mind. That is neither stable nor useful. You want to measure how well it follows clear instructions across diverse inputs.
+
+Some obvious "just fix it" cases from the leasing project: the agent got appointment dates wrong because the prompt did not even include today's date, and customers asked to reschedule when only a scheduling tool was exposed (the fix was to add a rescheduling tool). Neither needed an eval.
+
+### A rule of thumb for "just fix it"
+
+The line between the two gulfs is a spectrum, not a bright line. A practical heuristic:
+
+- If you can think of an **obvious prompt fix you are about 99% sure will work**, make it and move on. Example: a legal-clause extractor kept missing "covenant not to sue" clauses. Adding a one-sentence description of that clause type fixed it every time.
+- If the fix would be **hacky or speculative** (rewrite a sentence into a paragraph, try chain of thought, "maybe a different prompting trick"), or you catch yourself thinking "I don't know how I'd fix this", that is the signal to **build an eval first**.
+
+Specification fixes can still deserve evals. On the leasing assistant, scheduling broke on tricky dates (leap years, crossing a year boundary). That was fixable in the prompt, but only after brainstorming every edge case, so the team generated synthetic requests for those dates, knew the right answer for each, and built checks to iterate against.
+
+<Callout kind="tip">
+Applied to our table: add an instruction about amenity photos and links (specification), then measure. Hallucinated tools and unhelpful answers to vague questions are generalization failures, so they get evaluators.
+</Callout>
+
+### Reference-based and reference-free versions
+
+For each failure mode worth measuring, the course notes suggest thinking of two metrics:
+
+- **Reference-based**: compare the output to a known-good answer. For dropped constraints, a set of user queries paired with the correct query, then check that every expected filter is present. Great for iterating during development and for CI.
+- **Reference-free**: check a property of the output itself. For dropped constraints, if the user mentioned a price, does the generated query touch a price column at all? These run on unlabeled production traffic, which makes them the workhorses for monitoring.
+
+Either kind can include **executability checks**: actually run the generated SQL against a test database, or simulate the tool calls, to see that the output works and is not just plausible text.
+
+## Code-based evaluators
+
+A **code-based evaluator** is a deterministic function: trace in, pass or fail (or a number) out. Use one whenever the failure is objective enough to check with rules. Code evals are fast, cheap, deterministic and easy to interpret, so prefer them over an LLM judge whenever they can do the job.
+
+Typical uses:
+
+- **Parsing and structure**: is the output valid JSON, does the SQL parse, does it match a schema. You can check this without understanding what the text means.
+- **Regex and keyword checks**: required phrases present, forbidden phrases absent.
+- **Structural constraints**: the summary has three bullets, stays under 150 words.
+- **Tool execution errors**: did any tool call raise an error when run.
+- **Simple logic**: the user asked for a dog-friendly unit, so does the reply mention pets.
+
+Many checks people assume need an LLM can be done, or closely approximated, with code. Two examples from the instructors: an internal user ID that sits in the system prompt for tool calls and must never be echoed to the user, and the name of the backing database ("I queried our Snowflake warehouse and found...") which users should never see. Both are a string match.
+
+### Example: hallucinated tool invocation
+
+This failure looks like it needs judgment, but it does not. You already know the full list of tools, because you declared them in the tool schemas (or MCP specs). Any call to a name outside that list is a failure.
+
+```python
+import re
+
+# The source of truth is the tool schemas you send to the model.
+ALLOWED_TOOLS = {spec["name"] for spec in tool_specs}
+
+def hallucinated_tools(trace: dict) -> list[str]:
+    """Names of tools the agent tried to call that don't exist."""
+    return [
+        call["name"]
+        for msg in trace["messages"] if msg["role"] == "assistant"
+        for call in msg.get("tool_calls", [])
+        if call["name"] not in ALLOWED_TOOLS
+    ]
+
+LEAKS = re.compile(r"\b(snowflake|postgres|user_id)\b", re.IGNORECASE)
+
+def leaks_internals(reply: str) -> bool:
+    return bool(LEAKS.search(reply))
+
+# Prevalence over a batch of traces
+fails = [t for t in traces if hallucinated_tools(t)]
+print(f"hallucinated tool rate: {len(fails) / len(traces):.1%}")
+```
+
+Because it is cheap and deterministic, a check like this can also run **in the critical path** as a guardrail: catch the bad call and re-prompt the agent before anything reaches the user. Guardrails versus offline evals is a later lesson; for now the point is an evaluator that correctly measures prevalence.
+
+<EvEvaluatorSorter />
+
+## LLM-as-judge evaluators
+
+Some failures resist rules: is this reply helpful to a vague question, is the tone right for this customer, is the summary faithful to the source (nothing invented, nothing important dropped). For these you use a separate LLM, the **judge**, which reads the trace and decides whether one specific failure mode is present.
+
+You can ask an LLM to judge anything. You should not. The instructors' strong opinions, from years of doing this:
+
+- **One narrowly defined failure mode per judge.** Not "is anything wrong with this trace".
+- **Binary pass or fail.** Then validating the judge only means checking two outcomes. With a 1 to 10 or 0 to 100 score, you must validate that every value means what you think it does, which nobody ever manages.
+
+Expect three problems even with a good judge:
+
+- **Bias** toward saying pass or toward saying fail. You measure it and correct for it (next lesson).
+- **Inconsistency.** The same judge on the same trace can flip between runs, even at temperature 0. Running it several times and taking the majority helps, but you are paying for non-determinism either way.
+- **Cost.** A large reasoning model judging every production trace can cost more than the application itself.
+
+### Name it "helpfulness", define it narrowly
+
+A common way teams go wrong is an off-the-shelf "is this response helpful?" judge. That is the evaluation equivalent of a shrug. It is fine to *call* your judge "helpfulness" as a short label, but its definition must come from a failure you actually saw. For the leasing assistant it is specific: on an ambiguous query, the agent said something like "sorry, I'm not sure" and stopped, when it should have asked a clarifying question or offered a next step.
+
+## The judge lifecycle
+
+Building a judge you can trust has four stages:
+
+1. **Write a prompt template** for one failure mode.
+2. **Split your labeled traces** into train, dev and test sets.
+3. **Iteratively refine the prompt** until the judge agrees with your labels on the dev set.
+4. **Estimate the real success rate** on unlabeled traces, correcting for the judge's known mistakes.
+
+Most tutorials stop at step 1: write a prompt, ship it. Steps 2 and 3 are an **eval of the eval**, the thing that lets you tell stakeholders how good the judge is. Step 4 is the next lesson.
+
+It sounds like a lot, but it is mostly a one-time cost. Once a judge is aligned, you run it on any number of new traces. A good judge scales your own judgment across all your traffic; a bad one gives you confident random numbers.
+
+## Judge prerequisites
+
+Before writing a word of the prompt, check:
+
+- **One failure mode.** Picked from your error analysis taxonomy.
+- **Well defined and well scoped.** "Is this good?" fails this test. So does "check A and B and C and D and E": split that into five judges. Five to ten judges on one dashboard is common in practice.
+- **Binary.** Pass means the failure is absent, fail means it is present.
+- **Labeled data.** Traces you (or your benevolent dictator) have marked pass or fail for this failure mode. Your open codes and axial labels from error analysis are the starting point.
+
+## Crafting the judge prompt
+
+### The four components
+
+A strong judge prompt has four parts:
+
+1. **Task and criterion.** What to evaluate, scoped to where the failure occurs. If the failure only matters on ambiguous queries, say "ambiguous queries", or the judge will apply the rule to traces where it does not belong.
+2. **Precise pass and fail definitions.** What exactly counts as each. Write these from your open codes: if many notes said "should have asked a clarifying question", that phrase belongs in the fail definition. You can paste your open codes into an LLM and ask for a two-sentence summary of what a fail looks like, then edit it.
+3. **Few-shot examples.** Labeled pass and fail cases. A general-purpose system prompt often has few examples because the assistant must handle anything; a judge does exactly one task, so examples are cheap and they improve alignment a lot. Show, don't just tell.
+4. **Structured output.** JSON with a short `reasoning` field and an `answer` field. Asking for reasoning before the answer tends to help accuracy, and the reasoning is invaluable for debugging.
+
+### A worked prompt
+
+Your first draft of the criterion will be rough ("helpful and proactive" is not yet well defined). That is fine: the refinement loop sharpens it.
+
+```text
+You are evaluating replies from an apartment leasing assistant.
+
+Task: decide whether the assistant's reply to an AMBIGUOUS user
+message helps the user move forward.
+
+FAIL if the reply is generic or passive: it restates general facts,
+adds little new information, and does not ask a clarifying question
+or offer a concrete next step.
+
+PASS if the reply recognises the ambiguity and does at least one of:
+asks a relevant follow-up question, narrows down the user's needs,
+or offers a concrete next step (a tour slot, a listing, a link).
+
+Examples:
+{{few_shot_examples}}
+
+Conversation:
+{{trace}}
+
+Respond only with JSON:
+{"reasoning": "<one or two sentences>", "answer": "Pass" | "Fail"}
+```
+
+Leave the examples as a placeholder at first, or drop in one pass and one fail you know well. For the ambiguous query "Looking for an apartment, maybe a one-bedroom? What do you have?":
+
+| Assistant reply | Desired judge output |
+|---|---|
+| "We have one-bedroom units with modern appliances and access to our amenities. Leases are 12 months." | Fail: accurate but generic, makes no attempt to narrow down what the user needs |
+| "We have a few one-bedrooms! When are you hoping to move in, and what budget are you working with? Is in-unit laundry a must?" | Pass: asks targeted questions that lead to a useful recommendation |
+
+Note the examples carry their own reasoning. That grounds the judge further and teaches it the style of explanation you want.
+
+### Choosing few-shot examples
+
+- **Pick examples that carry information.** Easy cases the judge would get right anyway add little. Borderline and tricky cases teach the decision boundary.
+- **Think of explaining the rule to a new human colleague.** The example you would reach for after "despite all these rules, here is a confusing one" is an excellent few-shot example.
+- **Start simple.** Scanning the training set for the single clearest pass and clearest fail is a fine first move; you will swap them later.
+- **Hand-pick first.** Programmatic search over example combinations exists and is legitimate here, but writing and thinking through the prompt yourself builds intuition about both the failure and the judge.
+
+<Callout kind="tip">
+Reasoning fields also speed up labeling. One instructor had a strong reasoning model label a batch of traces for a failure mode, then read each rationale and flipped the verdicts she disagreed with. That is far faster than labeling from scratch, as long as the human still makes the final call.
+</Callout>
+
+## Train, dev and test splits
+
+Building a judge is like **training a classifier**, except the "training" is prompt editing, not gradient descent. So you borrow the machine-learning discipline of splitting labeled data into three disjoint sets:
+
+| Split | Typical share | What it is for | Rule |
+|---|---|---|---|
+| Train | 10 to 20% | The pool you draw few-shot examples from | Only these may appear in the prompt |
+| Dev | about 40% | Measure the judge after each prompt change and hill-climb | Never in the prompt |
+| Test | about 40% | One final, unbiased measurement of the judge | Never look at it while developing |
+
+### Why the ratios look backwards
+
+In ordinary ML, most data goes to training. Here you are not fitting parameters; you only need enough training examples to choose a handful of good few-shot demonstrations, and in-context learning tends to plateau after a few well-chosen examples. The value of labeled data is in *measuring* the judge, so most of it goes to dev and test.
+
+The numbers are a starting point, not a law. If the training pool has too few good failures to choose from, give it more. A common target is roughly 20 train, 40 dev and 40 test traces, with dev and test **balanced** between passes and fails (the notes suggest 30 to 50 of each), even if real failures are much rarer. The imbalance with production is deliberate and gets corrected later.
+
+### Don't overfit
+
+The rules that keep the judge's numbers honest:
+
+- **Only train examples go in the prompt.** Putting a dev or test trace in the prompt as a few-shot example hands the judge the answer. The instructors see this mistake constantly.
+- **Only tune against dev.** Every edit is judged by dev-set agreement.
+- **No peeking at test.** It exists so you do not overfit to dev. Run it once, at the end.
+
+If a dev trace turns out to be the perfect example, move it into the training set before using it in the prompt, so it stops counting toward dev scores.
+
+<EvJudgeSplitLab />
+
+## The refinement loop
+
+1. **Write a baseline prompt** with the four components and a few training examples.
+2. **Run the judge on every dev trace.**
+3. **Measure agreement** with your labels: TPR and TNR.
+4. **Inspect the disagreements**, both false passes and false fails.
+5. **Refine**: clarify the task and the pass/fail definitions, and swap in more illustrative few-shot examples from the training set.
+6. **Repeat** on the same dev set until both rates are good enough.
+
+### Measuring agreement: TPR and TNR
+
+Treat **pass as positive** and fail as negative. If the dev set has P traces you labeled pass and F you labeled fail:
+
+- **True positive rate (TPR)** = (judge said pass, you said pass) / P. How often the judge recognises a good trace.
+- **True negative rate (TNR)** = (judge said fail, you said fail) / F. How often the judge catches a real failure.
+
+```python
+def tpr_tnr(human: list[str], judge: list[str]) -> tuple[float, float]:
+    pairs = list(zip(human, judge))
+    P = sum(h == "Pass" for h, _ in pairs)
+    F = len(pairs) - P
+    tp = sum(h == "Pass" and j == "Pass" for h, j in pairs)
+    tn = sum(h == "Fail" and j == "Fail" for h, j in pairs)
+    return tp / P, tn / F
+```
+
+Worked example: dev has 40 passes and 40 fails. The judge says pass on 37 of your passes and fail on 26 of your fails. TPR = 37/40 = 0.925, TNR = 26/40 = 0.65. The judge waves through 14 real failures, so the next round focuses on those false passes.
+
+### Why accuracy alone lies
+
+Track both rates every time. Suppose 10% of traces fail and your "judge" is a function that returns pass no matter what. It agrees with you 90% of the time, and a dashboard showing "90% agreement" would fool most readers. Its TPR is 100% and its TNR is 0%, which exposes it immediately. TPR and TNR go by other names (sensitivity and specificity, or recall on each class); the names matter less than watching both.
+
+If both come out at exactly 100%, be suspicious before you celebrate: check whether a label leaked into the prompt.
+
+### Refine, repeat, stop
+
+Look at the traces where the judge and you disagree, on dev and on train. They show what the judge finds hard, and the hard ones are the best candidates for new few-shot examples (move them into train first if they came from dev). Each round, ask two questions: can the definition be clearer, and are there better examples? Three or four rounds is typical, and with practice the whole loop takes about an hour in a notebook. You do not need to be an engineer to run it.
+
+Stop when TPR and TNR are both satisfactory, often above 90%. Which one matters more depends on your app: if missing a real failure is costly, push TNR harder.
+
+Manual iteration has one more benefit: sometimes reading a disagreement makes *you* change your mind, and you relabel the trace. That is the criteria drift from the start of the lesson, now working for you.
+
+### If alignment stalls
+
+Sometimes TPR is fine but TNR is stuck at 30 or 40%. In order of effort, the instructors try:
+
+1. **A more capable judge model.** A small, cheap model may not handle subtle cases.
+2. **Split the criterion.** Turn one broad failure mode into two or three narrower ones, each with its own judge.
+3. **More or better labeled data**, especially edge cases for the training pool. This is the most tiring option, so it comes last.
+
+## Worked example: are claims substantiated?
+
+A live attempt on the leasing assistant shows what a first judge usually looks like. The failure mode: **are all assistant messages substantiated by data from the tools?** During error analysis the agent answered a question about a unit that appeared nowhere in the tool results, and claimed the property participates in affordable-housing programs when no tool data said so.
+
+The process:
+
+1. **Labels.** About 30 traces labeled by hand. To get more, a reasoning model labeled the rest using the human reviewer notes, and every rationale was read and corrected.
+2. **Split** 20% train, 30% dev, 50% test (a bit more weight on evaluation than the default).
+3. **Prompt**: detect unsupported claims; definitions of true and false; five random passing and five random failing examples from train; the conversation; and the list of tools and metadata the agent had access to.
+4. **Results.** On train, TPR 0.93 and TNR 0.80. On dev, agreement dropped sharply, mostly on the failures.
+
+The gap is the lesson. Train scores look good because the few-shot examples came from train. Dev shows the randomly chosen failing examples do not represent the kinds of unsupported claims in the rest of the data. The next steps would be to read the dev false passes and swap in more representative training examples, and if that is not enough, to cluster the unsupported claims (about units, about programs and partnerships) and build a judge for each. The instructors' blunt summary: never trust a judge prompt straight off the bat.
+
+## FAQ
+
+**Can I use prompt optimization tools?** Yes, this is a real supervised problem with labeled data, so hill-climbing tools (DSPy and similar) fit well. The condition is the same: split first, never let dev or test examples leak into the prompt. Manual iteration first still builds intuition.
+
+**How many few-shot examples?** Usually two or three passes and two or three fails, chosen to be diverse and hard. With short traces you might fit 15 or 20. With long traces or whole documents you may need fewer, or summarised ones, to fit the context window.
+
+**How much labeled data?** Around 20 train, 40 dev and 40 test is a reasonable start, balanced between pass and fail where possible.
+
+**Do I have to follow these numbers exactly?** No. Start the process, iterate, and come back to the rules if something looks wrong.
+
+## Where this goes next
+
+An aligned judge still makes mistakes, so the share of traces it marks pass on new data is a biased estimate of your real success rate. The next lesson uses the judge's test-set TPR and TNR to correct that estimate and put a confidence interval around it, which is why the test set must stay untouched.
+
+## Cheat sheet
+
+- An evaluator measures the prevalence of one known, well-defined failure mode. Error analysis comes first.
+- Fix specification failures in the prompt; build evaluators for generalization failures.
+- If the fix is obvious and you're ~99% sure it works, just fix it. If you don't know how you'd fix it, build an eval.
+- Prefer code evals for anything objective: parsing, regex, structure, tool errors, allowlists of tool names.
+- Use an LLM judge only for nuanced checks, one narrow failure mode per judge, binary pass/fail.
+- Judges are biased, inconsistent and can be expensive. Validate them; never trust a first draft.
+- Judge prompt = task and criterion, pass/fail definitions, few-shot examples, JSON with reasoning then answer.
+- Write definitions from your open codes; choose few-shot examples that are hard and diverse.
+- Split labels about 10 to 20% train, 40% dev, 40% test; dev and test balanced between pass and fail.
+- Only train examples in the prompt, only tune on dev, run test once at the end.
+- TPR = judge-pass among human-pass; TNR = judge-fail among human-fail. Always report both.
+- An always-pass judge can score 90% agreement with TNR 0%.
+- If alignment stalls: stronger judge model, then split the criterion, then more labels.

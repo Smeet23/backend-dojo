@@ -1,0 +1,285 @@
+import { EvGulfSorter } from "@/components/widgets/EvGulfSorter";
+import { EvPromptBuilder } from "@/components/widgets/EvPromptBuilder";
+
+## What an eval is
+
+**Evaluation** is the systematic measurement of quality in an LLM pipeline. Two words in that definition do the work:
+
+- **Systematic.** You run the same checks the same way every time, on a set of examples you chose on purpose, so results from Monday and Friday can be compared. Trying five queries in a playground and nodding is not an eval.
+- **Quality.** This is the subjective part. Quality can mean correctness, following the house format, safety, personalization, tone or latency, and usually it means several of these at once.
+
+Because quality has many faces, one number is rarely enough. Most production LLM apps end up with **five to ten evals**, each measuring one aspect ("did it respect the stated allergy?", "is the JSON valid?", "did it hand off to a human when asked?"). That is not unusual: a normal web product also tracks many metrics. Throughout this course, an individual metric is called **an eval**.
+
+The output of an eval should be easy to read without argument. Usually that's a score or a pass rate, sometimes a structured written summary of what went wrong.
+
+Evals get used in three ways:
+
+| Use | Where it runs | Example |
+|---|---|---|
+| **Background monitoring** | Off the critical path, over time | Daily pass rate of the "no allergens" check drops from 99% to 93% after a model upgrade |
+| **Guardrail** | In the request path | Output fails the JSON-schema check, so the app retries or falls back before the user sees it |
+| **Improvement** | Offline | Eval results pick good few-shot examples, label fine-tuning data, or point at a failure that needs an architecture change |
+
+<Callout kind="remember">
+This course is about **application-centric** evals: you took a pre-trained model off the shelf and you want to know whether *your* pipeline does *your* task well on *your* data. It is not about the giant public benchmarks model labs publish.
+</Callout>
+
+## Life without evals
+
+Without evals, the workflow looks like this: you ship a prompt change, a week later a product metric dips or a user complains, you patch that one case, ship again, and something else breaks. It's whack-a-mole. You have:
+
+- **No idea what is bad.** You only hear about failures users bother to report.
+- **No idea why it is bad.** A complaint tells you a symptom, not a cause.
+- **No way to know a fix worked**, or that it didn't break three other things.
+
+Evals exist to give you the reasons users should trust the product (it is reliable, safe for *your* context, and useful), to alert you when quality degrades, and to make improvement a deliberate process instead of guesswork.
+
+## Why LLM pipelines are hard: the three gulfs
+
+LLM outputs are not like traditional software outputs. They are non-deterministic, open-ended and often subjective. A reply can be factually right and still feel wrong for the context, or sound confident while being false. Traditional ML at least had crisp labels and accuracy or F1. LLM apps usually don't.
+
+A useful way to see where things go wrong is the **Three Gulfs** model (from Shreya Shankar's research group at Berkeley, inspired by Don Norman's gulfs in interaction design). Picture three islands: **you** (the developer), the **LLM pipeline**, and the **data** it runs on. Each gap between two islands is a gulf, and each needs a different skill to cross.
+
+### Gulf of comprehension
+
+Between **you and the data**. Do you actually understand what inputs your app receives and how the pipeline behaves on them? At scale you can't read every query: a recipe bot may get thousands of free-text messages a day, ranging from "Suggest a gluten-free dessert for a formal dinner party" to "I have chicken, broccoli and zero motivation." If you haven't seen that variety, you can't design for it, and you won't notice patterns like "the bot keeps proposing ten-step recipes for people who asked for something quick."
+
+Two stories from the instructors show how this bites:
+
+- An HR outreach assistant used **edit distance** (how much recruiters changed the AI's draft) as a quality metric. Less editing sounds like better output. But reading the actual edits showed many were made by non-native English speakers who sometimes made the text *less* correct. The metric was measuring the wrong thing, and nobody knew until they looked.
+- A team summarizing customer-support chats assumed customers describe their problem fully. Real transcripts showed frustrated customers typing a few terse words. The prompt had to stop inferring so much from the customer's text and lean on system logs instead.
+
+Even experts start a new project by reading data. If anything in your traces surprises you, that's a sign your mental model, or your metrics, need updating.
+
+### Gulf of specification
+
+Between **you and the pipeline**. Is what you *meant* actually what you *wrote* in the prompt? Natural language is full of ambiguity. "Give the user an easy recipe" sounds clear until you ask what easy means: few ingredients, under 30 minutes, beginner technique, or minimal cleanup? There's no single right answer, and the model can't read your mind, so it guesses, and guesses inconsistently.
+
+Even a prompt like "Extract the sender's name and summarize the key requests in this email" leaves open: display name or email address? Bullets or a paragraph? Include implied requests? How long? Each unstated decision is a coin the model flips per input.
+
+A real anti-pattern: a customer-support bot whose prompt began "You are a data scientist...", because a data scientist wrote it and nobody read it again. Underspecified prompts usually mean nobody looked at the data.
+
+### Gulf of generalization
+
+Between **the data and the pipeline**. Even with a clear prompt, does the model apply it correctly to *new* inputs? You test a vegan request, it works; another vegan request, still works. It's tempting to conclude "it handles dietary restrictions." Then a user asks for low-FODMAP or kosher and it happily suggests something they can't eat. The model learned the case you tested, not the principle.
+
+Another example: an email pipeline told to extract the sender sometimes returns a famous person *mentioned in the body* as the sender. The instruction was clear; the model just applied it wrongly on that kind of input.
+
+What makes this gulf hard is that LLMs don't generalize the way people do. If a model can do X and Y, you'd expect it to handle Z, which is no harder. Sometimes it can't. Tools for this gulf are heavier: decompose the task into several calls, add retrieval, switch to a stronger model, or fine-tune. This gulf never fully closes, since no model is perfect on every input.
+
+<Callout kind="warn">
+Only reach for generalization fixes after you've closed the first two gulfs. If the prompt never said what "easy" means, a bigger model or a fine-tune just guesses more expensively.
+</Callout>
+
+### Wearing three hats
+
+Each gulf asks for a different mindset:
+
+| Gulf | Between | Hat | Typical fix |
+|---|---|---|---|
+| Comprehension | You and the data | Data scientist | Read traces, build tooling to review high-priority data |
+| Specification | You and the pipeline | Communicator / product person | Rewrite the prompt with explicit rules, definitions and format |
+| Generalization | Data and the pipeline | Engineer | Decompose, add retrieval, better model, fine-tune |
+
+Nobody is trained to wear all three, and switching between them feels jarring. That's normal. When you're stuck, ask which gulf you're in; often the answer is that you need to switch hats. A fourth hat comes up constantly too: the **user's**. Looking at an output and thinking "looks fine" is easy; asking "would a real user be happy with this?" is the actual bar.
+
+<EvGulfSorter />
+
+## The analyze, measure, improve lifecycle
+
+Once you have an initial pipeline and some data running through it, evaluation follows a loop:
+
+1. **Analyze.** Collect representative traces, read them, and identify and categorize the failure modes specific to your app. This attacks the gulf of comprehension, and often exposes specification and generalization problems along the way.
+2. **Measure.** Turn those qualitative findings into numbers. You found three failure modes; how often does each one happen? Labeling every trace by hand doesn't scale, so you build **automated evaluators** (code checks and LLM judges) to estimate prevalence.
+3. **Improve.** With failure modes ranked by frequency, pick your fix: clarify the prompt, add examples, change models, improve retrieval, restructure the pipeline, fine-tune.
+
+Specification failures found during Analyze can often be fixed right away (just make the instruction clearer). Murkier failures, especially generalization ones, deserve measurement first, so you know how common they are and whether your fix moved the number.
+
+This is a cycle, and you'll run it for the life of the product. Each phase also loops internally: you'll go back and forth on failure categories, and on judge prompts.
+
+### Pitfalls at each stage
+
+| Phase | Common mistake | Why it hurts |
+|---|---|---|
+| Analyze | Looking at five examples and declaring the failure modes | Hypotheses from a handful of traces miss most of what's happening |
+| Analyze | Outsourcing annotation, or treating evals as "an engineering thing" | The people who know what good looks like never see the data, and the learning is lost |
+| Measure | LLM judges whose verdicts don't match what a human would say | An unaligned judge is a random number generator labeled "failure rate" |
+| Measure | Testing a judge on the same examples used as few-shots in its prompt | Reports 100% agreement, then falls apart on production data (classic train/test leakage) |
+| Improve | Premature improvement: jumping to agents, fine-tuning or automated prompt optimizers | You optimize before you know what's broken |
+
+Analyze is the phase most teams skip and the one with the least guidance available, yet it's where you learn the most. Hamel estimates he spends 75 to 80% of his eval time there.
+
+## Prompting fundamentals
+
+Before you can analyze anything you need a reasonable first prompt. This matters more than it seems: if your prompt never asked for JSON, then error analysis just tells you "it didn't return JSON," which you already knew. A decent starting prompt means the errors you find are real ones.
+
+### What LLMs are good and bad at
+
+Treat an LLM as a powerful but imperfect component.
+
+- **Strong at:** fluent, grammatical text; rewriting and tone shifts; summarizing, translating and answering questions when given context; picking up a new task from a few examples.
+- **Weak at:** consistency (the same prompt can give different answers, and small wording changes can swing results a lot); factuality (it predicts likely text, not verified truth, so it can hallucinate confidently); long iterative procedures like exact arithmetic on big numbers; and very long contexts, where quality degrades well before the advertised limit.
+
+### Components of a good prompt
+
+| # | Component | Recipe-bot example | Include? |
+|---|---|---|---|
+| 1 | Role and objective | "You are a friendly recipe assistant who suggests practical home-cooking recipes." | Always |
+| 2 | Instructions and response rules | "Always list ingredients with quantities before steps. Never suggest an ingredient the user says they're allergic to." | Always |
+| 3 | Context | The user's pantry, stated diet, skill level, past recipes | Always (whatever is relevant) |
+| 4 | Examples (few-shot) | One sample query with an ideal answer | Yes, one or two |
+| 5 | Reasoning steps | "First check the constraints, then pick a dish, then write it out." | Only if useful; modern reasoning models already think before answering |
+| 6 | Output format | Markdown with fixed headings, or JSON with `name`, `ingredients`, `steps` | Unless you use structured outputs or tool calling, which enforce a schema for you |
+| 7 | Delimiters and structure | `### Rules`, XML tags, fenced blocks around context | When the prompt is long or mixes sections |
+
+A common layout: role and core rules at the top, then context and examples, then repeat the most important rules and the format at the end. Anything your few-shot examples demonstrate should also be stated as a rule; don't make the model infer it.
+
+<EvPromptBuilder />
+
+### Iterate, and write the first draft yourself
+
+The perfect prompt doesn't arrive on the first try. Write, run on varied inputs, look at outputs, refine.
+
+Resist letting an LLM or a prompt optimizer write the first version. Writing it forces *you* to spell out what you want, and that thinking is the specification. A good split: draft it yourself, including a bullet list of do's and don'ts, until you've run out of ideas. Then ask an LLM to tighten the wording or point out gaps. Teams that hand the whole thing to a black box early tend to struggle to understand their own failure modes later.
+
+## Defining good
+
+To write a good prompt (and later, evals) you need a working definition of "good." Put on the product hat.
+
+### Start from user unhappiness
+
+It's easier to list what would make a user unhappy than to define perfection. For the recipe bot:
+
+- Uses ingredients that are hard to find
+- Ignores a stated allergy or diet (the instructor with a nut allergy still gets nut recipes from web search)
+- Vague steps like "bake until done" for someone who has never baked
+- Too complex for "quick weeknight dinner", or too basic for an experienced cook
+- Heavy, fried dish after the user asked for something healthy
+
+Each of these is a candidate failure mode. Good, as a starting point, is the absence of these bads.
+
+### Specifications: always and never
+
+Turn that list into **specifications**: concrete statements of what the bot must always do and must never do.
+
+- **Always:** list ingredients with quantities; give numbered, concrete steps; ask about allergies if none are stated.
+- **Never:** include an ingredient the user is allergic to; invent unsafe cooking methods.
+
+A test for a good specification: **could you check it?** If you can't imagine how to tell whether an output met the rule, the rule is too vague. Some checks are just code:
+
+```python
+import re
+
+def has_ingredients_before_steps(reply: str) -> bool:
+    i = reply.lower().find("ingredients")
+    s = reply.lower().find("steps")
+    return i != -1 and s != -1 and i < s
+
+def respects_allergy(reply: str, allergens: list[str]) -> bool:
+    text = reply.lower()
+    return not any(re.search(rf"\b{re.escape(a.lower())}", text) for a in allergens)
+
+print(respects_allergy("Ingredients: 2 tbsp peanut butter ...", ["peanut"]))  # False
+```
+
+Others ("are the steps clear enough for a beginner?") need a human or an LLM judge with written criteria. You don't build these evaluators yet; you just make sure each rule is checkable.
+
+Specifications are also where your **taste** lives. Two people building a recipe bot with the same model will ship different products because they wrote different specs. And specs won't disappear as models improve: a model trained for everyone can't know your particular preferences, especially when users disagree with each other. Models may get the obvious ones right on their own, but the specs that make your product yours stay your job. If you're not the domain expert (say, a medical app built by engineers), you have to learn your users' preferences closely before you can write them down.
+
+### Agency: how much freedom
+
+The prompt should also say how much latitude the bot has. Suppose a user asks for "a quick dinner with chicken and potatoes" and the obvious dish, roast chicken with potatoes, takes an hour:
+
+| Agency | Behavior |
+|---|---|
+| High | Swaps to a different, genuinely quick chicken recipe |
+| Medium | Asks: "Roasting takes about an hour. Is that OK, or want something faster?" |
+| Low | Gives the hour-long roast and ignores the conflict |
+
+None is universally right, but if you don't choose, the model will, and differently each time.
+
+## Reference-based and reference-free metrics
+
+Evals come in two families.
+
+**Reference-based** metrics compare the output to a known correct answer (a "golden" or reference output) that you prepared in advance, like grading against an answer key.
+
+- Exact match on a short extracted field
+- Output contains the expected keywords
+- Run generated SQL and compare the result table to the expected table (comparing SQL text fails, since many queries are equivalent)
+- Run generated code against unit tests
+- Ask a human or LLM whether a paragraph means the same as the reference
+
+**Reference-free** metrics check properties of the output itself, with no golden answer. They're essential when many answers are valid or the task is creative.
+
+- Summary adds no claims absent from the source
+- Support bot declines to give definitive medical or financial advice
+- Marketing copy has a call to action and none of the banned phrases
+- Generated SQL parses; code compiles and passes the linter; an API call uses valid parameter names
+
+Reference-free checks are what you can run in production, where no one has written the right answer for a live query. Reference-based checks are preferred when you can get them, because they're less ambiguous, and with some creativity you often can, for example by checking an intermediate step, or by generating test queries *from* known documents so you know which document retrieval should return.
+
+<Callout kind="tip">
+Execution doesn't make a metric reference-based. "Does the SQL run?" is reference-free (a validity check). "Does it return the same rows as the known-correct query?" is reference-based.
+</Callout>
+
+## Benchmarks versus application evals
+
+Public benchmarks like MMLU, GSM8K or HELM measure a foundation model's general abilities: math, code, broad knowledge. Think of them as standardized tests. They help you shortlist models, the way an SAT score tells you something about a candidate.
+
+But you don't hire someone on test scores alone. **Application evals** ask whether *your* pipeline does *your* task on *your* realistic data. Model providers tune their models with their own preference data, and that resulting "taste" is opaque to you, with no guarantee it matches your requirements. So you design metrics around your own criteria: following your format, respecting your domain's safety rules, being helpful by your users' definition.
+
+Be suspicious of generic metrics. A dashboard full of off-the-shelf "helpfulness score", "hallucination score" and "conciseness score" is a classic sign an eval effort has gone off course: those numbers aren't tied to failures you've actually observed in your app.
+
+## Eliciting labels
+
+Reference-free metrics need someone, a person or an LLM judge, to make a judgment. How you ask for that judgment matters.
+
+### Direct grading versus comparisons
+
+**Direct grading** scores one output against a rubric: pass/fail, a category, or a 1 to 5 scale. It's the most common approach, and the right one when you need an **absolute** answer: "what fraction of replies respect the budget?"
+
+**Pairwise comparison** shows two outputs for the same input and asks which is better *on a specific criterion* ("which recipe better fits a 20-minute limit?"). **Ranking** extends this to three or more outputs. Relative judgments are often easier for people than assigning a precise score, and they're useful for A/B-testing prompts, choosing between models, or picking the best of several generated candidates. Model labs lean on them heavily during post-training.
+
+Even if you never collect labels formally, these framings sharpen your prompt. If you say a five-star recipe "uses my ingredients, matches my skill, and has unambiguous steps", that's three rules for the prompt. If you prefer one chicken recipe over another because it "uses fewer unusual spices", that's another rule.
+
+### Prefer binary pass/fail over 1 to 5 scales
+
+It's tempting to rate helpfulness 1 to 5. In practice, **binary pass/fail judgments per criterion** work better, especially early:
+
+- **Nobody can define the middle.** What separates a 3 from a 4? Without crisp definitions for every level, two annotators (or a human and a judge) disagree, and your numbers are noise.
+- **Middle scores hide decisions.** A 3 often means "not sure." Pass/fail forces you to decide whether this output is acceptable, which is the question that matters.
+- **Binary is easier to automate and validate.** Checking an LLM judge against human pass/fail labels is straightforward. Aligning it on a five-point scale is much harder.
+- **It's actionable.** "Allergy respected: 94% pass" tells you what to fix. "Helpfulness: 3.6" doesn't.
+
+If you need nuance, split one fuzzy scale into several binary criteria (ingredients available? steps clear? fits time limit?) rather than adding points to the scale.
+
+## A preview of error analysis
+
+With a first prompt in hand, the Analyze phase works like this (the next lesson covers it in depth):
+
+1. **Get data.** Use real traces if you have them; otherwise generate a synthetic set of realistic queries. A **trace** is the full record of one interaction: the alternating user and assistant messages, plus any tool calls.
+2. **Run your pipeline** on those queries to collect outputs.
+3. **Open coding:** read traces one by one and write a short note on anything that's wrong.
+4. **Axial coding:** group those notes into a small set of named failure modes.
+5. **Repeat until saturation**, the point where new traces stop revealing new kinds of failures.
+
+The result is a taxonomy of failure modes, each backed by passing and failing examples. Those become the targets for Measure. The method isn't new: it borrows from grounded theory in the social sciences, a well-tested way of finding patterns in piles of unstructured text, which is exactly what a folder of chat logs is.
+
+## Cheat sheet
+
+- An eval is a systematic measurement of one aspect of pipeline quality; real apps run five to ten of them.
+- Evals power background monitoring, guardrails in the request path, and offline improvement.
+- Without evals you're playing whack-a-mole: no idea what's broken, why, or whether a fix helped.
+- Gulf of comprehension (you vs data): you haven't seen what inputs and outputs really look like. Fix: read traces.
+- Gulf of specification (you vs pipeline): the prompt doesn't say what you mean. Fix: explicit rules, definitions, format.
+- Gulf of generalization (data vs pipeline): clear instructions applied wrongly to new inputs. Fix: decomposition, retrieval, better model, fine-tuning, but only after the first two.
+- Lifecycle: Analyze (find failure modes) then Measure (quantify them) then Improve (targeted fixes), repeated for the product's life.
+- Biggest pitfalls: too few traces, outsourced annotation, unaligned or leaky LLM judges, premature improvement.
+- A good prompt has role, rules, context, examples, optional reasoning steps, a format and clear structure. Write the first draft yourself.
+- Define good by listing what makes users unhappy, then write always/never specs that you could check.
+- Decide the bot's agency explicitly, or the model will decide per request.
+- Reference-based metrics compare to a golden answer; reference-free check properties and work in production.
+- Benchmarks help shortlist models; only application-specific evals tell you if your product works.
+- Prefer binary pass/fail per criterion over 1 to 5 scales; use pairwise comparison to choose between versions.
+- Error analysis (next lesson): synthetic or real traces, open coding, axial coding, stop at saturation.

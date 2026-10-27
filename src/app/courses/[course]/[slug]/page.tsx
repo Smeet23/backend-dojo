@@ -7,6 +7,7 @@ import { LectureQuiz } from "./LectureQuiz";
 import { VisitTracker } from "./VisitTracker";
 import { LessonTutor } from "@/components/ai/LessonTutor";
 import { ExplainIt } from "@/components/ai/ExplainIt";
+import { PrivateCourseGate } from "@/components/PrivateCourseGate";
 
 export function generateStaticParams() {
   return courses.flatMap((c) => c.lectures.filter((l) => l.available).map((l) => ({ course: c.course.id, slug: l.slug })));
@@ -29,8 +30,13 @@ export default function LecturePage({ params }: PageProps<"/courses/[course]/[sl
 
 async function LectureContent({ params }: { params: PageProps<"/courses/[course]/[slug]">["params"] }) {
   const { course, slug } = await params;
-  if (!getLecture(course, slug) || !getCourse(course)?.lessons[slug]) notFound();
-  return <LectureBody courseId={course} slug={slug} />;
+  const content = getCourse(course);
+  if (!getLecture(course, slug) || !content?.lessons[slug]) notFound();
+  return (
+    <PrivateCourseGate course={content.course}>
+      <LectureBody courseId={course} slug={slug} />
+    </PrivateCourseGate>
+  );
 }
 
 /**

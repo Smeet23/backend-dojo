@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useProgress } from "@/lib/progress";
 
-export type CourseCard = { id: string; title: string; summary: string; author: string; lectureKeys: string[] };
+export type CourseCard = { id: string; title: string; summary: string; author: string; sourceKind: string; private: boolean; lectureKeys: string[] };
 
 export function CourseList({ courses }: { courses: CourseCard[] }) {
   const progress = useProgress();
@@ -35,7 +35,10 @@ export function CourseList({ courses }: { courses: CourseCard[] }) {
                   {done}/{c.lectureKeys.length} lectures{started && done === 0 ? " · started" : ""}
                 </span>
               </div>
-              <p className="mt-2 text-xs text-muted">From {c.author}&apos;s playlist</p>
+              <p className="mt-2 text-xs text-muted">
+                From {c.author}&apos;s {c.sourceKind}
+                {c.private && " · passcode needed"}
+              </p>
             </Link>
           </li>
         );

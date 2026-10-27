@@ -5,6 +5,7 @@ import { notFound } from "next/navigation";
 import { courseQuestions, courses, getCourse } from "@/content/catalog";
 import { MixedPractice } from "./MixedPractice";
 import { AiPractice } from "./AiPractice";
+import { PrivateCourseGate } from "@/components/PrivateCourseGate";
 
 export function generateStaticParams() {
   return courses.map((c) => ({ course: c.course.id }));
@@ -29,20 +30,22 @@ async function PracticeContent({ params }: { params: PageProps<"/courses/[course
   if (!content) notFound();
   const lectureSlugs = Object.fromEntries(content.lectures.map((l) => [String(l.id), l.slug]));
   return (
-    <div>
-      <Link href={`/courses/${courseId}`} className="text-sm text-muted hover:text-text">← {content.course.title}</Link>
-      <h1 className="mt-4 text-3xl font-semibold tracking-tight">Mixed practice</h1>
-      <p className="mt-2 text-muted">
-        Up to 10 scenarios from every lecture you&apos;ve finished in this course. Questions you&apos;ve missed show up more often until you get them right.
-      </p>
-      <div className="mt-6">
-        <MixedPractice pool={courseQuestions(courseId)} courseId={courseId} lectureSlugs={lectureSlugs} />
+    <PrivateCourseGate course={content.course}>
+      <div>
+        <Link href={`/courses/${courseId}`} className="text-sm text-muted hover:text-text">← {content.course.title}</Link>
+        <h1 className="mt-4 text-3xl font-semibold tracking-tight">Mixed practice</h1>
+        <p className="mt-2 text-muted">
+          Up to 10 scenarios from every lecture you&apos;ve finished in this course. Questions you&apos;ve missed show up more often until you get them right.
+        </p>
+        <div className="mt-6">
+          <MixedPractice pool={courseQuestions(courseId)} courseId={courseId} lectureSlugs={lectureSlugs} />
+        </div>
+        <AiPractice
+          courseId={courseId}
+          lectures={content.lectures.filter((l) => l.available).map((l) => ({ id: l.id, title: l.title }))}
+          lectureSlugs={lectureSlugs}
+        />
       </div>
-      <AiPractice
-        courseId={courseId}
-        lectures={content.lectures.filter((l) => l.available).map((l) => ({ id: l.id, title: l.title }))}
-        lectureSlugs={lectureSlugs}
-      />
-    </div>
+    </PrivateCourseGate>
   );
 }

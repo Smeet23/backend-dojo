@@ -1,0 +1,309 @@
+import { EvRetrievalMetricsLab } from "@/components/widgets/EvRetrievalMetricsLab";
+import { EvAgentFailureFunnel } from "@/components/widgets/EvAgentFailureFunnel";
+
+## What RAG is, and its two flavors
+
+**Retrieval-augmented generation (RAG)** grounds an LLM in knowledge it was never trained on: your company's documents, a product catalog, today's news. The pipeline has two kinds of steps:
+
+- **Retrieval steps** fetch relevant information from somewhere: a vector index, a keyword index, a SQL database, a web search API. How it is fetched does not matter for this lesson.
+- **Generation steps** hand that context to an LLM, which turns it into an answer.
+
+The leasing assistant is a good example. "Can I bring my friend to the pool?" has a specific answer buried in one apartment complex's community policies. A model that answers without seeing that document is guessing, so any answer it gives is a hallucination even when it happens to be right.
+
+RAG comes in two broad flavors:
+
+| Flavor | How it works | Where you see it |
+|---|---|---|
+| **Vanilla RAG** | Query in, retrieve once, stuff results into the prompt, answer | Most 2023 era tutorials |
+| **Agentic RAG** | An LLM decides what to search for, reads the results, may rewrite or split the query, and searches again until it is confident | Nearly every serious production system today |
+
+The instructors point out that agentic RAG is mostly a new name for something good teams already did: rewrite queries, preprocess documents, add LLM steps wherever they make retrieval smarter. From an evals point of view the two flavors are the same problem. In both, you have a retriever and a generator, and you evaluate them **separately**.
+
+## Evaluate retrieval first, then generation
+
+Error analysis on full traces still comes first, as in every lesson so far. But RAG adds one thing: the retriever is a component you can measure on its own, with decades of information-retrieval metrics behind it.
+
+Measure the retriever before you spend time on the generator. If the right chunk is not in the context, no prompt can fix the answer. As Hamel puts it, the document is not at the party. Reading 100 traces to diagnose generation failures is wasted effort when half of them never had a chance. A rough rule of thumb from the lecture: get recall to 80 or 90 percent first, then go back to error analysis on the generation step.
+
+The question retrieval evals answer is narrow: **for this query, did we fetch the right context?** "Context" can be chunks, whole documents, web pages or database rows.
+
+## Build a retrieval eval dataset
+
+To measure retrieval you need pairs of **(query, IDs of the chunks that answer it)**. Real queries labeled by hand with their correct chunks are best, but that is slow and expensive. The usual alternative is synthetic generation, and it runs in reverse compared to the synthetic queries from error analysis: instead of starting from dimensions of user queries, you **start from the documents** and write questions about them.
+
+### What a chunk is
+
+A **chunk** is the unit of text your knowledge base retrieves. The right size depends on the domain:
+
+| Domain | Natural chunk |
+|---|---|
+| E-commerce | One whole product description |
+| Legal | One clause or section of a contract |
+| Leasing assistant | The FAQ section, a policy section, an amenity list |
+
+Two forces pull on chunk size. It should be a standalone unit that answers a question on its own, and it has to fit comfortably in the LLM's context alongside other chunks. Variable-sized chunks are fine: the amenity list can be short and the FAQ long.
+
+Hamel's advice is to bring **domain knowledge** to chunking rather than accepting a library default of 200 tokens. Also remember that the chunk you **match on** and the text you **send to the LLM** can differ. You can index small chunks for precise search and then pass the whole surrounding section or document to the generator.
+
+### Generate queries from chunks
+
+For each sampled chunk, run a two-step LLM pipeline:
+
+1. **Extract a salient fact** a user might care about.
+2. **Write a realistic user question** that this fact answers.
+
+Leasing example. Chunk from the community policies: *"Pool hours are 9 AM to 10 PM, Tuesday to Sunday. Closed Mondays for maintenance. Each apartment may bring at most two guests to the pool."* The LLM picks the fact "each apartment may bring at most two guests" and writes the question "Can I bring my friend to the pool?"
+
+The output is a list of **(question, fact, source chunk ID)** tuples. The chunk ID is the part people forget. A list of questions alone is not a retrieval eval: without the ground-truth chunk you cannot compute any retrieval metric.
+
+```python
+def make_query(chunk):
+    out = llm_json(
+        "Extract one specific, self-contained fact from this chunk, then write "
+        "a question a prospective renter would ask that only this fact answers. "
+        "Match the style of these real queries: " + REAL_EXAMPLES +
+        '\nReturn {"fact": ..., "question": ...}\nChunk: ' + chunk.text
+    )
+    return {"question": out["question"], "fact": out["fact"], "chunk_ids": [chunk.id]}
+
+dataset = [make_query(c) for c in random.sample(chunks, 200)]
+```
+
+You can run the fact step several times per chunk to get several questions. If some questions genuinely need two or more chunks (a section that says "see page 112"), store a **list** of chunk IDs and later check that the retriever found all of them. But first ask whether your chunking is wrong: in Shreya's experience, most "my answers span many chunks" complaints come from blind fixed-size splitting.
+
+### Make harder, adversarial questions
+
+Questions generated straight from one chunk are often too easy, because they reuse the chunk's exact words. To make them harder:
+
+1. Pick a **target chunk A** that holds a clear fact.
+2. Find **similar chunks B, C** (by embeddings or keywords) that share vocabulary but do **not** contain the fact.
+3. Ask the LLM for a question **only A answers**, but phrased with terms from B and C.
+
+Target A: *"The fitness center is open 24/7 with Peloton bikes and a yoga studio. The pool is open 9 AM to 10 PM."* Distractor B: *"Our community offers a state-of-the-art fitness center and a resort-style pool."* Adversarial question: "What are the hours for the fitness center and pool?" Both chunks mention the gym and pool, but only A has hours. A retriever that matches on surface words will be fooled.
+
+### Filter unrealistic queries
+
+Some generated questions are nonsense. "Are dogs allowed in one-bedroom apartments?" is realistic. "What is the paint color code in apartment 305's second bathroom?" is not: the LLM just happened to pick a paint-code fact. Have an LLM rate each query's realism on a **1 to 5 scale**, with a few hand-rated good and bad examples in the prompt, and **drop the 1s and 2s**.
+
+<Callout kind="remember">
+This is the one place the instructors are happy with a Likert scale. The score is never used as ground truth or reported as a metric. It is a fuzzy filter, used once and thrown away, and the cost of a few bad queries slipping through is just a little wasted reading time.
+</Callout>
+
+### Tips for synthetic retrieval data
+
+- **Seed with realism.** Put real user queries in the generation prompt as style examples. Real users are messy (the leasing traces were sometimes unintelligible), so ask for that messiness.
+- **Data first, retriever later.** Generate the dataset without any retriever in mind: BM25, embeddings, or something fancier. The dataset describes your users, not your architecture.
+- **Go beyond single chunks.** Deliberately build some multi-hop queries from chunks that cross-reference each other.
+- **Validate on real queries** once you have logs. Synthetic sets skew toward easy, extractive questions.
+
+## Retrieval metrics
+
+With (query, relevant chunk IDs) pairs, run the retriever on every query and score its ranked list. All four common metrics care about **ranking**: relevant chunks should be present and near the top.
+
+### Recall@k and Precision@k
+
+- **Recall@k** = relevant chunks in the top k ÷ all relevant chunks for the query. *Did we find everything?* It measures coverage, and it rises as k grows.
+- **Precision@k** = relevant chunks in the top k ÷ k. *How much of what we returned is useful?*
+
+They trade off: retrieve the whole corpus and recall is perfect while precision collapses.
+
+**Prioritize recall.** The consumer of retrieved chunks is an LLM, not a human scrolling results, and modern models with long contexts are good at ignoring noise when the answer is present. A missing chunk, on the other hand, can never be recovered. This is why production RAG is often **two-stage**: a fast first stage tuned for Recall@k over many candidates, then a reranker (a cross-encoder or an LLM) tuned for ordering and precision.
+
+The right **k** comes from the product: how many chunks you actually pass to the LLM, or show to a user. If humans see the results directly (a search page), precision matters much more. Some products blend the two with F1 or a weighted version, depending on what a false positive and a false negative cost.
+
+### Mean reciprocal rank (MRR)
+
+MRR asks **how high up is the first relevant chunk?** For each query, score 1/rank of the first relevant chunk (0 if none is in the top k), then average over queries.
+
+Four queries with the first relevant chunk at ranks 1, 3, not found, and 2: MRR = (1 + 0.33 + 0 + 0.5) / 4 = **0.46**.
+
+It is useful whenever a single chunk answers the question ("What are the pool hours?"), and because models can over-weight early context. Shreya's habit is to retrieve generously (even 100+ chunks) for recall, and then push MRR up so the answer sits near the top. Use it after recall, not instead of it. For multi-hop questions it says little, since it only looks at the first hit.
+
+### NDCG@k
+
+Not all relevant chunks are equally useful. **NDCG@k** (normalized discounted cumulative gain) uses **graded relevance**, say 0 = irrelevant to 3 = highly relevant, and rewards putting the best chunks first:
+
+```text
+DCG@k  = Σ (i = 1..k)  rel_i / log2(i + 1)
+IDCG@k = DCG@k of the same chunks sorted best-first
+NDCG@k = DCG@k / IDCG@k          (1.0 = perfect order)
+```
+
+The log discount means rank 1 counts fully, rank 2 counts 1/1.58 = 0.63, rank 3 counts 0.5, rank 4 counts 0.43. NDCG matters when context gets truncated: if only the first few chunks fit, you want the best ones there.
+
+### Worked example
+
+Query: "Can I bring my friend to the pool?" The retriever returns six chunks. A human grades them, and we also know of one more relevant chunk (grade 2) that the retriever never returned. Chunks with grade 2 or more count as "relevant" for the binary metrics.
+
+| Rank | Chunk | Grade | Discount 1/log2(i+1) | Gain |
+|---|---|---|---|---|
+| 1 | Amenities overview | 1 | 1.00 | 1.00 |
+| 2 | Pool rules (2 guests max) | 3 | 0.63 | 1.89 |
+| 3 | Parking and garage | 0 | 0.50 | 0 |
+| 4 | Guest policy | 2 | 0.43 | 0.86 |
+| 5 | Gym hours | 0 | 0.39 | 0 |
+
+At k = 5:
+
+- **Recall@5** = 2 found ÷ 3 relevant = **0.67** (the missed chunk costs a third).
+- **Precision@5** = 2 ÷ 5 = **0.40**.
+- **Reciprocal rank** = first relevant at rank 2, so **0.5**.
+- **DCG@5** = 1 + 1.89 + 0.86 = 3.75. Ideal order of these chunks is 3, 2, 1, 0, 0: IDCG = 3 + 1.26 + 0.5 = 4.76. **NDCG@5 = 0.79**.
+
+<Callout kind="warn">
+The course notes build the ideal from the chunks you retrieved, so NDCG only judges ordering. Many IR libraries build it from **every** known relevant chunk, so missing ones also lower the score: here the ideal becomes 3, 2, 2, 1 (IDCG 5.69) and NDCG@5 drops to 0.66. Know which one your tool computes before comparing numbers.
+</Callout>
+
+<EvRetrievalMetricsLab />
+
+Try it: move "Pool rules" to rank 1 and watch reciprocal rank and NDCG jump while recall and precision do not move. Set k to 1 and see how harsh recall becomes. Mark the missed chunk count to 0 and recall reaches 1.0.
+
+### Which metric when
+
+| Situation | Lead metric |
+|---|---|
+| First-stage retrieval feeding an LLM | Recall@k (always measure this) |
+| One chunk answers the question; LLM confused by noise | MRR |
+| Several chunks of differing usefulness; context may be truncated | NDCG@k |
+| Humans read the results directly | Precision@k matters more |
+| Multi-hop questions | Recall@k over all required chunks |
+
+## Evaluating and tuning chunking
+
+Chunking is a tunable part of the pipeline, and your retrieval dataset is how you tune it. The knobs are **chunk size**, **overlap** between neighboring chunks, and the **method** (fixed token windows, paragraph or section boundaries, semantic splitting).
+
+For fixed-size chunking, run a small **grid search**: for each configuration, re-index the corpus, rerun the retrieval eval, and compare.
+
+| Chunk size | Overlap | Recall@5 | NDCG@5 |
+|---|---|---|---|
+| 200 tokens | 0 | 0.79 | 0.66 |
+| 200 tokens | 50 | 0.85 | 0.71 |
+| 400 tokens | 0 | 0.84 | 0.72 |
+| 400 tokens | 100 | **0.90** | **0.76** |
+| 800 tokens | 0 | 0.81 | 0.70 |
+
+Here 400 tokens with 25% overlap wins. One caution: the gold chunk IDs belong to one chunking, so when chunk boundaries change, match ground truth by the **fact's text** (is the answer span inside the retrieved chunk?) rather than by the old ID.
+
+Fixed windows fail on heterogeneous documents because arbitrary boundaries split related content: a table lands in one chunk and the paragraph explaining it in another. Two fixes:
+
+- **Follow the document's own structure**: sections, FAQ entries, recipe steps, contract clauses.
+- **Add context to each chunk** before indexing: prepend the document title and section headings so a chunk about "Table 2" knows what report it belongs to.
+
+Treat this as an experiment, not a belief. Even with the same retriever, Recall@k can swing a lot on chunking alone.
+
+## Evaluating generation quality
+
+Once retrieval is solid, look at what the LLM does with the context. The ARES framework (from Stanford) names the main dimensions:
+
+- **Answer faithfulness** (groundedness): does the answer reflect the retrieved context? The three ways it breaks:
+  - **Hallucination**: the answer states something not in the context. In RAG, even true facts from the model's own knowledge usually count, because you wanted grounded answers.
+  - **Omission**: the context had the key information and the answer ignored it.
+  - **Misinterpretation**: the context was used but represented wrongly.
+- **Answer relevance**: a perfectly faithful answer can still miss the question. Asked how to reset the Foobar widget, the model faithfully quotes reset steps for the Bazqux widget that was also retrieved. Retrieval was fine and nothing was invented; the generator picked the wrong part of the context.
+
+<Callout kind="warn">
+RAG is where off-the-shelf metrics are most tempting, because "hallucination score" sounds obviously useful. But a generic hallucination metric is just someone else's prompt that has never seen your product. Use these categories as a **checklist while open coding** traces, find out what *your* system hallucinates or omits (prices? pet rules? tour dates?), and only then build an LLM judge for that specific failure, validated against human labels as in the previous lessons. Even the ARES authors train their judges on labeled data; nothing about it is off the shelf.
+</Callout>
+
+## RAG pitfalls
+
+- **Optimizing RAG before knowing retrieval is the problem.** Error analysis first, then retrieval metrics, then generation.
+- **Not choosing the precision and recall trade-off for your product.** How many chunks does the LLM get? Does a human see results? What does noise cost in tokens and confusion? There is no magic formula; experiment, but start by securing recall.
+- **No error analysis on retrieval failures.** Group the misses: which kinds of questions fail? Teams have found entire document sets that were never indexed this way.
+- **Bikeshedding tools.** Swapping vector databases or trying chunkers at random without knowing what is wrong. Focus on process, not tools. Many teams would do better starting with plain **keyword search (BM25)**, which often matches or beats embeddings, and is what strong search agents use under the hood.
+- **Only end-to-end scores.** One correctness number cannot tell you whether retrieval or generation broke.
+- **Overfitting to synthetic data.** Check against real queries as soon as you have them.
+
+## Beyond RAG: tool calling
+
+RAG is really a special case of **tool calling**: the model invokes something external and reasons over what comes back. In a tool-calling system the LLM picks a tool from a list you provide, generates arguments, your code executes the call, and the result goes back into the conversation. The leasing assistant has a dozen such tools (`check_calendar`, `schedule_tour`, `query_listings`, `transfer_call` and so on).
+
+Nothing changes about the evals process. But the first thing to fix is usually not the model: it is the **tool descriptions**. The model relies heavily on each tool's name, description and parameter spec, the same way it relies on your system prompt. Spend real time writing them, include example arguments, and keep tools distinct from each other. The same goes for MCP servers. If you use a framework, read the prompts it hides from you; they are sometimes poor.
+
+### Evaluate each step of a tool call
+
+When reading traces, check each stage separately. Use this as a checklist during error analysis, not as a list of evaluators to build.
+
+| Stage | What goes wrong | Leasing example |
+|---|---|---|
+| **Tool selection** | Wrong tool, no tool when one was needed, or a hallucinated tool | Calls `send_email` for "any showings this weekend?"; prompt says "use the reschedule tool" but no such tool was provided |
+| **Argument generation** | Schema or type errors, missing required args, semantically wrong values, unsafe input | `price_max: "700k"` instead of `700000`; date "May 10th" when the tool expects `YYYY-MM-DD`; raw user text inside a SQL filter |
+| **Execution** | Timeouts, network errors, and **silent failures** | `query_listings(property_id="98765")` passes validation, returns zero rows, and the model tells the user nothing is available |
+| **Handling the output** | Misreads the result, drops key details, fails to use it | Says "over 2,000 sq ft" for 1,500; omits a "structural issues" note; gets back two open slots and then asks "when are you free?" |
+
+Structural checks (schema validation with Pydantic) are cheap code-based evaluators. Semantic checks need reference data or custom rules. And watch especially for silent failures: an empty result that looks like a real answer is the classic way agents go wrong without anyone noticing.
+
+## Debugging agents and multi-step pipelines
+
+Agents chain many steps, and an early mistake **cascades**: bad arguments produce an empty result, which produces a confident wrong reply. The path also varies from trace to trace. Two things make this tractable.
+
+**Traceability.** Log everything at every step: inputs, the model's reasoning, every tool call with its arguments and response, every decision. You cannot attribute a failure you did not record.
+
+**Know the intended level of agency.** If the agent is meant to work autonomously, stopping to ask the user is a failure. If it is meant to defer to humans, the same behavior is correct. Decide which before you label anything.
+
+### Find the first failure
+
+The error analysis heuristic from earlier lessons applies directly: look at the input and the final outcome; if the outcome is bad, walk forward from the start and mark the **first** step that went wrong. Attribute the trace there. Later steps that "failed" were usually reacting reasonably to garbage.
+
+Then count. Define discrete **states** for your pipeline (each tool call's argument generation and execution can be separate states, and so can reasoning steps such as deciding the next action), label the first failing state in each failed trace, and tally. Laid out in pipeline order, this is a **failure funnel**: how many traces reach each step, and how many first fail there.
+
+<EvAgentFailureFunnel />
+
+Switch to "count every step that looks broken" and the last steps look like the worst offenders, even though no trace's root cause is in "Reply". Fix "Generate args" and one trace that was hiding a second bug now fails later, at "Use result". Fixing the top hotspot reveals the next one, which is why this is a loop.
+
+### Transition failure matrix
+
+Agents branch, so a single funnel is not always enough. A **transition failure matrix** has one row per **last successful state** and one column per **state where the first failure happened**, with counts in the cells. For a leasing assistant with a SQL path and a calendar path, the non-zero cells over 32 failed traces might be:
+
+| Last successful state | First failure in | Count |
+|---|---|---|
+| GenSQL | ExecSQL | 10 |
+| GenCal | ExecCal | 6 |
+| DecideTool | GenSQL | 5 |
+| ExecSQL | Respond | 4 |
+| ClassifyIntent | DecideTool | 3 |
+| DecideTool | GenCal | 2 |
+| ParseRequest | ClassifyIntent | 2 |
+
+Read it two ways. **Column sums** say which state fails most overall (ExecSQL, 10). **Individual cells** say in which context: ExecSQL might be fine when the user supplied the filter and fail mostly after the LLM wrote the SQL. Start debugging by pulling the 10 GenSQL to ExecSQL traces and doing error analysis on them. The root cause may be in either state (for example, the prompt never said which SQL dialect the database uses). As fixes land, the matrix should get sparser.
+
+## Other input modalities
+
+The analyze, measure, improve loop does not change for images, long documents or PDFs. What changes is the list of failures to look for.
+
+### Images
+
+Vision-language models describe individual objects well, but watch for errors in **spatial reasoning** (left and right, behind, above), **counting**, **reading text in images**, and **hallucinated objects**. Image generation has its own quirks: diffusion models refine the whole image at once, so global constraints are hard. Ask for twelve distinct presidents in one picture and you get repeats and mashups. Negative constraints ("fried rice, no peas") are often ignored too. Judges must see the image: either a human or a capable VLM.
+
+### Long documents
+
+Accuracy drops as context grows, even well inside the window. Shreya splits long-document tasks into two types:
+
+- **Constant-output tasks** (needle in a haystack): find one fact or clause, such as the covenant-not-to-sue clause in a 500-page contract. Output size does not grow with the document. Test whether performance drops when the answer sits **in the middle**.
+- **Variable-size output tasks**: extract **all** clauses, summarize **every** section, list **every** logical fallacy in a debate transcript. Output grows with the document, and models do poorly when they must attend to everything at once. **Chunk** the document, run the LLM on each chunk, and merge the results.
+
+To tune a variable-output pipeline, start with the whole document as one chunk as a baseline, then try smaller chunk sizes and see which finds the most valid items. A rule of thumb from the notes: keep each chunk to about **3 to 5 items** the model must reason over. Simple extraction tolerates 2k to 4k token chunks; harder transformations need closer to 1k. Evaluate per chunk *and* the merged result (anything missed or duplicated?).
+
+For LLM judges, avoid feeding the full document: it is expensive and the judge degrades like any model. Give it the relevant snippet, or judge chunk by chunk and aggregate. Every chunk must pass for variable-output tasks; for a constant-output task, one chunk with the right answer is enough.
+
+### PDFs
+
+PDFs inherit the problems of both images and long documents, and the biggest source of errors is usually **extraction**: OCR mistakes on scans, mangled tables, wrong reading order in multi-column layouts. Digitally generated PDFs extract much better than scans, and the way you format an extracted table for the model changes results. When debugging, **look at the extracted text the LLM actually received**, not the original PDF, so you don't blame the model for garbage input. And check what off-the-shelf PDF tools do under the hood; some just send page images to a vision model.
+
+## Cheat sheet
+
+- RAG = retrieval steps plus generation steps; vanilla or agentic, evaluate the retriever and the generator separately.
+- Measure retrieval before tuning generation. If the right chunk is missing, nothing downstream can fix it.
+- Retrieval datasets are (query, gold chunk IDs). Generate them in reverse: chunk, salient fact, realistic question. Keep the chunk ID.
+- Make adversarial questions from a target chunk using vocabulary from similar distractor chunks.
+- Filter synthetic queries with a 1 to 5 realism rating, drop 1s and 2s, then never use the score again.
+- Recall@k = found ÷ all relevant; Precision@k = relevant ÷ k. Prioritize recall when an LLM consumes the chunks.
+- MRR = average of 1/rank of the first relevant chunk; NDCG@k = DCG ÷ ideal DCG with graded relevance and a log2(i+1) discount.
+- Pick k from the product: how many chunks reach the LLM or the user.
+- Tune chunking with a grid search over size and overlap, and prefer the document's natural structure.
+- Faithfulness (no hallucination, omission, misinterpretation) and answer relevance are open-coding checklists, not off-the-shelf metrics.
+- Don't bikeshed vector databases. Try BM25, and do error analysis on retrieval misses.
+- Tool calls: check selection, arguments, execution (especially silent empty results) and use of the output. Write clear tool descriptions first.
+- Attribute each failed agent trace to its first failing step; count per step (failure funnel) or per transition (failure matrix) to find hotspots.
+- Long documents: needle tasks test lost-in-the-middle; extract-everything tasks need chunking with 3 to 5 items per chunk.
+- PDFs: inspect the extracted text before blaming the model.

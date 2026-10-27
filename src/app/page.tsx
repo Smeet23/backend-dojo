@@ -7,6 +7,8 @@ export default function Home() {
     title: course.title,
     summary: course.summary,
     author: course.author,
+    sourceKind: course.sourceKind ?? "playlist",
+    private: course.private ?? false,
     lectureKeys: lectures.filter((l) => l.available).map((l) => `${course.id}:${l.id}`),
   }));
 

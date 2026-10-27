@@ -1,0 +1,249 @@
+import { EvTupleGenerator } from "@/components/widgets/EvTupleGenerator";
+import { EvAxialCodingLab } from "@/components/widgets/EvAxialCodingLab";
+
+## Where error analysis fits
+
+The evals lifecycle is **Analyze, Measure, Improve**. This lesson is the first box. Before you can measure anything, you need to know *what* to measure, and the only reliable way to find that out is to look at what your pipeline actually does on realistic inputs and write down how it fails.
+
+Error analysis is how you cross the **gulf of comprehension**, the gap between you and the data your app runs on. Its output is not a score. It is a short, application-specific list of **failure modes**, each with a clear definition and examples, plus a count of how often each one happens. That list is what you later build automated evaluators around.
+
+The stages, end to end:
+
+1. **Create a starting dataset** of about 100 inputs (real, synthetic, or both) and run the pipeline to get traces.
+2. **Read traces and open code**: write a short free-form note on what went wrong in each one.
+3. **Axial code**: cluster the notes into a small taxonomy of failure modes.
+4. **Label every trace** against the taxonomy (present or absent per mode) and count.
+5. **Iterate**: read more traces, refine the taxonomy, re-label, until nothing new shows up.
+
+The instructors call this step the one that holds most of the value in evals, and also the one teams skip most, because reading data by hand feels old-fashioned in the age of LLMs. It is not optional.
+
+## The running example: a leasing assistant
+
+The example throughout is a real product (anonymized data, shared with permission): an AI **leasing assistant** for apartment complexes. It answers prospective, current and past residents over voice, text and email. It has a dozen or more tools, including:
+
+- `get_tour_availability` and `schedule_tour`
+- `check_apartment_availability`
+- `update_contact_info`
+- `get_resident_balance`
+- `transfer_call` (hand off to a human)
+
+Its system prompt is long and the result of many iterations: a persona name, "do not invent information", rules for working out whether the caller is a current or prospective resident, when to transfer, a required date format, and instructions to call tools quietly in the background. Lots of instructions means lots of ways to go wrong, which is exactly why reading traces pays off.
+
+<Callout kind="tip">
+If you didn't write the system prompt, read it before you read a single trace. You can't judge whether the assistant failed until you know what it was told to do.
+</Callout>
+
+## Create a starting dataset
+
+### Where the data comes from
+
+**If you have production traffic, use it.** Real users type things you would never invent: one real leasing message was so garbled the instructors could only make out "bedroom", "moving costs" and "square footage". If you have far more than 100 real queries, sample for diversity: cluster them (embeddings or simple keyword rules) and sample across clusters so you don't just get 100 copies of the most common request. With a small pool, random sampling is fine.
+
+**If you don't, generate synthetic queries, but carefully.** Before generating anything, use the product yourself, many times, and throw odd or adversarial queries at it. Or get a few friends to try it. You want **hypotheses** about where it breaks, because synthetic data should be aimed at those weak spots first. Approach it like a skeptical data scientist: assume it breaks somewhere and go find where.
+
+### How many traces: aim for about 100
+
+About **100 diverse traces** is a rule of thumb, not a law. The real target is **theoretical saturation**: the point where reading more traces stops revealing new *kinds* of failure. You will still see new instances of known failures; that's fine.
+
+Why 100 and not 20? Below that, it's too easy to tell yourself "I'm not learning anything new" when really you're just tired of reading. By the time you reach 100 you either genuinely have the picture or you've started to appreciate the process enough to keep going. Stopping early is how you end up firefighting failure modes in production that you never looked for.
+
+### Synthetic queries: sample along dimensions
+
+The bad approach is one prompt: "Give me 100 user queries for a leasing assistant." You get generic, repetitive, polite queries that look nothing like real users and rarely trip the system up.
+
+The good approach starts with product thinking. A **dimension** is one axis along which real queries vary in a way that matters for your app. Pick at least three, and pick them because they're where you suspect failures. For the leasing assistant:
+
+| Dimension | Example values |
+|---|---|
+| **Intent** (what they want) | check availability, schedule a tour, ask about pet policy, request maintenance, ask about the application process |
+| **Caller status / persona** (who's asking) | prospect on a budget, prospect wanting luxury, current resident with an urgent issue, current resident with a general question |
+| **Scenario / complexity** (how hard the request is) | clear with all details, ambiguous or missing information, out of scope, multi-turn |
+
+Other dimensions you could use: which property (for a large chain), or whether the caller wants a quick answer versus a back-and-forth. Dimensions are specific to each product; don't copy these for a recipe bot (there you might use dietary restriction, ingredients on hand, cuisine, meal type, skill level).
+
+If you get stuck, brainstorm a long list of candidate dimensions and try to write three values for each. Dimensions where values come easily and differ a lot are the ones worth sampling along.
+
+A **tuple** is one value from each dimension, for example (schedule tour, current resident, ambiguous). Each tuple describes one specific use case.
+
+### From tuples to natural queries
+
+Generation is a two-step pipeline with a human review after each step:
+
+1. **Make tuples.** Either enumerate the cross product in code, or ask an LLM for combinations (around 50). Then **review**: drop duplicates and implausible combinations (a prospect asking for their rent balance).
+2. **Turn each tuple into a query.** A second prompt takes one tuple plus an example query and writes a realistic message in that style. **Review again**: throw out anything awkward or unrealistic, and regenerate.
+
+Splitting the steps is the point. Asking for tuples first forces coverage across the space; writing each query from a single tuple gives far more varied phrasing than one big prompt does. Writing about 20 tuples by hand first is also a good way to understand your own problem.
+
+```python
+from itertools import product
+
+intents = ["check availability", "schedule tour", "reschedule tour", "maintenance request"]
+personas = ["prospect, budget", "prospect, luxury", "current resident"]
+scenarios = ["clear, all details", "ambiguous", "terse or typo-ridden"]
+
+tuples = list(product(intents, personas, scenarios))   # 4 * 3 * 3 = 36
+# Step 1 review: let a human (or an LLM, checked by a human) drop implausible ones
+tuples = [t for t in tuples if not (t[1].startswith("prospect") and t[0] == "maintenance request")]
+
+QUERY_PROMPT = """We are generating realistic user messages for an apartment leasing assistant.
+Intent: {intent}
+Caller: {persona}
+Scenario: {scenario}
+Example for a different tuple: "cant make it thurs. fri?"
+Write one new message this caller might actually send. Output only the message."""
+# Step 2: one LLM call per tuple (often 2-3 per tuple to reach ~100), then review every result
+```
+
+One instructor prefers to enumerate the cross product in code and use an LLM only to flag unrealistic tuples; others let the LLM propose tuples. There's no fixed rule. What matters is that when you finish, you can read your 100 queries and believe they're realistic and not near-duplicates. **Be aggressive in quality control here**: everything downstream inherits the realism of this set. Then run the bot on every query and save the full traces.
+
+<EvTupleGenerator />
+
+## Read the traces
+
+A **trace** is the complete record of one interaction: the user's input, every LLM call's inputs and outputs, every tool call with its arguments and results (`get_tour_availability`, `check_apartment_availability`), any intermediate reasoning, and the final reply. A good test: could you replay the whole interaction in your head from it? With chat APIs it's often just the full list of messages.
+
+You need the intermediate steps, not only the final answer, because failures often happen in the middle. In one leasing trace, the agent said "I've sent you a text confirmation" twice; only the tool results showed that the text-message tool had never succeeded.
+
+Use whatever renders traces readably: an observability tool (the live demo used Braintrust only because the data was already there), a notebook, or a spreadsheet. Plan to get fast. Experienced reviewers move through simple traces in seconds.
+
+## Open coding: write down what went wrong
+
+"Coding" here means annotating, not programming. **Open coding** is borrowed from grounded theory in qualitative research: you read the data and attach short descriptive labels, letting categories **emerge from the data** instead of starting with a fixed checklist.
+
+For each trace, write a brief note about anything that is wrong, surprising, or feels off: a wrong tool, an invented fact, a bad tone, a missed opportunity. Keep the friction low. Free text, one or two lines.
+
+### Note the first upstream failure
+
+Traces with many turns or tool calls can contain a dozen problems, and most of them are knock-on effects of the first. So, as a beginner:
+
+- Find the **most upstream** failure, note it, and **move on**.
+- Don't catalogue every downstream symptom. Fixing the first error often fixes the rest.
+- Don't root-cause yet. You're not asking *why* the prompt allowed it; you're recording *what* happened. Jumping into "improve" mode mid-review slows error analysis to a crawl.
+
+Once you've done a couple of rounds and can hold the system's behavior in your head, you can start labeling **all independent failures** in a trace. Later, when you need an accurate before-and-after rate for one specific failure mode, you re-label a subset exhaustively for just that mode.
+
+### What a good open code looks like
+
+Real notes from the demo, cleaned up:
+
+| Trace | Open code |
+|---|---|
+| Text tool failed during booking | Did not report that the text-message tool failed; said "sent confirmation" twice in a row. |
+| Caller asked for a representative | Caller asked to be transferred; agent kept asking questions instead of transferring right away. |
+| Caller wanted Friday instead | Asked to reschedule; scheduled a new tour and left the old one. (There was no reschedule tool.) |
+| Unit "A11" quoted | Said A11 is available; A11 appears in no tool output. Likely hallucinated. |
+| Late caller asks about parking | Did not answer parking; should say it doesn't know and flag the question to staff in the background. |
+
+Notice what's *not* there. "User query had typos" or "couldn't parse the message" describe the input, not a failure of the assistant. Only note failures. Also notice that "it should have said X" is a useful addition when you know what good looks like.
+
+The rescheduling trace is a good lesson in **product context**. Without knowing the agent lacked a reschedule tool, it looks like a successful booking. With that context, it turned out to be one of the most frequent failures in the whole dataset. This is why the person coding needs to understand the product, and why domain experts belong in the loop. A more senior reviewer might also flag things like "this caller said 'too expensive' and we let them walk away with no attempt to keep them", which a junior reviewer would reasonably pass. Both are valid; that judgment is where PMs add the most.
+
+### Don't hand this step to an LLM
+
+In the demo, the instructors pasted the failed-text-message trace into a frontier model and asked whether the agent handled the query correctly. It said there was "some minor redundancy" but the query was fulfilled. A human would not believe a tour was booked without the confirmation. Generic LLMs lack your product context and your taste, so they miss exactly the failures that matter. Reading traces is your job.
+
+<Callout kind="tip">
+Stuck on how to describe what feels off? Temporarily go top-down: look specifically for known LLM failure types (invented facts, malformed structured output, ignored length limits, inconsistent style) and describe how each one shows up in *your* trace. Use them as lenses, not as your taxonomy.
+</Callout>
+
+## Axial coding: build a failure taxonomy
+
+After about 100 traces you'll have a pile of messy, specific notes. **Axial coding** (the next step in grounded theory) groups them into higher-level categories: think of each note as a sticky note on a whiteboard that you cluster into piles. For the leasing assistant, clusters included:
+
+- **Scheduling and rescheduling** problems (new tour instead of reschedule, wrong time, past slots)
+- **Handoff and escalation** problems (not transferring when asked, transferring too late)
+- **Incorrect or invented information** (units, policies, capabilities)
+- **Poor reaction to tool errors**
+- **Formatting** that doesn't fit the channel
+
+Expect a long tail, and expect something like an 80/20 split: a few categories explain most failures.
+
+Each final failure mode should be:
+
+- **Binary**: present or absent in a trace, with no 1 to 5 scale.
+- **Clearly defined**: a title, a one-line definition, and one or two real examples.
+- **Non-overlapping**: a trace's failure should obviously belong in one mode.
+
+Merging and splitting take judgment. "Bad communication" might really be two modes: persona mismatch (investor jargon sent to a first-time buyer) and inappropriate tone (slang sent to a luxury client). "Hallucination" might split into invented facts about the property versus invented user actions (scheduling a tour nobody asked for). When in doubt, ask a domain expert.
+
+### Using an LLM to help cluster
+
+This is where an LLM is genuinely useful. Export your notes (a CSV of trace ids and open codes), paste them into a chat model or a data-analysis tool, and ask for groupings:
+
+```text
+Below are open-ended notes describing failures in an apartment leasing assistant.
+Group them into a small set of coherent failure categories. Give each a short
+title and a one-line definition. Only cluster what is in the notes; do not invent
+new failure types.
+```
+
+Treat the result as a **first draft**. In the live demo the model initially missed some notes and needed prodding; its draft categories ("missed or delayed handoffs", "incorrect factual assertions") were a reasonable start, not the answer. You review every cluster, rename, merge, split and write the definitions. The human stays in charge of the taxonomy.
+
+<EvAxialCodingLab />
+
+## Label every trace and count
+
+Now go back over the traces with the taxonomy. Add one column per failure mode and mark each trace **1** (present) or **0** (absent). If an LLM drafted the categories, map each open code back to them carefully, either by hand or with a per-trace prompt ("Given this note and these failure modes, which apply?") that you spot-check.
+
+| trace_id | open_code | scheduling | handoff | invented_facts | tool_errors |
+|---|---|---|---|---|---|
+| t03 | booked second tour instead of rescheduling | 1 | 0 | 0 | 0 |
+| t07 | kept asking questions after transfer request | 0 | 1 | 0 | 0 |
+| t08 | quoted unit A11, not in any tool output | 0 | 0 | 1 | 0 |
+| t09 | (no issue) | 0 | 0 | 0 | 0 |
+
+Then count. A spreadsheet `SUM` per column divided by the number of traces works; so does pandas:
+
+```python
+import pandas as pd
+
+df = pd.read_csv("labeled_traces.csv")
+modes = ["scheduling", "handoff", "invented_facts", "tool_errors", "caller_status", "formatting"]
+summary = (df[modes].sum().rename("traces").to_frame()
+           .assign(rate=lambda t: (t.traces / len(df)).round(3))
+           .sort_values("traces", ascending=False))
+print(summary)
+```
+
+If 13 of 100 traces have a scheduling failure and 3 have a formatting one, you know where to spend the next week. Frequency isn't the only input (one invented lease term may cost more than ten clumsy SMS replies), but now you're prioritizing with data instead of with whoever complained loudest. You'll also hit traces that don't fit any mode or that expose a fuzzy definition. That's expected: fix the definition and keep going.
+
+## Iterate until saturation
+
+Your first taxonomy will be wrong in places. Evaluation criteria **drift** as you review: seeing more outputs changes your sense of what "bad" means. Teams that do about **three rounds** typically change their taxonomy a lot, refining definitions, merging near-duplicates and splitting broad buckets.
+
+Each round: read more traces (unlabeled ones or freshly generated queries), open code them, update the taxonomy, re-label. A second round on the leasing data might surface a mode the first missed entirely. Two or three serious rounds usually get you close to saturation, after which more reading yields little.
+
+If a failure mode is real but rare in your sample, generate **targeted** synthetic queries to trigger it (for example, reschedule requests in many phrasings) so you have enough examples to build and test an evaluator later.
+
+## Custom review interfaces
+
+The friction of reviewing adds up over hundreds of traces. In the demo, checking whether a reschedule had worked meant opening a *different* system to see the caller's booked tours. A small custom annotation app, quick to build with an AI coding tool, can put the trace, the relevant business data, the note field and keyboard shortcuts on one screen, and can offer your failure modes as one-click labels. Lesson 8 covers what makes these interfaces fast.
+
+## Common pitfalls
+
+- **Unrepresentative data.** If the queries don't reflect real users' variety and difficulty, either nothing fails or the wrong things fail. Choose dimensions that target likely failures.
+- **Skipping open coding.** Starting from a generic list ("hallucination", "verbosity", "helpfulness") or a vendor's off-the-shelf metrics misses the failures specific to your app, like booking unavailable times or treating a resident as a prospect.
+- **Likert scales too early.** A 1 to 5 score without a detailed rubric is noisy, and annotators disagree on it. Use pass/fail per failure mode.
+- **Not iterating.** Treating the first taxonomy as final freezes your evals around an incomplete understanding.
+- **Excluding domain experts.** In complex domains, people without subject knowledge label superficially or wrongly. Make it easy for experts to review.
+- **Fixing while reviewing.** Debugging the prompt mid-pass slows you down and narrows what you notice. Observe first, improve later.
+- **Outsourcing the reading to an LLM.** Use LLMs to generate queries and to draft clusters, not to judge raw traces before you understand your failures.
+
+## Cheat sheet
+
+- Error analysis is the Analyze step: it produces a defined, counted list of your app's failure modes.
+- Start with about 100 diverse traces; the real goal is theoretical saturation, not the number.
+- Use production data if you have it; sample across clusters for diversity.
+- Never ask an LLM for "a bunch of queries"; define 3+ dimensions where you expect failures.
+- Tuple = one value per dimension. Generate tuples, review, turn each into a natural query, review again.
+- Use the product yourself first so synthetic data targets real hypotheses.
+- A trace includes every LLM call, tool call and result, not just the final reply.
+- Open coding: short free-form notes on what went wrong; categories emerge from the data.
+- Beginners note only the first upstream failure and move on; don't root-cause yet.
+- Note assistant failures, not properties of the input like typos.
+- Don't ask an LLM to judge traces in this phase; it lacks your product context.
+- Axial coding clusters notes into a small set of binary, well-defined, non-overlapping failure modes.
+- An LLM can draft the clusters; a human reviews, merges, splits and defines them.
+- Label each trace 1/0 per mode, sum the columns, and prioritize by rate and impact.
+- Expect criteria drift; two or three rounds of re-coding usually reach saturation.
+- Pass/fail beats Likert scales early; keep domain experts in the loop.

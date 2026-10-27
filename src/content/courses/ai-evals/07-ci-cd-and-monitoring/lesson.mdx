@@ -1,0 +1,289 @@
+import { EvCicdSuiteBuilder } from "@/components/widgets/EvCicdSuiteBuilder";
+import { EvCicdGuardrailSorter } from "@/components/widgets/EvCicdGuardrailSorter";
+
+## Where this lesson picks up
+
+By now you can find failure modes (error analysis), turn them into evaluators (code checks and LLM judges), and trust those evaluators (TPR, TNR and the corrected success rate θ̂). This lesson is about keeping all of that running after launch, using two ideas borrowed from software engineering: **continuous integration (CI)** and **continuous deployment (CD)**.
+
+The instructors are upfront that this is the least urgent part of the course. If nobody on your team has asked "how do we wire evals into our pipeline?", keep doing error analysis and come back later. It matters most for teams that already have solid engineering habits and want evals to plug into them.
+
+The running example is a **real estate agent assistant**: an LLM agent that helps agents answer client questions about listings, query a listings database with SQL, check calendars, and draft emails to clients.
+
+## Why CI/CD looks different for LLMs
+
+You cannot copy a normal software pipeline, or even a classic machine learning one, and expect it to work. Four things change:
+
+| Aspect | Classic ML | LLM pipelines |
+|---|---|---|
+| Starting data | Large labeled datasets; CI retrains and validates on big test sets | A handful of labeled traces from error analysis; the logic lives in the prompt and a model you didn't train |
+| Where failures come from | Data drift, feature bugs, training/serving mismatch | Prompt sensitivity, silent provider model updates, judge drift, hallucination, multi-step agent failures |
+| Measuring quality | Accuracy, F1, AUC; online labels such as clicks plug straight into formulas | Tone, faithfulness, helpfulness: subjective, so you need custom evaluators, and small offline sets don't represent traffic |
+| Determinism | Same input, same model, same output | Same input can give different outputs, so tests must tolerate variation |
+
+A unit test in normal software checks one objective fact. An LLM test often checks something that needs judgment, against an output that may differ every run, produced by a model the provider might update underneath you.
+
+## Known unknowns and unknown unknowns
+
+If you keep one idea from this lesson, keep this split:
+
+- **CI is unit tests for known unknowns.** You already know your failure modes because error analysis surfaced them, with ten or so real traces for each. Before shipping a prompt change, run those cases and make sure you haven't reintroduced anything you've already seen.
+- **CD is monitoring for unknown unknowns.** Once the system is live, users do things you never predicted. You keep sampling production traces and doing error analysis on them to find failure modes your first round never saw.
+
+Both halves involve error analysis. CI replays what you learned from it; CD keeps feeding it new material. It is simply not possible to anticipate most failure modes before an LLM application meets real users.
+
+## CI: a safety net against regressions
+
+The goal of LLM CI is narrow: **confirm that a change (a prompt tweak, a model swap, a new tool) doesn't break behavior you already care about.** It is not a measurement of production accuracy. A classic ML pipeline might report overall accuracy on a large held-out set; LLM CI checks specific, known failure modes on a small, curated set.
+
+### Building the golden dataset
+
+The core of CI is a **golden dataset**: hand-picked inputs, each with a reference (the correct output, or the facts needed to judge it). It should contain:
+
+- **Core features**: the everyday requests the product must keep handling.
+- **Past critical failures**: traces that broke before, now acting as regression tests.
+- **Edge cases** found during error analysis, the awkward phrasings and rare situations.
+- **Path coverage**: examples that exercise each tool call, the RAG path, and each branch of your prompt logic.
+
+A typical set has **100 or more examples**, and it is deliberately **not a random sample of production**. It is built to stress the behaviors you want to protect. Building it takes human review and labeling, often with the collaborative methods from earlier lessons to agree on what "correct" means. The effort pays off because the suite runs on every change.
+
+### What to check in CI
+
+CI evaluation is **reference-based**: for each golden input, run the new pipeline and compare its output against the reference. Prefer **code assertions** wherever they work, because they are cheap, instant and deterministic. Add **a few LLM judges** for the failure modes code can't see. For the real estate assistant:
+
+| Check | Input | Reference | Evaluator |
+|---|---|---|---|
+| Factual consistency | Client question about a listing | The listing data | LLM judge: is anything unsupported or contradicted? |
+| Tone match | Client message plus the agent's persona | A human-approved reply in that persona | LLM judge |
+| Tool argument schema | "When is the agent free Thursday?" | The calendar tool's schema | Code: validate the arguments |
+| Email address exists | "Email John B. about the new match" | The client database | Code: the recipient is a real client address |
+
+If any check fails on its golden example, **the build fails** and the change doesn't merge.
+
+### Example: factual consistency
+
+The golden input carries both the client's question and the trusted data for the property:
+
+```json
+{
+  "id": "fact-017",
+  "input": "Does 456 Oak Avenue have outdoor space?",
+  "reference": {
+    "listing": { "address": "456 Oak Avenue", "features": ["updated kitchen 2022", "patio", "large lot"], "yard_type": "open" }
+  }
+}
+```
+
+The pipeline answers, say, "456 Oak Avenue has a patio, a large open yard, and a heated pool." A judge receives the answer, the listing data, and one narrow question: does the answer state anything that is contradicted by, or not supported by, the listing? Here the pool is unsupported, so the judge fails it and CI goes red.
+
+### Example: does the email address exist?
+
+When the pipeline decides to email a client, it has to work out who "John B." is and look up his address. A wrong address is a serious, objective failure, so no judge is needed. Plain test code covers it:
+
+```python
+import json
+import pytest
+from assistant import run_assistant
+from evals import judge_factual_consistency
+from crm import client_emails
+
+GOLDEN = [json.loads(line) for line in open("golden/ci_set.jsonl")]
+
+def cases(check):
+    return [e for e in GOLDEN if e["check"] == check]
+
+@pytest.mark.parametrize("ex", cases("email"), ids=lambda e: e["id"])
+def test_recipient_email_exists(ex):
+    out = run_assistant(ex["input"])
+    emails = [c for c in out.tool_calls if c.name == "send_email"]
+    assert emails, "expected the assistant to send an email"
+    to = emails[0].args["to"]
+    assert to in client_emails(), f"{to} is not a known client"
+    assert to == ex["reference"]["email"]
+
+@pytest.mark.flaky(reruns=2)  # nondeterminism: re-run before failing the build
+@pytest.mark.parametrize("ex", cases("fact"), ids=lambda e: e["id"])
+def test_factual_consistency(ex):
+    out = run_assistant(ex["input"])
+    verdict = judge_factual_consistency(out.text, ex["reference"]["listing"])
+    assert verdict.passed, verdict.reason
+```
+
+Two details in that file matter. Judge tests are marked flaky so a single unlucky sample is re-run rather than blocking a merge (some teams instead run each case a few times or accept a set of valid outputs). And inside `judge_factual_consistency` the judge model is **pinned to an exact dated version**, never an alias like "latest". Otherwise your CI results can change overnight because the provider updated the judge, with no change on your side.
+
+### Keeping CI fast and cheap
+
+A suite that takes 20 minutes or costs real money per commit gets skipped. The levers:
+
+- **Code checks first.** They cost nothing and take milliseconds. Each judge adds a model call per example.
+- **Few judges.** Use them only for the failure modes code truly can't catch, such as tone or faithfulness.
+- **Parallelize.** Examples are independent, so run them concurrently.
+- **Decide when judges run.** Running code checks on every commit and the full suite (judges included) before merging to main is a common split.
+
+Worked numbers: 120 examples, two judges at about $0.004 per call, and a pipeline run of about $0.003 each. One full run makes 240 judge calls and costs 120 × (0.003 + 2 × 0.004) = **$1.32**. At 30 commits a day that is about $40 a day. Running judges only on 6 merges a day cuts it to 30 × $0.36 + 6 × $1.32 ≈ **$19**. With 8 parallel workers a run takes about 15 batches × 6.5 s ≈ 1.6 minutes; on a single worker it is 13 minutes.
+
+<EvCicdSuiteBuilder />
+
+### Maintaining the suite
+
+A golden set is never finished. Whenever online monitoring or a new round of error analysis turns up a failure mode, add examples of it, so the safety net grows to cover each newly understood risk.
+
+Watch the pass rate too. **If CI passes 100% of the time, it may not be telling you anything.** Keep challenging cases in it so it has signal. Over time you can also overfit the pipeline to the CI set, tuning prompts until those exact cases pass. Refresh it now and then so it stays useful. There's no exact formula for when; it's a judgment call.
+
+### CI common mistakes
+
+1. **Treating the CI pass rate as production accuracy.** You'll see claims like "our app is 98% accurate" that come from a fixed, curated set. The set is small, built around known issues, and not sampled from real traffic, so it says little about live behavior. A CI pass rate means **stable on known issues**, nothing more.
+2. **Data leakage.** If golden examples appear in the pipeline's prompt (as few-shot examples) or in a judge's prompt, the pipeline is being tested on its own answer key. The pass rate inflates and the checks become close to meaningless.
+3. **A big set nobody has read.** A large, poorly curated dataset gives false comfort. If you don't know what's in your CI set, its metrics mean nothing. Quality and diversity beat size.
+
+## CD: observability first
+
+CD is where you learn how the system actually performs, find new failure modes, and catch the unknown unknowns. All of it depends on **logging**. For each production request, or a representative sample, record:
+
+- The input and metadata (user and session IDs, feature flags)
+- Every intermediate LLM call: prompt, response, any reasoning
+- Every tool call: name, arguments, response, errors
+- Retrieved documents for RAG steps (it can help to also log documents the retriever found that didn't make it into the prompt)
+- The final output the user saw
+- User feedback: thumbs up or down, edits, follow-up questions
+- Evaluator outputs, when you run them
+
+Without this, debugging is guesswork. You need to be able to reconstruct exactly what happened in any interaction.
+
+### Traces, spans and sessions
+
+An observability platform (many are built on the open OpenTelemetry standard) organizes these logs at three levels:
+
+- A **trace** is one request end to end, for example one client question from parsing to final reply.
+- A **span** is one step inside a trace: an LLM call that writes SQL, a `query_listings` tool call, a `send_email` call, a database read.
+- A **session** groups related traces over time, such as a whole multi-turn conversation in which a client refines a search.
+
+## Two ways to run evals in production
+
+With traces flowing, you can operationalize your evaluators in two different ways, and they answer different questions:
+
+- **Async evals** estimate how often each failure mode happens on live traffic.
+- **Guardrails** block known failures in real time, before the user sees them.
+
+### Async evals on sampled traces
+
+A typical pipeline runs **5 to 7 key evaluators**, a mix of code and judges, each tracking one known failure mode. They run **after the request has completed**, so they add no latency, and usually on a **small stratified sample of 1 to 5%** of traffic, because judge calls cost money.
+
+The numbers stay reasonable. At 40,000 requests a day, a 2% sample is 800 traces. Three judges on each is 2,400 calls, about $10 a day at $0.004 a call. Judging every request would be 120,000 calls, about $480 a day, and wouldn't tell you much more.
+
+For each failure mode, compute the **corrected success rate θ̂** from the judge's raw pass rate and its known TPR and TNR, plus a 95% bootstrap confidence interval, exactly as in the previous lesson. That gives a statistically grounded estimate without labeling production data. A concrete routine for the real estate team:
+
+1. Sample 1% of production traces each day.
+2. Run the "hallucinated tool usage" and "location ambiguity" judges on them.
+3. Correct each raw pass rate with that judge's TPR and TNR, and bootstrap an interval.
+4. Put θ̂ and its interval on a dashboard, and alert when the interval's lower bound drops below the success rate you've agreed is acceptable.
+
+### Guardrails in the request path
+
+A guardrail runs **synchronously**, while the request is being handled and before the output reaches the user. That puts it on the critical path, so it must be:
+
+- **Fast**, because every request pays its latency.
+- **Reliable, with a very low false failure rate**, because every false alarm breaks a good interaction.
+
+So guardrails are usually lightweight code: regexes, schema validation, a parser, a blocklist. Typical uses are critical safety (PII, toxicity, harmful content), hard constraints (generated SQL must be valid before it runs), and strict output formats. Each guardrail needs a predefined action when it fires:
+
+- **Reject**: block the output and return a safe, canned response or an error.
+- **Retry**: run the pipeline again. Generation is nondeterministic, so a second try often passes. Use it sparingly, since it doubles cost and latency for that request.
+- **Fallback**: switch to a simpler model, a constrained path, or a request for clarification.
+
+```python
+import re
+
+SSN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+
+def send_client_email(draft):
+    if SSN.search(draft.body):
+        log_guardrail_hit("ssn_in_email", draft)   # still visible to monitoring
+        return SAFE_REPLY                           # Reject
+    return send_email(draft)
+
+def answer_with_sql(request):
+    for _ in range(2):                              # first try plus one Retry
+        sql = generate_sql(request)
+        if sql_parses(sql):                         # a SQL parser, no LLM involved
+            return run_query(sql)
+    return ask_user_to_rephrase(request)            # Fallback
+```
+
+### Guardrail or async eval?
+
+The trade-off is cost per request versus harm per miss. Suppose you put a judge in the request path as a guardrail. It adds about 2 seconds to every request, and even a good judge with a 4% false failure rate blocks 4,000 perfectly good replies a day at 100,000 requests. A regex with a 0.01% false failure rate blocks 10.
+
+| | Guardrail | Async eval |
+|---|---|---|
+| When it runs | In the request, before the user sees output | After the request, on a sample |
+| Latency it adds | All of it, on every request | None |
+| Typical evaluator | Code: regex, parser, schema, blocklist | Code and LLM judges |
+| Tolerable false fails | Near zero | Some, corrected with TPR/TNR |
+| Use it for | Harm you can't undo, output that would break anyway | Measuring how often each failure mode happens |
+
+<EvCicdGuardrailSorter />
+
+## Keeping judges accurate over time
+
+LLM judges **drift**. The provider updates the underlying model, or your team's definition of a subjective criterion shifts as you see more data. Either way, the TPR and TNR you measured last quarter may no longer hold, and your corrected success rates are only as good as those numbers.
+
+- **Pin model versions** for judges, in both CI and production, using exact dated snapshots.
+- **Run a re-alignment loop.** Every few weeks (more often for subjective criteria), sample recent production traces, label them by hand with the current rubric, and recompute each judge's TPR and TNR.
+- **Act on a drop.** If either rate falls below your threshold, revise the judge's prompt or few-shot examples, re-validate on a held-out set, and redeploy.
+- **Re-align after any judge model change**, even a deliberate upgrade.
+
+Here is why stale rates hurt. A judge was measured at TPR 0.90 and TNR 0.85. This month its raw pass rate drops to 0.70, and with the old rates θ̂ = (0.70 + 0.85 − 1) / (0.90 + 0.85 − 1) = 0.55 / 0.75 ≈ **0.73**, which looks like a regression. Fresh labels show the judge's TPR has fallen to 0.75: it now fails good replies more often. With the fresh rates, θ̂ = 0.55 / 0.60 ≈ **0.92**. The pipeline never got worse. The judge got stricter.
+
+<Callout kind="warn">
+An alert on θ̂ is a prompt to look at traces, not a verdict. Before you roll back a release, check whether the judge changed (unpinned model, edited rubric) rather than the pipeline.
+</Callout>
+
+## The continuous improvement flywheel
+
+CI and CD are not separate stages. Together they form a loop that keeps feeding the Analyze, Measure, Improve cycle:
+
+1. **Develop and analyze.** Build the first pipeline and do error analysis on early outputs to find failure modes.
+2. **Measure.** Build and validate evaluators for them, and assemble the first golden set.
+3. **Set up CI.** Run the golden set and evaluators on every change.
+4. **Deploy with observability.** Ship instrumented, with pinned judges running async on sampled traffic.
+5. **Monitor.** Track θ̂ and intervals per failure mode, alongside product metrics (task completion, satisfaction, session length, thumbs).
+6. **Spot drift and new failures.** Read the dashboards, and also hunt by hand through traces the evaluators did *not* flag.
+7. **Re-analyze.** Run targeted error analysis on the problem traces.
+8. **Update eval artifacts.** Add the new failure to the golden set, adjust or add evaluators, re-align judges.
+9. **Improve and redeploy.** Fix the pipeline, ship, and watch the targeted rate improve.
+
+An example turn of the wheel: after a neighborhood-targeting feature ships, the location-ambiguity failure rate spikes and sessions from those neighborhoods get shorter. Reading the flagged traces shows the model confusing "West Berkeley" with a non-existent "Berkeley West" and returning poor results. Error analysis turns that into a new failure mode, handling of directional location qualifiers. Examples go into the golden set, a check is added, the prompt is fixed, and the next deploy is monitored for it.
+
+Good moments to restart a full round of error analysis: after a substantial product change (a new capability such as database querying), when your users or query mix shift noticeably, and when online evals or product metrics show a persistent new pattern.
+
+## Practical considerations and common mistakes
+
+You don't need an elaborate evals platform before you know what you need. Two pieces of tooling are essential: **logging with a trace viewer**, and a **simple annotation interface** that is faster than a spreadsheet (the next lesson covers building one).
+
+On the human side, the instructors' default is to **set aside about an hour a week to read traces**: the ones users complained about plus a random sample. The point is to stay confident that the ground isn't shifting under the application.
+
+Common mistakes in production:
+
+- **A stagnant golden set.** Traffic and users change. A CI set that never gains new examples gradually stops catching the regressions that matter.
+- **Trusting automated monitoring alone.** Judges only catch the failure modes they were built for. Regular failure hunting through random traces finds the rest. If engagement drops while every evaluator stays flat, something undetected is going on.
+- **Mishandling conflicting metrics.** Making replies more concise can quietly make them less accurate. Rank your metrics, with safety guardrails as non-negotiable, and decide up front how to trade them off.
+- **Not connecting AI metrics to product metrics.** When task completion falls, check whether AI quality is the cause; if it is (say, verbose replies driving users away), define that as a failure mode and track it. Product metrics can also fall for reasons that have nothing to do with the model, such as a poor UX or a feature users don't need, so be careful to tell the two apart.
+- **Stale judge alignment.** Old TPR and TNR give wrong θ̂ values.
+- **Thin tracing.** If you can't reconstruct every LLM call, tool call and retrieved document, you can't debug.
+
+## Cheat sheet
+
+- CI covers known unknowns (regressions on failure modes you've seen); CD covers unknown unknowns (new failures in production).
+- LLM CI/CD differs from classic ML: few labels, subjective quality, nondeterminism, and silent provider model updates.
+- The golden set: about 100+ hand-curated examples covering core features, past failures, edge cases and pipeline paths. It is not a random sample.
+- CI checks are reference-based. Prefer cheap, deterministic code assertions and add a few judges; fail the build on a failed check.
+- Pin judge models to exact versions; re-run flaky judge tests instead of letting one sample block a merge.
+- Keep CI fast: code checks per commit, judges before merge, run examples in parallel.
+- A CI pass rate means stability on known issues, not production accuracy. Never put golden examples in pipeline or judge prompts.
+- If CI always passes, add harder cases; grow the set whenever you find new failure modes.
+- Log everything per request (inputs, LLM calls, tool calls, retrieved docs, output, feedback) as traces, spans and sessions.
+- Async evals: 5 to 7 evaluators on a 1 to 5% sample after the request, reported as θ̂ with a confidence interval, dashboarded and alerted.
+- Guardrails: fast code checks with near-zero false fails in the request path, each with a Reject, Retry or Fallback action.
+- Judges drift: re-label recent traces every few weeks, recompute TPR/TNR, and fix and redeploy when they drop.
+- The flywheel: monitor, hunt for failures, re-analyze, update golden set and evaluators, improve, redeploy.
+- Read traces every week: complaints plus a random sample.

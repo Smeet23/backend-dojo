@@ -1,0 +1,235 @@
+import { EvReviewInterfaceDemo } from "@/components/widgets/EvReviewInterfaceDemo";
+import { EvTraceSamplingPlanner } from "@/components/widgets/EvTraceSamplingPlanner";
+
+## Why human review needs its own tool
+
+Every stage of this course depends on people reading traces: open coding, axial coding, labeling data to align an LLM judge, and checking that the judge is still right in production. Automated evaluators do not remove that need. Judges drift, new failure modes appear when you change a model or ship to new users, and (as you'll see below) even the humans' own definition of "good" moves over time.
+
+So the question is not whether humans review traces, it is **how many good labels you get per hour of reviewer time**. If reviewing is slow and unpleasant, people do less of it, label more carelessly, and the whole analyze, measure, improve loop stalls.
+
+The instructors' experience makes the case. Early on, Shreya tried error analysis in a spreadsheet: one row per trace. A trace with 50 or 80 turns becomes one enormous cell, the next five rows compete for your attention, there are no hotkeys, and filtering is clumsy. Reviewing even two or three traces felt like a chore, and she was nowhere near the volume needed to train a judge. So in late 2023 she spent about a week building a small Streamlit app for one specific task (reviewing AI-generated e-commerce product descriptions). It rendered each output the way a shopper would see it, had hotkeys, and offered one-click tags for failure modes she already knew. Her throughput went from roughly **20 traces an hour to over 200**, about 400 in a two-hour session. Today, with an AI coding assistant, the same app is about an hour of work.
+
+<Callout kind="remember">
+The speed at which your team can look at data sets the speed at which your AI product improves. A review app is one of the highest-leverage things you can build, and somebody on the team should own it.
+</Callout>
+
+### Spreadsheets, observability tools, or your own
+
+| Option | Good enough when | Where it breaks |
+|---|---|---|
+| Spreadsheet | Single-turn: one short input, one short output, little context | Long or multi-turn traces, tool calls, retrieved documents, structured feedback |
+| Notebook with rich rendering | You live in notebooks anyway; a `_repr_html_` method can render an email or a chat as HTML | Sharing with non-technical domain experts, hotkeys |
+| Observability tool (LangSmith, Braintrust, Phoenix, Arize) | Far better than spreadsheets; try annotating there first | Generic layout, can't hide your long system prompt per trace, can't show side effects or business data |
+| Custom review app | You'll label a lot, for a long time, or need experts to label | Costs a little build time (now small) |
+
+These are not either/or. Observability tools have good APIs, so a common setup is a **custom UI on top of them**: read traces from the platform, write labels and notes back, and use the platform as your database. The custom layer exists to show exactly what *your* reviewers need on one screen. If checking whether the agent booked a tour means opening the scheduling system in another window, you have lost the reviewer's flow. Put the calendar entry next to the trace.
+
+## Principles of effective review interfaces
+
+You don't have to invent design rules. Decades of human-computer interaction (HCI) work, mostly Jakob Nielsen's usability heuristics, translate directly:
+
+| Principle | What it means in a review tool |
+|---|---|
+| Visibility of status | Which trace you're on, how many remain, how many you've labeled, which failure modes you've found so far |
+| Match the real world | Render outputs the way the end user sees them: an email as an email, a chat as chat bubbles, tags as colored chips |
+| User control and freedom | Next, previous, undo, defer. You can always go back and change a label |
+| Consistency | Same layout and controls on every trace |
+| Error prevention | Distinct pass and fail controls; require a note when you mark fail |
+| Recognition over recall | Show known failure modes as clickable tags instead of making reviewers remember and retype them |
+| Flexibility and efficiency | Hotkeys for experts, obvious buttons for newcomers |
+| Minimalist design | Show the signal (input, output, key context); collapse the rest |
+
+The single goal behind all of them is **reduce friction**. Every domain has its own idiosyncrasies, so treat these as prompts for thinking, not hard rules.
+
+### Show the trace in its native form
+
+People judge faster and catch more errors when an output looks the way the user sees it. A raw JSON blob of a generated email is intimidating ("let me get a cup of tea first"); the same email rendered with sender, subject and body is quick to scan. Some errors are only visible when rendered: broken formatting, a reply that is technically correct but would look absurd in a text message, a date that reads wrong in context.
+
+### Show the minimum, keep the rest one click away
+
+The reviewer needs enough to make a quick call, not everything. The leasing assistant's system prompt is long and identical on every trace, so collapse it by default. Tool calls, raw arguments and retrieved documents can be expandable. Never delete them, because sometimes the reviewer needs to check whether the prompt actually said something. The exception: if a part of the trace changes on every run (a dynamic system prompt, say), it may deserve to be visible.
+
+### Keep the reviewer in flow
+
+- **One trace per screen.** Spreadsheets show several rows at once and attention gets split; people skim instead of reading.
+- **Hotkeys** for pass, fail, defer, next and previous, and number keys for common tags.
+- **Back navigation.** In an early version of one of Shreya's apps, users couldn't return to earlier traces. When they discovered a new failure mode or changed their mind, they didn't restart the app to fix old labels; they shrugged and left them wrong.
+- **A defer option** for genuinely uncertain cases, so nobody is forced into a low-confidence label.
+
+### Show progress
+
+In the EvalGen user studies, adding a progress bar changed behavior. Without it, people clicked "I'm done" after six or seven examples. With it, they kept going to around 20. Anything that makes someone wait or work through a queue needs a sense of where the end is.
+
+### Recognition over recall
+
+Error analysis produces a long tail of failure modes, more than anyone can hold in their head. In the first round of open coding, free-text notes for every trace are right. As your taxonomy settles, turn the recurring axial codes into one-click tags or a dropdown, and keep the free-text box for anything new. Quick-pick comment templates ("tone too casual", "missing key fact") help the same way.
+
+### Batch labeling: only once you're an expert
+
+Bulk-applying one label to a group of similar traces multiplies throughput, but it trades away care. Do it only when you know the system's failure modes well and can say with real confidence that a cluster is all the same problem. The instructors only reached for it in late-stage work, such as checking a thousand examples for a fine-tuning run.
+
+Try the difference yourself. Grade the same five leasing-assistant traces as raw rows, then switch to the review view.
+
+<EvReviewInterfaceDemo />
+
+### The feature checklist
+
+Essentials: the full trace (input, intermediate steps, output) with less important parts collapsed, a binary pass or fail, failure-mode tags from your error analysis, and a free-text note. Then, roughly in order of payoff:
+
+- **Hotkeys** for every frequent action.
+- **Structured failure tags**, with templates for common comments.
+- **Visual hierarchy**: emphasize the final output and domain-important entities (price, date, unit number).
+- **Contextual metadata**: trace id, pipeline version, user segment, channel, and the automated judges' verdicts.
+- **Filters** on the dimensions that matter (for the leasing assistant: voice, text or email).
+- **Progress indicators**, possibly broken down by dimension.
+- **Inline annotation**: highlight the bad sentence or mark the faulty turn.
+- **Progressive disclosure**: pass, fail, defer first; detailed tagging only after fail.
+- **Bulk actions**, used with care.
+
+## Case study: EvalGen and criteria drift
+
+**EvalGen** was an interface the instructors built in 2023 (described in the "Who Validates the Validators?" paper) on top of ChainForge, an open-source visual tool for building LLM pipelines. It targeted single-turn outputs: generated emails, product descriptions, tweets. Its flow:
+
+1. **Extract candidate criteria from the prompt.** Prompts are full of do's and don'ts that came from earlier debugging. Each is a candidate eval criterion, and some will fail often because models don't follow instructions perfectly.
+2. **Grade one output at a time**, thumbs up or down, with an optional note explaining a thumbs down. Labels could be edited later. Reviewers found it easier to first recognize "this is bad" and then articulate why.
+3. **Generate evaluators for each criterion**, both code-based and LLM-based. Both matter: a character limit on tweets is a one-line code check, and LLM judges are bad at counting characters.
+4. **Pick traces using disagreement.** When different evaluators disagreed about an output, that output was shown to the human.
+5. **Show a report card** of each evaluator's alignment with the human's grades, so users could keep the ones that agreed.
+
+It is not the one true interface, but the workflow contains most of this course in miniature: look at outputs, write criteria, build judges, check alignment, iterate.
+
+### The insight: criteria drift
+
+The surprise from the user studies was how much people's **criteria changed as they graded**. They refined definitions, went back to relabel earlier outputs, and met failure modes they couldn't have predicted before seeing them.
+
+One task extracted notable named entities from tweets, and the prompt said not to extract hashtags. Reviewers flagged hashtag extractions as errors. After seeing many of them, several changed their minds: a hashtag naming a notable entity that also appears in the tweet body seemed fine, or fine as long as the `#` was stripped. One rule turned out to hide several distinct cases, some acceptable and some not.
+
+The consequences:
+
+- **You cannot write the full rubric up front.** Criteria have to be defined iteratively, alongside labeling. That is why error analysis works in rounds of open and axial coding.
+- **The tool must allow relabeling and adding new tags on the fly**, including when a model change or a production launch brings new behavior.
+- **Alignment runs both ways.** Reviewers also adjust to the model: they learn what is hard and relax unreasonable expectations. That is healthy, and in a business setting it helps stakeholders accept the product.
+
+<Callout kind="warn">
+If your review tool fixes the label set before anyone has read traces, or forbids editing old labels, it will quietly bake today's half-formed criteria into your dataset.
+</Callout>
+
+## Selecting traces from the firehose
+
+Production produces far more traces than anyone can read, so you need to choose. But don't start here. Many teams ask about sampling strategy before they have done a single round of error analysis. Begin with a uniform random sample, build your first review app, get comfortable with it, and only then sample more cleverly.
+
+| Strategy | How it picks | Strength | Weakness |
+|---|---|---|---|
+| Random | Uniformly from all traces | Unbiased; the only way to estimate a true failure rate; finds unexpected problems | Misses rare failures; wasteful when most outputs are fine |
+| Stratified | Random within each value of a dimension you care about (intent, channel, persona, your synthetic-data dimensions) | Covers rare segments | Only as good as the dimensions you chose |
+| Uncertainty | Traces where evaluators disagree or look unsure | Most informative per label; this is active learning | Biased toward borderline cases |
+| Failure-driven | Traces with a known bad signal: thumbs down, complaint, guardrail hit, timeout | High precision, fixes known problems fast | Low recall; misses subtle and new failures |
+| Similarity | Traces sharing keywords or embeddings with ones you labeled bad | Measures how widespread a known problem is | Finds more of the same, nothing new |
+
+Uncertainty has several sources: a trace passes some criteria and fails others, a judge run several times at temperature above 0 flips its verdict, or a code check and an LLM judge disagree.
+
+In practice it is always a form of stratified sampling: pick the dimensions or signals you care about and sample randomly within each. Mix and match freely, with one rule: **always keep a random slice.** Targeted samples only show you the failures you already know how to look for, and they overstate how often things fail. The random slice is how you find new failure modes and keep an honest failure rate.
+
+How many? Earlier lessons gave the starting point: about 100 traces for a round of error analysis, more until new traces stop revealing new failure modes. After that, review becomes a steady habit (a daily or weekly batch) rather than a one-off.
+
+<EvTraceSamplingPlanner />
+
+## Navigating trace groups and discovering patterns
+
+Some problems only show up across a group. When you spot an interesting failure, don't just move on: ask whether there are more like it and go looking.
+
+- **Clustering by metadata**: for a real-estate assistant, group by client persona ("investor", "first-time buyer") or feature (email drafting vs property search). A few traces from the investor cluster might show emails that are too casual or lack numbers.
+- **Semantic clustering**: embed inputs or outputs and group them (k-means is fine). You might find a latent cluster like "affordable condos near good schools" where the model keeps ignoring HOA fees.
+- **Search**: keyword search, metadata filters (`pipeline_version`, `user_segment`, failure tag) and semantic search ("other emails that give unsolicited financial advice").
+- **Highlighting**: Shreya's trick was to highlight phrases in the current output that match keywords from open codes on earlier bad examples, so likely repeats jump out.
+
+```python
+from sklearn.cluster import KMeans
+
+vecs = embed([t.user_query for t in traces])   # any embedding model
+labels = KMeans(n_clusters=12, n_init="auto").fit_predict(vecs)
+for c in range(12):
+    members = [t for t, l in zip(traces, labels) if l == c]
+    print(c, len(members), [m.user_query[:60] for m in members[:3]])
+```
+
+Read a few traces per cluster, name the cluster, and see whether failures concentrate there. This is ordinary data analysis, and the more you do it, the more review turns into it.
+
+## Integrating human review into the engineering workflow
+
+A review tool only matters if people use it regularly and their labels change the system. If nobody opens yours, the friction is still too high.
+
+- **Scheduled batches.** A daily or weekly job samples traces with the strategies above and notifies reviewers ("today's review set is ready").
+- **Alerts for urgent cases.** Safety violations, broken tool calls or regressions flagged by online monitoring go straight to an on-call reviewer.
+- **Labels flow back.** Failed traces join the golden dataset that CI runs on. Human labels are also how you watch the LLM judge: if humans keep failing traces the judge passed, revise or replace the judge.
+- **One-click follow-through.** Buttons for "add to golden set" and "file bug" with the trace details prefilled.
+- **A small dashboard** of recent review activity: most frequent failure tags, and where humans and judges disagree.
+
+## Walkthrough: evolving a review UI for a real-estate assistant
+
+Take a real-estate assistant that drafts emails to clients, and watch the interface grow:
+
+| Stage | What the reviewer sees | What it costs them |
+|---|---|---|
+| Spreadsheet | Query, persona and email as raw text in cells; one comment column | Scrolling sideways, no hotkeys, notes on unrelated issues mixed together |
+| Basic custom UI (Streamlit, Gradio, or AI-generated) | One trace at a time: input, persona, rendered email; Good or Bad buttons, optional comment, next and previous | Already beats the spreadsheet, but no tool calls or retrieved context, no structured tags, no grouping |
+| Advanced UI | Rich layout with intermediate steps; prices, locations and dates highlighted; failure tags like "Tone mismatch", "Missing budget", "Hallucinated feature"; hotkeys (N next, D defer, T tone); trace id and pipeline version shown; cluster view with bulk tagging; search | Small build cost, large gains in speed and consistency |
+
+The highest-payoff features, per the instructors, are hotkeys, structured failure tags and clustering. They are cheap to build and pay off immediately.
+
+## Case study: DocWrangler for prompt refinement
+
+**DocWrangler** is an IDE for LLM pipelines that process documents (a front end for the DocETL framework). You write a prompt, run it over a batch of documents, and review each output side by side with its source document. The example task: extract customer complaints from airline support transcripts.
+
+What it adds is **closing the loop from notes to fixes**:
+
+1. While reviewing, you jot open codes on any output ("missed the date field", "I want a customer quote illustrating the complaint").
+2. Many of these turn out to be **gulf of specification** problems: the prompt never asked for quotes, so the model didn't give them. Writing the same note on every output would be tedious.
+3. An "improve prompt" action gathers the notes related to this prompt, has an LLM group them into axial codes, and proposes a revised prompt shown next to the current one.
+4. You don't just accept it. You give feedback and iterate a couple of times, and a revision history lets you roll back.
+
+The lesson: in early stages, light free-text notes beat formal labeling, and specification gaps are often fixed by editing the prompt, with no judge needed. Save LLM judges for failures that persist after the prompt says what you want (generalization problems), where you need to measure prevalence at scale.
+
+## Building one fast with an AI coding assistant
+
+Asking an AI assistant to "build me a labeling UI" gets you something generic. Put the principles in the prompt:
+
+```text
+Build a FastAPI app with an HTML page to review leasing-assistant traces
+from traces.jsonl. Show one trace at a time. Render the conversation as
+chat bubbles; show tool calls as collapsed rows that expand on click;
+collapse the system prompt. Beside the chat, show the tour bookings the
+agent created for this caller (from bookings.json). Controls: Pass,
+Fail, Defer, plus a notes box. Hotkeys: p pass, f fail, d defer,
+j/k next/previous, number keys toggle these tags: [list your axial codes].
+Fail requires a note. Show "reviewed 12 of 100" and a progress bar.
+Filter by channel. Save labels to labels.jsonl after every action, and
+let me revisit and change any earlier label.
+```
+
+Then use it on real traces for twenty minutes and iterate on whatever slows you down. Expect the app to keep evolving as your failure modes do.
+
+## Common mistakes
+
+- **Reviewing raw JSON in a spreadsheet** for multi-turn or tool-using traces, then wondering why nobody labels enough data.
+- **Showing everything.** A long, unchanging system prompt on every screen buries the part that matters.
+- **No way back.** Fixed label sets and uneditable labels freeze criteria drift into wrong labels.
+- **Designing sampling before the first random round**, or dropping random sampling entirely once targeted signals exist.
+- **Batch labeling too early**, before you know the failure modes well.
+- **A tool nobody opens.** Without scheduled batches and a path from labels to the golden set and judge checks, review does not change anything.
+
+## Cheat sheet
+
+- Measure your review setup by high-quality labels per reviewer hour; a custom app took one reviewer from about 20 to 200+ traces an hour.
+- Spreadsheets are fine only for simple single-turn data; observability tools are a good start, and a custom UI can sit on top of their APIs.
+- Render traces as the user sees them, collapse the rest, and put side effects (bookings, emails sent) on the same screen.
+- One trace per screen, hotkeys, back navigation, defer, a progress bar.
+- Free-text notes first; promote recurring axial codes to one-click tags.
+- Batch labeling only once you are expert in the failure modes.
+- Criteria drift: reviewers' standards change as they grade, so define criteria iteratively and allow relabeling and new tags.
+- EvalGen: criteria from prompt do's and don'ts, binary grading, code and LLM evaluators, disagreement-based sampling, alignment report card.
+- Start with random sampling; later stratify and add uncertainty, failure signals and similarity, but always keep a random slice for new failures and honest rates.
+- Use clustering, search and highlighting to turn one bad trace into a pattern.
+- Embed review in the workflow: scheduled batches, alerts, labels into the golden set and judge monitoring, one-click follow-through.
+- DocWrangler: open codes, then axial codes, then a proposed prompt revision; fix specification gaps in the prompt before building judges.
+- When vibe coding a review app, spell out the rendering, hotkeys, tags, progress and storage in the prompt.

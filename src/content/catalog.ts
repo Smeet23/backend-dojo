@@ -5,7 +5,7 @@ export { courses };
 export type { CourseContent };
 
 /** Display order of courses on the home page. */
-const ORDER = ["backend", "system-design", "hld", "langgraph"];
+const ORDER = ["backend", "system-design", "hld", "ai-evals", "langgraph"];
 courses.sort((a, b) => (ORDER.indexOf(a.course.id) + 1 || 99) - (ORDER.indexOf(b.course.id) + 1 || 99));
 
 export function getCourse(courseId: string): CourseContent | undefined {

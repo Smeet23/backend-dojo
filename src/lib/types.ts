@@ -61,4 +61,8 @@ export type Course = {
   /** Creator of the source playlist. */
   author: string;
   playlistUrl: string;
+  /** What the source is; defaults to "playlist". */
+  sourceKind?: "playlist" | "course";
+  /** Built from non-public material, so its pages need the passcode. */
+  private?: boolean;
 };

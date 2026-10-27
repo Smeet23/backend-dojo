@@ -1,0 +1,307 @@
+import { EvKappaCalculator } from "@/components/widgets/EvKappaCalculator";
+import { EvRubricSharpener } from "@/components/widgets/EvRubricSharpener";
+
+## Where this lesson picks up
+
+Lesson 2 walked through error analysis: build about 100 traces, read them, open code the first failure in each, cluster the notes into a failure taxonomy with axial coding, label and count. This lesson adds three things on top of that:
+
+1. Answers to the questions that come up once people actually try it (what exactly a trace is, how to re-code, how deep to go on tool calls).
+2. What changes, and what doesn't, when your traces are **multi-turn conversations**.
+3. What to do when one person's judgment isn't enough: **collaborative evaluation**, rubrics, and measuring whether annotators agree with **Cohen's kappa**.
+
+The running example is still the apartment leasing assistant (the product behind it is called NurtureBoss), which answers prospective and current residents and has a dozen or more tools for tours, availability, contact details and handoffs.
+
+## Error analysis FAQ
+
+### What counts as a trace
+
+A **trace** is the complete record of what happened in response to a user, from their first message to the final reply: every LLM call, tool call, tool result, retrieval and intermediate step, across every agent and component. For a chat product, one trace is the whole session, not one request and response.
+
+Why annotate at that level instead of turn by turn?
+
+- **Many errors only make sense in context.** "Booked Friday at 3" is fine on its own and wrong if the user said Thursday four turns earlier.
+- **Mistakes cascade.** If the agent picks the wrong tool in turn 2, turns 3 to 8 are mostly fallout. Labeling every symptom wastes your time.
+- **You need everything in one place to debug.** If the logs don't capture the tool arguments, you can't tell a bad tool choice from a bad argument.
+
+That is why the beginner rule from lesson 2 is to note the **first (upstream) failure** and move on. The two terms mean the same thing. With experience you'll recognize when two failures in a trace are independent of each other, and then you label both.
+
+<Callout kind="tip">
+In enterprise settings you often can't log everything you'd like. Capture whatever metadata you can, anonymize where possible, and consider a small group of reviewers who sign a data agreement and see data that is deleted after a fixed window. The more of the trace you can see, the faster error analysis goes.
+</Callout>
+
+### Only code what you saw
+
+Open codes should come from failures you actually observed, not from failures you were told to fear. Teams often arrive convinced that hallucination is their big problem because "AI hallucinates". If 100 traces show almost no invented facts and a dozen botched reschedules, reschedules are your problem. Drop categories the data doesn't support.
+
+### Re-coding with your taxonomy
+
+After an LLM helps you cluster open codes into a taxonomy (for example, asking it to organize the notes into a hierarchy with codes of three to five words each), **go back and apply the axial codes to the traces yourself**. This looks slow, but it's the step where you find out whether the taxonomy is any good:
+
+- Some open codes won't fit anywhere ("did not invoke text-message tool" had no home in one draft). That's a missing category, such as *uninvoked tool*.
+- Some traces fit two categories. That's allowed: a trace can carry more than one axial code.
+- Some categories turn out to overlap. Merge them.
+
+Keep the axial codes in their own column (a categorical field in your annotation tool, or a column in the spreadsheet you export), so counting is trivial later. Stop when applying the codes no longer changes the taxonomy: that's **theoretical saturation**. For most products, about **two rounds** of open plus axial coding is enough. Broad products (general coding or writing agents) may need more.
+
+The output is a table: failure mode, count, and the trace IDs behind it. For the leasing assistant, most failures clustered around the handoff tool, the rescheduling tool, and conversation flow. Each row then gets one of two treatments: an immediate fix (often a prompt that never specified the behavior) or an automated evaluator to measure it at scale.
+
+### Tool calls have layers
+
+When you review a tool call, check it at three depths:
+
+| Layer | Question | Example failure |
+|---|---|---|
+| Selection | Did the agent call a tool at all, and the right one? | Answered from memory instead of calling `check_apartment_availability` |
+| Argument types | Do the arguments match the schema? | Passed a boolean where an integer was required |
+| Argument values | Are the values actually correct? | `location` is a valid string, but a lat/long blob when the API expects a city or ZIP code |
+
+The first two are cheap to check in code: define tool inputs with Pydantic (or Zod in TypeScript) and write validators, so type and format errors are caught automatically and you spend reading time on the third layer.
+
+## Multi-turn conversations
+
+Nothing about error analysis changes because a trace has many user messages. You still read traces, open code, axial code and count. Two things do get harder: deciding *what level* to judge at, and *getting* realistic multi-turn data.
+
+### Evaluate at the session level first
+
+There are three useful levels:
+
+- **Session level:** did the whole conversation achieve what the user came for? Pass or fail. A feedback assistant that ends without collecting any useful feedback fails, even if every turn was polite and well formed. Start here.
+- **Turn level:** was a single reply relevant, correct, on tone? Use this for **debugging** a specific failure, not as a routine. Grading every turn of every trace costs a lot and tells you little more than session-level labels.
+- **Coherence and memory:** does the assistant remember what the user said earlier in the session, and (if it has memory) across sessions? These failures are subtle and often only appear after several turns.
+
+In practice: find failing sessions first, then deep-dive a handful of representative ones turn by turn.
+
+### Collecting multi-turn traces
+
+Generating realistic multi-turn synthetic data is hard, because you need plausible user follow-ups. Don't let that block you. Put a simple chat interface in front of colleagues or friends, give them personas and tasks, and ask each for 10 to 15 conversations. Ten people get you over 100 varied traces in an hour or two.
+
+Once you've reviewed those, you'll know what real users tend to do (change their mind, give partial answers, get impatient). Only then is it worth writing an LLM user simulator, with those observed behaviors in its prompt. Use simulators cautiously: real or lightly modified conversations reflect user behavior better.
+
+### Reproduce a multi-turn failure as a single turn
+
+Treat a multi-turn failure like a bug report: find the **minimal reproduction**. Many failures you see in conversations aren't really conversational.
+
+A shopping assistant gives the wrong return window on turn 4, after the user named the product on turn 3. Try a single turn: "What's the return window for the X1000?" If it still says 15 days instead of 30, the problem is retrieval or grounding, not conversation handling. You can now test and fix it with cheap single-turn cases, and generate many variants of them.
+
+If you can't get it down to one turn, try to get it down to as few turns as possible.
+
+### Truncate to N-1 turns for memory failures
+
+Some failures are inherently multi-turn. A movie bot hears "I love sci-fi", asks about actors, and then recommends a romantic comedy. To test that, cut the conversation off right before the bad reply (keep the first N-1 turns) and **sample the next response many times**. If 6 of 10 samples ignore "sci-fi", you have a reproducible memory failure and a test case. A set of these N-1 prefixes, taken from real logs or built synthetically, becomes a regression suite for short-term memory.
+
+### Perturb real traces
+
+Instead of inventing whole conversations, **modify real ones** in valid ways and see whether the assistant copes. This is data augmentation, but the transformations are specific to your domain:
+
+- The user changes their goal halfway ("Actually, my friend is vegetarian, can you suggest somewhere else?").
+- The user corrects the assistant, or adds ambiguity.
+- The underlying data changes but stays consistent. On an observability product, the team rewrote a customer's query *and* that customer's schema together, giving new pairs that were realistic and valid.
+
+In the vegetarian example, a reply like "your friend might enjoy the tiramisu, it's vegetarian" mentions the right word but ignores the new request for a different restaurant. That's exactly the kind of failure perturbation exposes.
+
+The dimensions idea from lesson 2 still applies: instead of dimensions of an initial query, you choose dimensions of the perturbation (type of constraint added, when it's added, how it's phrased) and sample combinations.
+
+<Callout kind="warn">
+Many assistants behave well for two or three turns and then degrade: they forget constraints, drop instructions, or contradict themselves. Include conversations of different lengths in your test set, or you'll only ever test the easy part.
+</Callout>
+
+## Why collaborate
+
+So far "correct" has meant one person's judgment. That works until the criterion is subjective. "Helpful", "good tone" or "on brand" mean different things to different people, and a single reviewer brings their own blind spots. If two people on the same product disagree on what helpful means, any evaluator built on one person's labels will look wrong to the other.
+
+**Collaborative evaluation** means involving several experts or stakeholders in a structured way so the criteria get defined, refined and applied consistently. The aim isn't more opinions. It's a definition precise enough that anyone, human or LLM, applying it gets the same answer.
+
+## The benevolent dictator
+
+Before you set up a committee, try not to need one. A common way teams stall is five to ten people debating each trace for 20 minutes. Usually the real problem isn't disagreement about quality, it's that **nobody has the authority to decide**.
+
+Hamel's answer is the **benevolent dictator**: appoint one **principal domain expert** whose judgment defines good for this product. Examples:
+
+- A lead psychologist for a mental health assistant.
+- A lawyer for a legal document analyzer.
+- The customer service director for a support bot.
+- The founder or CEO in a small company. For the leasing assistant, that was the CEO.
+
+Why it works: one person sets a consistent standard, they surface expectations they couldn't have written down upfront, labeling conflicts disappear, and they end up owning (and trusting) the result.
+
+A few practical points:
+
+- **It's usually not an engineer.** It's whoever knows what a good outcome looks like for users. Engineers labeling alone, or a convenient proxy like your manager, is a recipe for evals nobody trusts.
+- **The expert doesn't need to spot engineering bugs.** Give them a review tool that shows tool calls and retrieved data in plain terms, so "the agent never checked availability" is visible to them.
+- **Learn their taste.** Sit with them while they review, build a mental model of their preferences, and you can label more traces the way they would. Be honest with yourself about whether you've really absorbed it.
+- **If you're a solo developer, you're the expert.** If the expert is leadership, check their assumptions against real user feedback.
+
+Use a team when no single person holds all the critical perspectives: large organizations, high-stakes or regulated domains, or genuinely fuzzy criteria. If you're unsure which applies, start with a benevolent dictator.
+
+## A collaborative annotation workflow
+
+When you do need multiple annotators, follow a fixed loop:
+
+1. **Assemble the team:** two or more annotators with the relevant expertise. Agree on scope.
+2. **Draft a rubric:** a definition of each criterion with a few pass and fail examples. Keep criteria **binary**: two people align on pass/fail far more easily than on what a "3 out of 5" means.
+3. **Pick a shared set:** 20 to 50 representative traces that everyone labels, deliberately including borderline cases.
+4. **Label independently.** No discussion. You want to see how each person reads the rubric on their own.
+5. **Measure agreement** (inter-annotator agreement, next section).
+6. **Hold an alignment session** on the disagreements, to fix the rubric rather than the labels.
+7. **Revise the rubric:** wording, examples, decision rules.
+8. **Iterate** on fresh traces until agreement is high (kappa of about 0.6 or more).
+9. **Finalize:** a documented rubric and a consensus-labeled **gold set**.
+
+Annotators will often propose new criteria along the way. Note them and handle them in a later round. Low agreement on a criterion doesn't mean the criterion is unimportant, only that it isn't specified well enough yet.
+
+## Measuring agreement
+
+### Percent agreement and why it misleads
+
+The obvious measure is **observed agreement**, the share of items where both annotators gave the same label:
+
+```text
+P_o = (items where both labels match) / (total items)
+```
+
+The trouble is that people agree a lot by chance, especially when one label dominates. And one label usually does dominate: as your product improves, most traces pass. If both annotators mark 95% of traces "pass" without much thought, they'll agree most of the time no matter how vague the rubric is.
+
+### Cohen's kappa
+
+**Cohen's kappa** (κ) is the standard fix for two annotators labeling categories. It compares observed agreement with the agreement you'd expect if each annotator labeled at random at their own rates:
+
+```text
+P_e = sum over labels k of (p_A,k × p_B,k)
+κ   = (P_o - P_e) / (1 - P_e)
+```
+
+`p_A,k` is the share of items annotator A put in category k. For pass/fail, `P_e = p_A,pass × p_B,pass + p_A,fail × p_B,fail`. κ = 1 is perfect agreement, κ = 0 is no better than chance, and negative values mean they disagree more than chance would predict.
+
+### A worked example
+
+Two reviewers label 10 leasing-assistant traces for "handled the reschedule correctly":
+
+| Trace | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Ana | P | P | F | P | P | F | P | P | F | P |
+| Ben | P | P | F | F | P | P | P | P | F | P |
+
+- They match on 8 of 10, so **P_o = 0.80**.
+- Ana passes 7 of 10 (0.7), Ben also 7 of 10 (0.7).
+- **P_e** = 0.7 × 0.7 + 0.3 × 0.3 = 0.49 + 0.09 = **0.58**.
+- **κ** = (0.80 - 0.58) / (1 - 0.58) = 0.22 / 0.42 ≈ **0.52**.
+
+80% agreement sounds solid, but more than half of it is what chance would produce. Now the skewed case: 200 traces, each annotator passes 190, and they agree on 190 (185 passes, 5 fails). P_o = 0.95, P_e = 0.95² + 0.05² = 0.905, κ = 0.045 / 0.095 ≈ **0.47**. Ninety-five percent agreement, moderate kappa: they barely agree on what a *fail* is, which is the part that matters.
+
+```python
+from collections import Counter
+
+def cohens_kappa(a, b):
+    assert len(a) == len(b) and a, "need two equal, non-empty label lists"
+    n = len(a)
+    po = sum(x == y for x, y in zip(a, b)) / n
+    ca, cb = Counter(a), Counter(b)
+    pe = sum((ca[k] / n) * (cb[k] / n) for k in set(a) | set(b))
+    if pe == 1:  # both used one label for everything
+        return 1.0 if po == 1 else 0.0
+    return (po - pe) / (1 - pe)
+
+ana = list("PPFPPFPPFP")
+ben = list("PPFFPPPPFP")
+print(round(cohens_kappa(ana, ben), 2))  # 0.52
+```
+
+In practice you can also use `sklearn.metrics.cohen_kappa_score`.
+
+<EvKappaCalculator />
+
+### Interpreting kappa
+
+The usual scale (Landis and Koch, 1977):
+
+| κ | Agreement |
+|---|---|
+| below 0 | Poor |
+| 0.00 to 0.20 | Slight |
+| 0.21 to 0.40 | Fair |
+| 0.41 to 0.60 | Moderate |
+| 0.61 to 0.80 | Substantial |
+| 0.81 to 1.00 | Almost perfect |
+
+Aim for **about 0.6 or higher**, especially in specialized domains. A perfect 1.0 isn't realistic, and pushing from 0.65 to 0.68 isn't worth a week. Once agreement is good, move on to building evaluators.
+
+### What kappa is not for
+
+- **Judging an LLM judge against ground truth.** Kappa measures agreement between peers. Once your human labels are the ground truth, treat the judge as a classifier and measure TPR and TNR (lessons 4 and 5). Using kappa there is a common misuse.
+- **More than two annotators:** use **Fleiss' kappa**.
+- **Ordinal scales or missing labels:** **Krippendorff's alpha** fits better.
+
+## Alignment sessions
+
+Before the session, compute agreement, share it, and list the traces where annotators disagreed. A neutral moderator helps, and so does timeboxing each disagreement. The guiding question is not "who was right?" but **"what change to the rubric would make future annotators agree on this case?"**
+
+### Worked example: is this reply helpful?
+
+The draft criterion is "helpful response to an ambiguous query". Pass: the response gives relevant information related to the query. Fail: it's irrelevant or gives no useful information.
+
+> **User:** I need a new place soon, maybe a 1-bed? What's good?
+>
+> **Assistant:** One-bedroom apartments are very popular here! Our community is highly sought after due to its prime location and quiet environment. Many residents tell us they love the peaceful atmosphere. Do you have specific dates in mind for your move?
+
+The engineer (Shreya, in the demo) marked it **pass**: it mentions one-bedrooms, describes the community, sounds friendly, and moves forward by asking about dates. That's a fair reading of the draft rubric.
+
+The domain expert (Hamel, playing the CEO) marked it **fail**, emphatically. A leasing manager who said this in person would get an eye-roll. It's boilerplate that could answer any one-bedroom question, with very little information per word. A good reply should move the prospect **down the sales funnel**: say something specific about the units or the property that sets it apart, mention any current specials, and end with a concrete next step like available tour times or a booking link.
+
+Both readings follow the draft rubric. The rubric is the problem. The engineer's job is to listen for phrases like "move down the funnel" and turn them into checkable attributes: *mentions a unit-level detail*, *names a differentiator or promotion*, *ends with a call to action*. Note that this refines the **definition**. It isn't yet a prompt change.
+
+### Turning disagreement into a sharper rubric
+
+Four techniques, in rough order of how often you'll use them:
+
+- **Clarify wording.** Replace vague terms. "Relevant information" becomes "at least one specific fact about available units (price, layout, features or availability)".
+- **Add examples,** especially borderline ones. Ask the expert: "Show me a reply that looks helpful but isn't." Boundary cases teach annotators more than obvious ones.
+- **Add decision rules** for recurring tricky cases. "Community information without any unit information is a fail." "Must end with a concrete next step."
+- **Split the criterion** when it's doing too much. "Helpful" here hides at least three things: factual relevance, a differentiator, and a call to action. Three binary criteria are each easier to agree on than one broad one.
+
+Watch for **proactivity**. On agent products, teams often disagree about how much the agent should take the initiative (ask clarifying questions, suggest next steps) versus just answer what was asked. If two people hold different views, they will never agree on "helpful". Settle it explicitly and write it into the rubric.
+
+Avoid **majority vote** as a way to settle disagreements. It produces a label but leaves the rubric just as vague, so the same split happens next round. Use it only as a last resort for labeling a dataset, and give persistent disputes an **escalation path** (a project lead who makes the call). Record each rubric change and the reason for it.
+
+<EvRubricSharpener />
+
+## Connecting labels to automated evaluators
+
+The workflow produces two assets, and both feed straight into the next lessons:
+
+- **The refined rubric becomes the judge's specification.** Its definitions, decision rules and borderline examples go into the LLM-as-judge prompt. A rubric five people can apply consistently is one an LLM can follow too.
+- **The gold set becomes ground truth.** You measure the judge's TPR and TNR against it and use those to correct its estimated failure rate. Those numbers are only as trustworthy as the labels: if the humans didn't agree, the judge's "accuracy" means little. A few gold examples also make good few-shot examples in the judge prompt.
+
+Keep every well-labeled trace. They're useful later for auditing, regression tests, or fine-tuning a smaller classifier.
+
+## Common pitfalls
+
+- **Skipping independent labeling.** If annotators discuss the traces or the rubric at length before labeling, high kappa measures groupthink. The shared understanding lives in their heads, not in the rubric, and a new annotator won't reach it.
+- **Starting with a vague rubric.** Some vagueness is expected, but a rubric with no examples guarantees a frustrating first round.
+- **Arguing about past labels.** Alignment sessions exist to improve the rules for future cases, not to win the argument about trace 17.
+- **Trusting percent agreement.** With skewed labels, 90%+ agreement can hide a kappa below 0.5.
+- **Chasing perfect kappa.** Above about 0.6, move on.
+- **A committee when a dictator would do.** If one expert can own the definition, let them.
+- **Outsourcing labels to people without product context.** Developers or contractors who don't understand users label superficially.
+- **Not closing the loop.** A great rubric and gold set that never make it into the judge prompt and judge validation are wasted effort.
+
+## Cheat sheet
+
+- A trace is the whole session: every message, LLM call, tool call and retrieval, start to finish.
+- Label the first upstream failure; label several only when they're clearly independent.
+- Only code failures you've observed; drop feared ones the data doesn't show.
+- Re-apply axial codes by hand to test the taxonomy; multiple codes per trace are fine; about two rounds usually saturates.
+- Check tool calls at three layers: selection, argument types, argument values. Validate the first two in code.
+- Multi-turn: judge the session pass/fail first; use turn-level review for debugging.
+- Get initial multi-turn traces from colleagues role-playing personas, not from a simulator.
+- Reduce a multi-turn failure to a single turn (or the fewest turns) whenever you can.
+- For memory failures, truncate to N-1 turns and sample the next reply many times.
+- Perturb real traces (goal changes, corrections, new constraints) instead of inventing conversations.
+- Prefer a benevolent dictator: one principal domain expert who owns the definition of good.
+- Team workflow: draft rubric, shared set of 20 to 50, label independently, measure, align, revise, repeat.
+- Keep criteria binary; they're far easier to align on than Likert scales.
+- κ = (P_o - P_e) / (1 - P_e), with P_e from each annotator's own label rates.
+- Skewed labels inflate percent agreement; kappa corrects for chance.
+- Aim for κ of about 0.6 or more, then move on.
+- Kappa is for peers; judge vs human ground truth uses TPR and TNR. Three or more annotators: Fleiss' kappa.
+- Fix disagreements with clearer wording, borderline examples, decision rules, or split criteria, not majority vote.
+- The rubric becomes the judge prompt; the gold set validates the judge.
