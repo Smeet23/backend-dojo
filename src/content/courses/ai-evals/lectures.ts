@@ -7,7 +7,6 @@ export const course: Course = {
   author: "Hamel Husain and Shreya Shankar",
   playlistUrl: "https://drive.google.com/drive/folders/1fr0vFxh66_a9u8aapNE8y_eS2HufgZS9",
   sourceKind: "course",
-  private: true,
 };
 
 const drive = (id: string) => `https://drive.google.com/file/d/${id}/view`;
