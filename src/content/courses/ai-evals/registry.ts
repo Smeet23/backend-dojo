@@ -17,6 +17,8 @@ import L6Lesson from "./07-ci-cd-and-monitoring/lesson.mdx";
 import { quiz as L6Quiz } from "./07-ci-cd-and-monitoring/quiz";
 import L7Lesson from "./08-human-review-interfaces/lesson.mdx";
 import { quiz as L7Quiz } from "./08-human-review-interfaces/quiz";
+import L8Lesson from "./09-improvement-and-cost/lesson.mdx";
+import { quiz as L8Quiz } from "./09-improvement-and-cost/quiz";
 
 /** Lesson bodies and quizzes for each available lecture, keyed by slug. */
 export const lessons: Record<string, { Lesson: ComponentType; quiz: Question[] }> = {
@@ -28,4 +30,5 @@ export const lessons: Record<string, { Lesson: ComponentType; quiz: Question[] }
   "rag-and-agents": { Lesson: L5Lesson, quiz: L5Quiz },
   "ci-cd-and-monitoring": { Lesson: L6Lesson, quiz: L6Quiz },
   "human-review-interfaces": { Lesson: L7Lesson, quiz: L7Quiz },
+  "improvement-and-cost": { Lesson: L8Lesson, quiz: L8Quiz },
 };

@@ -1,0 +1,285 @@
+import { EvPromptCacheCalculator } from "@/components/widgets/EvPromptCacheCalculator";
+import { EvCascadeThresholdTuner } from "@/components/widgets/EvCascadeThresholdTuner";
+
+## The whole course in one picture
+
+Before the last stage, here is everything so far on one page. Each earlier lesson covers its piece in depth; this is the map.
+
+**The problem: three gulfs.** Building an LLM application means crossing three gaps at once:
+
+- **Comprehension**: can you actually understand what your pipeline does across thousands of inputs and outputs?
+- **Specification**: can you turn what you want into prompts and pipeline steps precise enough that a model, which cannot read your mind, does it?
+- **Generalization**: once you have specified it well, does the model behave reliably on inputs you have never seen?
+
+**The method: analyze, measure, improve.** A loop, not a checklist.
+
+| Phase | What you do | Classic pitfall |
+|---|---|---|
+| Analyze | Read real traces, open-code what went wrong, axial-code the notes into a failure taxonomy, align multiple annotators with Cohen's kappa when criteria are subjective | Outsourcing the reading; looking at too few traces |
+| Measure | Turn each failure mode into an evaluator: code checks where possible, LLM judges where judgment is needed | Unaligned judges; "testing" a judge on its own few-shot examples |
+| Improve | Change prompts, pipeline structure or models, then re-measure | Fixing too early; jumping straight to the most complex fix |
+
+**Reliable judges.** Split labeled traces into train, dev and test. Tune the judge on dev to maximize TPR and TNR, report them once on test, and use them to correct the judge's raw pass rate into an estimate of the true one.
+
+**Operationalizing.** CI runs a golden set of known failure cases on every change, guarding against regressions you have already seen (known unknowns). Online monitoring samples production traffic to surface failure modes you never predicted (unknown unknowns).
+
+**Human review.** Generic spreadsheets and log viewers slow review down. A small custom interface that renders traces clearly, supports quick tagging and keyboard shortcuts can multiply how much useful feedback a reviewer produces per hour.
+
+<Callout kind="remember">
+Programmatic evaluators are not a lesser option. A regex or schema check that catches most instances of a failure is cheap, stable and easy to maintain. Many experienced teams use code checks wherever they can and reserve LLM judges for what truly needs judgment.
+</Callout>
+
+## Improve comes last, and is measured
+
+The instructors spend about 90% of the course on analyze and measure, deliberately. Once you know exactly what is broken and how often, the fix is often obvious. Without that, improvement is guessing.
+
+Two rules frame everything below:
+
+1. **Every change is measured with the evals you built.** A prompt tweak that fixes one failure mode can quietly break another. Run the change against your labeled traces and CI suite before believing it helped, and once it works, add the cases to CI so the gain sticks.
+2. **Don't be dogmatic about order.** If during error analysis you spot an obvious bug (the prompt never tells the model today's date, say), finish your annotation pass and then just fix it. The goal is a better product, not a ritual. What you should avoid is breaking your flow mid-analysis to tinker, or rewriting prompts before you know which failures are common.
+
+The improve phase has two halves: **accuracy** (make outputs more correct) and **cost** (deliver the same quality for less). Accuracy comes first.
+
+## Quick wins: fix the prompt
+
+Start with the lowest-effort, highest-impact changes. Most of them close a **gulf of specification**: the model failed because you never told it clearly what you wanted.
+
+- **Clarify ambiguous wording.** If the leasing assistant confuses "West Berkeley" with "Berkeley West", say explicitly how neighborhood names are written, or add an example that disambiguates.
+- **Add two or three targeted few-shot examples.** Pick input/output pairs that demonstrate the failure modes error analysis found. Keep them distinct from your CI and test cases, or your eval will flatter you.
+- **Give a role.** "You are a careful tax advisor" can steer tone and reasoning style, mainly for open-ended tasks.
+- **Ask for step-by-step reasoning**, ideally with an example of what that reasoning looks like. This helps on tasks with logic or planning. The instructors are openly skeptical that generic "think step by step" hacks move the needle much on modern models; test it, don't assume it.
+- **Fix the specs error analysis found.** Missing context (the current date, the user's timezone, the return policy) is usually the fastest win of all.
+
+Each of these takes minutes, and your golden set tells you within one run whether it helped.
+
+## Structural changes
+
+When prompt edits stop helping, change the shape of the pipeline.
+
+**Decompose the task.** One monolithic call that parses the request, looks things up and writes the answer is hard to get right and hard to debug. Split it into a chain of narrow steps:
+
+1. Rewrite or parse the user's query to make the intent explicit.
+2. Call a tool or run retrieval using the rewritten query.
+3. Summarize the results into the final reply.
+
+Each step gets a focused prompt, and your traces now show exactly which step failed. If one step is still unreliable, ask how a human would do it and decompose that step further.
+
+**Fix retrieval before generation.** In RAG systems the instructors' rule of thumb is that the problem is almost always retrieval. Build retrieval evals (recall@k and friends) and tune the levers: rewrite the query sent to the retriever, change the chunking, retrieve more or fewer chunks, add a re-ranking step, or let an agent retrieve iteratively.
+
+**Fix tool misuse.** If the model calls a tool with wrong argument formats or missing parameters, rewrite the tool's description, parameter docs and accepted values. The gulf of specification applies to tools as much as prompts. A common trap: the tool is described both in the system prompt and in its own schema (an MCP server definition, for example), and the two descriptions drift apart. Keep one source of truth.
+
+**Use structured outputs and lightweight checks.** Ask for a schema-constrained output, and validate before returning: a regex for malformed IDs, a length cap, a blocklist for unsafe content. These don't make the model smarter, but they catch common failures before users see them.
+
+## Heavier fixes
+
+Only when you have exhausted the above:
+
+- **Fine-tuning.** Worth considering when you have hundreds of high-quality labeled examples of a recurring failure that prompting cannot fix. It can lock behavior in, but it is slow and costly, and the cost is not just training: you now host and serve a model, someone is on call for it, and you need to re-tune as better base models come out.
+- **Systematic prompt optimization.** Treat the prompt as a tunable artifact and search over variants against your golden set, with A/B tests or tools such as DSPy. This only works because you have a trustworthy metric to optimize.
+- **More human review.** For high-stakes tasks, build review loops that keep feeding newly labeled examples into your datasets. Those labels are also what a later fine-tune would train on.
+
+Sometimes the honest answer is that the current model cannot do it and you wait for the next one, with your evals ready to tell you the day it can.
+
+<Callout kind="warn">
+Jumping to fine-tuning first is one of the named pitfalls of the improve phase. It is the most expensive fix, and it is usually aimed at a problem a clearer prompt or better retrieval would have solved.
+</Callout>
+
+## Cost: only once quality is good
+
+Do not optimize cost for an application that still produces bad outputs. A cheaper wrong answer is not progress. Cost work starts when your evals show the failure modes are under control and the bill is now the problem.
+
+The same evals make cost work safe. Every cost cut below is a change to the pipeline, and the question "did quality hold?" is answered by rerunning the suite.
+
+## Simple cost strategies
+
+**Tiered model selection.** List every LLM call in the pipeline and ask which ones need the flagship model. A binary classification step, intent routing or simple extraction often runs fine on a small model at a tenth to a hundredth of the price. A support bot might classify the incoming message ("billing", "technical", "general") with a small model and only send complex queries to the large one. Decide by running the small model through the same evals, not by intuition.
+
+**Decompose to mix models.** Decomposition helps cost as well as accuracy, because each step can use a different model. In a RAG pipeline over long manuals: an embedding model retrieves, a cheap model filters out irrelevant chunks, and the expensive model writes the answer from only the best few chunks, so its prompt is much shorter.
+
+**Cut input tokens.** Providers bill per token. Keep instructions concise and tune how many documents you stuff into the prompt. If several calls all read the same long document (extracting different clauses from one contract, say), summarize it once with a cheap model and let the later calls read the summary.
+
+**Cut output tokens.** Output tokens usually cost several times more than input tokens. Ask for concise answers, and when you need structure but are not using tool calling, a compact format like YAML has fewer braces and quotes than JSON.
+
+**Batch.** Work that doesn't need an instant answer (nightly judge runs over sampled traces, bulk labeling) can go through providers' batch endpoints, which typically charge substantially less in exchange for slower turnaround.
+
+## How provider prompt caching works
+
+A transformer computes a **key** and a **value** vector for every token it reads; together they are how later tokens look back at earlier ones. Computing them for a long prompt is the expensive part of reading it. Inference engines therefore keep a **KV cache**: if a new request starts with exactly the same tokens as an earlier one, the engine reuses the stored keys and values for that shared start and only computes the rest.
+
+Providers pass part of the saving on: cached input tokens are billed at a steep discount, roughly 50% to 90% off depending on the provider. The catch is the word **prefix**. Reuse stops at the first token that differs. One changed token near the top invalidates everything after it.
+
+Compare two layouts for the task "suggest a friendlier way to say X":
+
+```text
+Cache-friendly (static first)
+  Request 1: [Task: suggest a friendlier way to say:] hello my name is Shreya
+  Request 2: [Task: suggest a friendlier way to say:] hello my first name is Shreya
+             shared prefix = the whole instruction + "hello my"
+
+Cache-unfriendly (data first)
+  Request 1: hello my name is Shreya. Task: suggest a friendlier way to say the above
+  Request 2: hello my first name is Shreya. Task: suggest a friendlier way to say the above
+             shared prefix = "hello my" only
+```
+
+Same task, same tokens, but the second layout throws away the cache because the data sits in front of the instructions.
+
+The structuring rules:
+
+- Put **static content first**: system prompt, instructions, tool definitions, few-shot examples.
+- Put **variable content last**: retrieved documents, conversation history, the user's message.
+- Keep the static part **byte-for-byte identical**: no timestamps, request IDs or user names at the top, consistent whitespace and ordering.
+- Read your provider's docs. They differ in discount, minimum cacheable length, how long a cache entry lives, whether caching is automatic or needs explicit markers, and whether writing to the cache costs a little extra.
+
+## Worked example: caching a long system prompt
+
+A leasing assistant has a 3,000-token system prompt (rules, tool descriptions, examples) and about 500 tokens of variable content per request (the user's message plus retrieved listings). It writes 300 output tokens and serves 100,000 requests a day. Illustrative prices: $3 per million input tokens, $15 per million output tokens, cached input at 90% off ($0.30 per million).
+
+| Per day | No caching | Static prefix cached |
+|---|---|---|
+| Prefix: 300M tokens | $900 | $90 |
+| Variable input: 50M tokens | $150 | $150 |
+| Output: 30M tokens | $450 | $450 |
+| **Total** | **$1,500** | **$690** |
+
+Input cost drops from $1,050 to $240, and the total bill falls 54%. Output is untouched, so it becomes the floor: the next saving would come from shorter answers. If the same prompt put the user's message first, the prefix would almost never match and you would pay the full $1,500.
+
+<EvPromptCacheCalculator />
+
+## Model cascades
+
+The heavier cost technique. The goal: **match the answers of an expensive model at a fraction of its cost**.
+
+- The **oracle** is the expensive, slow, accurate model you trust (or the best system you currently have).
+- The **proxy** is a cheap, fast model.
+
+Every query goes to the proxy first. If the proxy is confident, return its answer. If not, escalate to the oracle and return the oracle's answer.
+
+```text
+query ──> proxy (cheap) ──> confidence >= T ? ──yes──> return proxy answer
+                                   │
+                                   no
+                                   └──> oracle (expensive) ──> return oracle answer
+```
+
+Easy queries, usually the majority, are answered cheaply; only the hard ones pay for the big model. Cascades are especially handy for cutting the cost of LLM judges in monitoring, where you run the same classification over thousands of traces.
+
+Two things to keep straight:
+
+- **Accuracy is measured against the oracle, not ground truth.** If the oracle is 80% correct and the proxy 70%, a cascade tuned to "95% agreement with the oracle" is trying to recover the oracle's behavior cheaply. It never tries to beat the oracle, and it does not correct the oracle's own mistakes.
+- **Escalated queries cost more than oracle-only.** They pay for the proxy call and then the oracle call. With 10,000 queries a day, a proxy at $0.0002 per call and an oracle at $0.01: oracle-only costs $100. If the proxy keeps 70%, the cascade costs 10,000 × $0.0002 + 3,000 × $0.01 = $2 + $30 = $32. If the proxy only keeps 10%, it costs $2 + $90 = $92, barely a saving.
+
+## Confidence from logprobs
+
+The cascade hinges on knowing when the proxy is unsure. The standard signal is the **log probability** (logprob) that most LLM APIs can return for each generated token: the natural log of the probability the model gave that token. Values near 0 mean high probability; a probability of 0.9 has logprob about -0.1, and 0.1 has about -2.3.
+
+This is most reliable for **classification**, where the answer is one token from a short list (Pass/Fail, True/False, A/B/C). To get a confidence score:
+
+1. Request the logprobs for every valid label.
+2. Exponentiate each one to get a probability: P = e^logprob.
+3. Normalize so they sum to 1 (other tokens took some probability mass).
+4. The normalized probability of the chosen label is the confidence.
+
+Example: logprob(True) = -0.10, logprob(False) = -2.30. Then e^-0.10 ≈ 0.905 and e^-2.30 ≈ 0.100, so the normalized confidence in True is 0.905 / 1.005 ≈ 0.90.
+
+```python
+import math
+
+def label_confidence(logprobs: dict[str, float]) -> tuple[str, float]:
+    """logprobs: {'Pass': -0.10, 'Fail': -2.30} for every valid label."""
+    probs = {label: math.exp(lp) for label, lp in logprobs.items()}
+    total = sum(probs.values())
+    label = max(probs, key=probs.get)
+    return label, probs[label] / total
+```
+
+For **open-ended generation** there is no clean answer. Heuristics such as the average logprob per token, or the total logprob of the sequence (which penalizes long answers), give a rough signal at best. The instructors treat this as an open research problem: validate any such score against labeled data before trusting it.
+
+<Callout kind="tip">
+Raw logprobs are not calibrated probabilities. A proxy that says "0.95" may be right only 85% of the time. That doesn't matter for a cascade, because you never trust the number itself: you tune the threshold on labeled data and keep whatever T delivers your target.
+</Callout>
+
+## Tuning the threshold
+
+What confidence is high enough? You decide with data, not intuition:
+
+1. Take a labeled dev set. The labels are the oracle's answers (or human labels).
+2. Run the proxy on every example to get its prediction and confidence.
+3. Try candidate thresholds. For each one, simulate: keep proxy answers with confidence ≥ T, assume escalated ones get the oracle's answer.
+4. Compute agreement with the oracle and cost for each T.
+5. Pick the **lowest** T that meets your target (say 95% agreement). Lowest, because a lower threshold keeps more queries on the cheap model.
+
+For classification, tune a **separate threshold per predicted class**. A proxy can be reliable when it says "Pass" and shaky when it says "Fail". If no threshold gets a class to the target, set its threshold to infinity: always escalate that class.
+
+For generative tasks there are no classes, so treat all examples as one group. Score each proxy output against the oracle's output with a binary check, usually an LLM judge asking "does this answer convey the same information?", and find one global threshold.
+
+Try it below. Notice how much the target matters: on this data a 90% target lets the proxy handle about three quarters of queries, while 95% drops that to about half.
+
+<EvCascadeThresholdTuner />
+
+## The cascade algorithm in Python
+
+A greedy version, per class. It is not globally optimal (thresholds are tuned independently), but it is simple, fast and works well in practice.
+
+```python
+import math
+
+def find_thresholds(examples, target=0.95):
+    """examples: list of (pred_label, confidence, oracle_label) from the dev set."""
+    thresholds = {}
+    for k in {pred for pred, _, _ in examples}:
+        group = sorted((c, pred == gold) for pred, c, gold in examples if pred == k)
+        thresholds[k] = math.inf  # fallback: always escalate this class
+        for t, _ in group:  # ascending, so the first hit is the lowest T
+            kept_wrong = sum(1 for c, ok in group if c >= t and not ok)
+            accuracy = 1 - kept_wrong / len(group)  # escalated ones match the oracle
+            if accuracy >= target:
+                thresholds[k] = t
+                break
+    return thresholds
+
+def cascade(query, proxy, oracle, thresholds):
+    label, conf = proxy(query)  # e.g. label_confidence(...) on the proxy's logprobs
+    if conf >= thresholds.get(label, math.inf):
+        return label, "proxy"
+    return oracle(query), "oracle"
+```
+
+Then check the chosen thresholds on a held-out set, exactly as you would a judge, and record what share went to the proxy and the cost per query. The idea extends to longer cascades: order several models by cost, give each its own thresholds, and stop at the first one that is confident enough. Learned routers that pick a model directly exist too, but threshold tuning is the robust, interpretable baseline.
+
+## Trade-offs at a glance
+
+| Lever | Typical effect | Effort | Main risk |
+|---|---|---|---|
+| Prompt clarifications, few-shot examples | Accuracy up, often a lot | Minutes | Overfitting examples to the test set |
+| Task decomposition | Accuracy up, easier debugging | Days | More calls, more latency |
+| Retrieval and tool fixes | Accuracy up for RAG and agents | Days | Tuning a retrieval metric that does not improve answers |
+| Fine-tuning | Locks in behavior | Weeks, ongoing | Serving cost, re-tuning on new base models |
+| Smaller model for a step | Cost down 10x to 100x for that step | Hours | Silent quality drop if not re-evaluated |
+| Fewer tokens, compact formats | Cost down proportionally | Hours | Losing context the model needed |
+| Prompt caching | Input cost down 50% to 90% on the prefix | Reorder the prompt | One dynamic token at the top kills it |
+| Model cascade | Cost down by the share the proxy handles | Labeled dev set and tuning | Uncalibrated confidence, drift over time |
+
+## From guesswork to engineering
+
+The course's real lesson is a change of habit: from "prompt and pray" to evaluation-driven development. Analyze, measure, improve is a repeatable process for building AI products you can trust.
+
+- **Start small.** You don't need a platform. Pick one failure mode you care about, build one simple evaluator, make one targeted improvement, and measure it.
+- **The mindset matters more than the exact recipe.** You will make many small judgment calls. A Likert-scale judge where binary was taught is not a failure; losing sight of what quality means to your users is.
+- **Keep looking at your data.** Models, users and use cases change, so the loop never finishes. New failure modes appear, judges drift, and the improve phase feeds the next analyze phase.
+- **Share it.** Few teams know how to do evals well yet. Teach your colleagues, write up what worked.
+
+## Cheat sheet
+
+- The course in one line: three gulfs (comprehension, specification, generalization), closed by analyze, measure, improve.
+- Improve only after you know what is broken and how often; measure every change with the evals you built, then add it to CI.
+- Accuracy ladder: clarify the prompt and add targeted examples, then decompose, fix retrieval and tools, then (rarely) fine-tune or optimize prompts.
+- Keep few-shot examples distinct from CI and test cases.
+- Don't optimize cost until accuracy is good.
+- Cheap wins: a smaller model for steps where evals say it passes, fewer input and output tokens, batch endpoints for offline work.
+- Prompt caching reuses an exact token prefix: static instructions first, variable content last, nothing dynamic at the top.
+- A model cascade sends every query to a cheap proxy and escalates low-confidence ones to the oracle; its accuracy target is relative to the oracle.
+- Classification confidence: exponentiate the label logprobs, normalize, take the chosen label's share.
+- Tune thresholds on labeled data: the lowest T per class that hits the target; infinity if none does.
+- Escalated queries pay for both models, so a cascade only saves money if the proxy handles most traffic.
+- Start small, keep looking at data, and treat improvement as a loop that never ends.
