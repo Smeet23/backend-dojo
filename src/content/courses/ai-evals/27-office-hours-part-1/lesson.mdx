@@ -1,0 +1,276 @@
+import { EvOfficeHoursAdvisor } from "@/components/widgets/EvOfficeHoursAdvisor";
+
+## How to use this page
+
+During the first half of the course, Hamel Husain and Shreya Shankar held four open office hours: about four hours of students describing their own products and asking "but what about my case?" This page collects the substantive answers, grouped by theme. Duplicates across sessions are merged, and logistics are dropped.
+
+Most answers lean on ideas taught elsewhere, so each one links to the lesson that covers the technique. What this page adds is the judgment: the rules of thumb, the edge cases, and the "it depends" reasoning that comes out when someone asks about a gas-turbine copilot, a role-playing game or a legal contract analyzer.
+
+One answer came up so often that Hamel joked students would end the course making memes about it: **do error analysis first**. "Where do I start?", "What should I eval?", "Should we unit test the pre-flight checks or look at end-to-end traces?" all got that reply, because error analysis is how you narrow an infinite surface of possible evals down to the failures you actually have ([Systematic error analysis](/courses/ai-evals/error-analysis)). Keep that in mind; the questions below are mostly about how to apply it in awkward situations.
+
+<EvOfficeHoursAdvisor />
+
+## Getting started: data and traces
+
+### We have no production data yet
+
+Several students had products that were not live: a tool with 100+ tool calls and many personas, a legal extraction pipeline targeting 70+ fields, an engineering copilot. The advice:
+
+- **You will not cover everything synthetically.** Trying to will delay your launch. Restrict the synthetic set to the personas, scenarios and features where quality matters most, and generate from dimensions and tuples ([Create a starting dataset](/courses/ai-evals/error-analysis#create-a-starting-dataset)).
+- **Use saturation as a launch signal.** Keep adding dimensions (new personas, new scenario types). If you add dimensions and error analysis finds no new failure modes, the system is getting robust. Not perfect, but it is evidence you may be ready to ship.
+- **Set expectations, then build a flywheel.** For the extraction project, Shreya said you cannot promise 100% before production. Ship with what labeled data you have, then do error analysis on real production data and add judges for the failures it reveals ([The continuous improvement flywheel](/courses/ai-evals/ci-cd-and-monitoring#the-continuous-improvement-flywheel)).
+- **Synthetic data for a specific hypothesis is fine, sparingly.** If you suspect fields in the middle of long documents are extracted worse (a known weakness of long-context LLMs), generate documents to test that. But don't spend your resources imagining failures when there are real ones to fix.
+
+### Our users are not like our docs
+
+An industrial software company expected two kinds of users: veterans who use product-specific jargon, and new hires who describe things in lay terms. They had no user data, only technical documentation. Hamel's read was that the real problem was not knowing the users, and that synthetic data would be a stopgap. His advice was to find pilot or test users and let their queries **seed** the synthetic data, perturbing real queries into many variations. Shreya added a generation trick: give the LLM the documentation, ask it to find the most technical terms, and rephrase questions about them the way a newcomer would ask. Even a handful of real beginner queries in the generation prompt makes the output far more realistic.
+
+### Our inputs are documents, not chat messages
+
+For a contract analyzer (upload a contract, the LLM annotates it against legal concepts), generating whole synthetic contracts is hard and rarely realistic. Curate real documents first. Then, Shreya suggested, **perturb real documents** rather than inventing new ones: ask an LLM for five or six altered versions of each. Your dimensions become *dimensions of perturbation* (remove a clause, move it, reword it ambiguously) instead of dimensions of whole documents. Hamel framed this as detective work: you are trying to trip the system where you suspect it is weak.
+
+### Synthetic multi-turn conversations
+
+Simulating a user turn by turn is possible (some vendors sell it) but hard; fully simulating a person is "approaching AGI." The order of preference from the sessions:
+
+1. **Real traces first.** "Real" is a spectrum: a colleague role-playing a renter still counts.
+2. **Learn themes from them.** Collect around 100 real conversations, look for patterns (how users react to certain replies), and put those patterns into the simulator's prompt.
+3. **Then simulate personas.** Specify each persona concretely in the simulator's system prompt.
+
+Shreya never generates fully synthetic conversations to discover failure modes from scratch. Asked whether to start from personas or from failure modes, her answer depended on expertise: in document processing, where she knows the typical failures, she starts from expected errors; in an unfamiliar domain like a recipe bot, she starts from personas. For classifying production traces by persona, Hamel suggested a plain LLM classifier: it helps you sample for error analysis, and if it is accurate enough it can double as a router.
+
+### We can't even see our traces
+
+A product coach who had built custom GPTs for clients could only see conversations users chose to share via links. Hamel's smallest next step: get whoever runs the product to **log traces** somewhere you can read them. A tool is optional; JSONL, CSV or a SQLite file is enough to start. A trace should include everything relevant to the interaction, including steps the user never sees. When an agent hands off to a human, the trace continues through the handoff.
+
+### Does any of this apply to single-shot pipelines?
+
+Yes, and it is easier. One prompt in, one response out, no conversation: you still do error analysis and write evals exactly the same way. The homework Recipe Bot is effectively single-turn too.
+
+### What about public trace datasets?
+
+Hamel's advice was to skip them. Error analysis works because you have an opinion about what good looks like, and someone else's traces mean little to you. Log your own (the homework sets this up), and if you have work data, use it instead of the homework app: you will learn more.
+
+## Error analysis in practice
+
+### Multi-agent systems
+
+Treat the whole multi-agent system as **one unit**. The trace is still the journey from user query to final answer, with each step tagged by the agent that produced it. Do error analysis on that, find failure modes, and only then work out which agent or handoff is responsible. The mistake Shreya sees is evaluating each agent individually before any system-level analysis: maybe sensible two years ago, not with today's models. The diagnostic tools are in [Debugging agents and multi-step pipelines](/courses/ai-evals/rag-and-agents#debugging-agents-and-multi-step-pipelines).
+
+### Reading long traces without drowning
+
+Hamel's routine for traces with many LLM calls and tool calls:
+
+1. Read the user's first input, then jump to the **final output**.
+2. If the outcome looks fine, move on.
+3. If not, go back to the top and read down until the **first** thing that looks wrong. Write the open code, stop, next trace.
+
+The same applies to multi-step workflows such as a six-step business-case builder: the whole workflow is one trace, judged from the user's perspective. Some questions don't need reading at all. If you already know a workflow with 100 steps is bad, count steps with analytics and skip the ceremony.
+
+For **30+ turn** conversations, Shreya pre-screens with a reasoning model: one row per trace in a spreadsheet (a message-history column plus metadata), uploaded to o3 with a request to list which traces most likely show a failure, summarizing messages if needed to fit about ten traces at once. She then reads those first. It is an 80/20 tool, and she notes a human reading 30 turns misses things too. For month-long role-play sessions, Hamel suggested segmenting traces and sampling by signals (user feedback, outlier statistics) rather than at random.
+
+### Which traces should we sample?
+
+A support team had about 1,500 questions from a year in production, split by product line, role and region. Hamel's progression:
+
+| Stage | Sampling | Why |
+|---|---|---|
+| First pass | Random | Learn what is in the data at all |
+| Once you know the dimensions | Stratified: a fixed number per product line, role, region | Small slices don't vanish under big ones |
+| Once you "smell" a problem | Targeted at the suspect slice, plus outliers (very long or short, unusual tool-call counts) | Detective work: dig where problems are likely |
+
+He admitted the third stage is hard to teach. It is data-analysis intuition, and the way to build it is to read a lot of traces. More on selection in [Selecting traces from the firehose](/courses/ai-evals/human-review-interfaces#selecting-traces-from-the-firehose).
+
+### Can I start with a rubric I already have?
+
+A student replicating the TinyStories paper had six fixed criteria (creativity, plot, grammar and so on) and a judge agreeing with her 90%+ of the time, yet felt she was "doing it wrong" by not starting blind. Both instructors said hypotheses are good; without them you get lost. But still open code about 100 outputs and look for problems outside your criteria. Shreya: "I would bet money that you'll come up with something."
+
+The same logic answers **"should I write evals before prompts, like TDD?"** Writing some evals first is fine. The pitfall is believing your up-front list is complete and skipping error analysis: you cannot predict how an LLM will fail to generalize, so you would miss many failure modes and bake your bias into the eval suite.
+
+### Fix as you go
+
+A student asked whether to fix all failure categories before re-running error analysis. Hamel's answer was a reminder that the point is a better product, not evals:
+
+- If at any point you see a frequent failure **and you know exactly how to fix it, stop and fix it.** A syntax error in a calendar tool deserves a unit test at most, not an LLM judge.
+- Then re-run and re-code. Doing that loop ten times and fixing twenty problems is the process working.
+- Evals earn their cost on the **lagging** problems, the ones you can't fix trivially and will iterate on with prompt variants, models or context changes. See [Improve comes last, and is measured](/courses/ai-evals/improvement-and-cost#improve-comes-last-and-is-measured).
+
+He added a test for axial codes: if you count "50 scheduling issues" and don't know what that means or where to look, the code is too vague. Good axial codes are actionable. (Writing axial codes into the open-code column, as happened in one lecture demo, was a live-demo shortcut, not a recommendation.)
+
+### When "failure" is subjective
+
+A game studio asked how error analysis works when entertainment is the goal and there is no right answer. The answer: failure is defined by your product, not by a generic checklist. A "wrong" tool call nobody cares about is not a failure. A dull reply or a character breaking role is. Write notes on *why* it isn't entertaining, and those notes become your open codes.
+
+The same question in another form came from a research-paper search assistant, where users refine queries and reach a good result by different routes. Start with a binary pass or fail on the whole trace: if both routes end well, both pass. Raise the bar later. For richer questions, put on a data-science hat: slice your error analysis by metadata (channel, number of turns, number of edits) and test a concrete hypothesis, such as "sessions with many edits churn more." Shreya: something must be a *known* unknown before you can measure it.
+
+Related cases got the same answer. A platform where teachers configure tutoring bots (so the system prompt varies) is still one product if the outcomes you want for students are the same; if outcomes differ, treat them as separate products. And if a pipeline routes queries to different system prompts (say German versus French), the trace starts at the user query and the system prompt is just one step. An evaluator may run only on the relevant subset, and you can report prevalence over the whole set and per slice.
+
+### How often do we redo this?
+
+There is no separate "evals phase"; looking at data is part of building each feature. Shreya suggested reviewing a sample of about **50 production traces a week** to catch new user behavior that automated checks miss. What should trigger new error analysis and new evals: a new feature, a redesigned UI, or a new user population. A model or backend change should *not* force you to rebuild everything: your existing evals exist precisely to catch regressions from such changes, and your labeled data lets you re-validate judges on a new model. External tools that change underneath you are one more reason the process never stops.
+
+## Annotators, experts and agreement
+
+### One trusted expert and several imperfect reviewers
+
+A mystery-shopper company had one expert with little time and a team of editors at various training levels. Treat the expert's labels as ground truth and **evaluate the humans**: measure each editor's agreement with the expert (Cohen's kappa, [Measuring agreement](/courses/ai-evals/collaborative-evaluation#measuring-agreement)). Editors who pass join a circle of trusted annotators.
+
+### Several experts for separate product lines
+
+An enterprise support RAG system spanned product lines with no content overlap, so no single expert existed. Multiple labelers are fine if each area is clearly scoped: a **benevolent dictator per area**, empowered to make the call (and to check with colleagues when unsure). Ten labelers is not too many, provided all ten are genuine domain experts. The usual failure is handing labeling to a developer or an outside party who lacks the expertise.
+
+### Highly technical domains
+
+For a gas-turbine service assistant where the engineers could not judge correctness: get domain experts, and **train** them. That means a review interface that removes friction (not just a vendor UI), starting with one expert you trust, and labeling alongside them at first so you learn the domain, coach the process and see where it is painful. Multiple annotators per example come later, if reliability demands it. See [Interfaces for human review](/courses/ai-evals/human-review-interfaces) and the healthcare talk in [Evals with domain experts](/courses/ai-evals/evals-with-domain-experts).
+
+### Our agreement is low. Now what?
+
+Low kappa is a diagnosis, not a verdict. Hamel's two usual causes:
+
+- **The rubric is vague**, or people hold different ideas of good. Hold alignment sessions and sharpen definitions.
+- **Too much surface area for the people labeling.** If everyone labels every region, language and product, some labelers lack context for some slices. Reorganize so experts label what they know.
+
+Once agreement is reasonably high, accept the remaining noise (advanced users can fold it into confidence intervals). Agreement is not a number to maximize: perfect agreement has unbounded cost. The real goal is a shared understanding of good, so that when a judge's numbers reach stakeholders, people believe them.
+
+## Judges, metrics and reporting
+
+### Imbalance versus stratification
+
+Two different problems that students often mixed up. **Imbalance** means failures are rare (10% is typical), so accuracy misleads: always guessing "pass" scores 90%. Use TPR and TNR ([Trusting your judge](/courses/ai-evals/trusting-your-judge)). **Stratification** is about dimensions you care about (regions, user types, products) that have very different amounts of data; sample so each one gets enough examples to measure.
+
+### Speeding up judge alignment
+
+For a judge that is "barely acceptable," Hamel suggested collecting the examples where you and the judge disagree, giving them to an LLM with your critiques, and asking it to propose prompt edits, which you then check yourself. Some vendors build this in, and research tools such as AlignEval and Shreya's DocETL work the same way. This works best if you **write open codes so an LLM can understand them**: they then feed axial coding and judge drafting. Prompt optimizers like DSPy can add a final push with a good dev/test split, "but it's not a magic bullet." Perfect alignment has infinite cost.
+
+### Can a reasoning model refine the judge on its own?
+
+A student proposed giving a reasoning model the labels and letting it iterate the judge prompt unsupervised. Shreya's objection: it can't infer your **latent criteria**, the taste you never wrote down. Fine for objective checks like spelling; for anything subjective it "will completely fail." Her compromise keeps humans in charge: have a reasoning model *rank traces* likely to show a failure, confirm them yourself, then ask it for judge improvements. Fine-tuning a judge is possible too, Hamel said, but if you are willing to fine-tune, ask why you aren't fine-tuning the product model.
+
+### All these judges cost money
+
+Evals aren't free, so spend where you will iterate. Cheap code checks are basically unit tests; write them freely. Costly aligned judges are only worth it for problems you can't fix right away. Shreya ranked the course's ideas by leverage: **error analysis first, trustworthy LLM judges second**, and everything else (prompting tricks, fine-tuning, RL) well behind. Master the first two and you have a flywheel.
+
+For a non-chat workflow (mystery-shopper reports checked for inconsistencies), the `judgy` library still applies, but it only estimates a failure's prevalence on unlabeled data. It doesn't suggest fixes. A scoped-down loop: one judge per observed failure mode, then a second LLM that reads only the failing traces and proposes improvements, which you review.
+
+### What do we show stakeholders?
+
+Hamel's approach depends on the room:
+
+- **Non-technical audience**: one **global error rate**, the share of traces where any judge flagged any failure. No confidence intervals on the slide. Keep the validation story ready (measured against human labels, TPR and TNR) for when someone asks how you know.
+- **A hot-topic failure**, the one leadership loses sleep over, gets its own headline metric. Don't bury it in the composite. Hamel compared this to journalism: anticipate what your audience needs.
+- **"Why not 0%?"** Shreya frames it as resource allocation: nothing reaches 100% everywhere, pushing one failure to zero can raise others, and 95% can still deliver a lot of value. The question is where to spend effort.
+
+Correcting a judge's raw pass rate and putting an interval around it are covered in [Estimating the true success rate](/courses/ai-evals/trusting-your-judge#estimating-the-true-success-rate).
+
+### Guardrail: LLM or separate classifier?
+
+A friend's team kept the Recipe Bot on topic with a separate relevance classifier rather than prompt tweaks. Shreya's answer was cost-benefit, with three costs: dollars per call, **latency**, and the cost of **false positives** (legitimate queries rejected), which most teams only discover after deploying a conservative guardrail. Decide what false-positive rate you can tolerate and work backwards. See [Two ways to run evals in production](/courses/ai-evals/ci-cd-and-monitoring#two-ways-to-run-evals-in-production).
+
+## Improving the system
+
+### The three groups of knobs
+
+Asked to list everything that improves an agent, Shreya grouped the levers:
+
+| Knob | Examples | When |
+|---|---|---|
+| Context | Specification you never wrote down; external context fetched at run time (current docs, package versions) | First, and often enough. Not every gap is fixable: some domains are simply absent from training data |
+| Workflow decomposition | Sub-agents, one LLM call per subtask, self-refinement loops | Only where error analysis shows the biggest failures. Don't decompose up front |
+| Model work | Switch models, fine-tune, train | Only with dedicated people and serving infrastructure |
+
+On decomposition she was blunt: many teams take "the cross product of any decision they could possibly make" in agent design and try them all. Start with one simple agent and decompose only where failures appear. Hamel agreed: one agent first, split only when the prompt is doing too much and the evals justify the complexity. For a student extracting business processes from meeting transcripts, the "dead simplest" version was one capable model with a carefully written prompt, followed by error analysis. Splitting into one call per process type comes only if the errors point there.
+
+### Fixing one metric breaks another
+
+A game studio's tone-rewriting feature kept answering the message instead of rewriting it; every prompt rewrite fixed one eval and broke another. Hamel's sequence: first try **splitting the task** into sub-agents (cheaper than fine-tuning). If the instructions are clear and it still fails, it is a generalization problem: try a stronger model, more test-time compute (reasoning), and only then fine-tuning or RL ([Structural changes](/courses/ai-evals/improvement-and-cost#structural-changes)).
+
+### When is fine-tuning worth it?
+
+The consensus: exhaust prompting, decomposition and model choice first, and fine-tune only at a real plateau with a clear ROI. Two practical points:
+
+- **Serving is the hidden cost.** Training a fine-tune is cheap compared with hosting it. Without the MLOps to serve it, there is often no point.
+- **Evals make fine-tuning easy, and newer models make it obsolete.** At ReChat, a real-estate assistant, the model had to emit special code blocks interleaved with text that the app rendered as widgets, and prompting couldn't get it reliable. The team used their evals to filter the hardest failures into a training set and fine-tuned via the OpenAI API, which worked. Within about three months, GPT-4o outperformed the fine-tune. Hamel says this keeps happening.
+
+If you do go down that road, build a modular harness: a curated dataset and trusted evals let you point the same process at any model or fine-tuning API.
+
+### How much effort goes into the first prompt?
+
+A lot, once. Shreya often spends 30+ minutes on an initial prompt, following the template from [Prompting fundamentals](/courses/ai-evals/evals-fundamentals#prompting-fundamentals) and the test "would a smart contractor I hired online be able to do this from my instructions?" What she does *not* do is patch the prompt after every error she finds: that is whack-a-mole. Other prompting points from the sessions:
+
+- **"Do not" instructions get ignored**, especially by small models like GPT-4o mini. Prefer stating what you want. If you need a "don't" to hold today, write an eval for it, and if it fails, isolate it with decomposition or add a guardrail that detects the bad output and retries.
+- **Treat the system prompt as globals.** Whether it is technically a system or first user message, put everything the agent should always know in one grounding prompt instead of scattering context across later messages.
+- **Long conversations lose early instructions.** Two ideas Shreya had heard of but not tested: collapse prior turns into a single message (one paper reported a large gain in instruction following), or run a background process that tracks the user's stated constraints and re-injects them with every new message.
+- **"Context engineering" is not new.** It is a better name for what RAG already was: getting the right context into the model, however it gets there.
+
+### Pipelines that are slow or not LLM-based
+
+For a coding agent whose runs take 10 to 30 minutes, Hamel pointed to the advantage of code: **reference-based checks** like tests, static analysis and execution. GitHub Copilot's harness masked code in real repositories, had the model fill it in, and ran the repository's unit tests at scale (a large engineering job). Without that, gather a small set of 5 to 10 failing cases, try to reproduce them minimally, and iterate. To catch a run going off the rails early, put the eval in the critical path as a guardrail that rejects the step and feeds the error back.
+
+A document pipeline turned scanned PDFs into garbled Markdown. The converter was a deterministic library (Microsoft's MarkItDown, by the sound of it), so there was no prompt to tune. If the conversion needs judgment (what to keep, what to ignore, describing images), an LLM step is reasonable, with evals to iterate on it. Otherwise pick a better extractor ([the guest talk on RAG pitfalls](/courses/ai-evals/rag-evaluation-pitfalls) covers extraction errors).
+
+## Tooling
+
+### Choosing an eval platform
+
+Hamel wouldn't rank vendors (they compete so hard that any feature he named on a call would ship the next week) but gave rough guidance. LangSmith fits naturally if you build on LangChain or LangGraph. Phoenix is open source and self-hostable, so it is the default if data must stay on your infrastructure. Braintrust and Arize differ in feature flavor and UX, so try them. Compliance questions (EU data residency, which tier is compliant) go to the vendors directly. The platforms are compared in [Eval platforms](/courses/ai-evals/eval-platforms).
+
+Two related answers. On off-the-shelf metric libraries for a tool-using agent: don't start there; generic metrics won't measure your failures. On a stack outside Python and TypeScript (a Rails app with a thin vendor SDK): SDK support is a long tail. OpenTelemetry is the closest thing to a standard, but full vendor neutrality is hard because you instrument for each vendor's UI. Hamel doesn't spend his limited "innovation tokens" on making tracing vendor-agnostic, though dumping raw traces to storage such as S3 is perfectly fine. NurtureBoss, the leasing company from the core lessons, eventually moved from a vendor to its own homegrown viewer.
+
+### Notebook or the production cloud?
+
+A student was stuck in AWS Bedrock permissions instead of doing coursework. Hamel, a self-described notebook fan: move forward in a notebook and port to the production environment later. AWS confuses experienced engineers too.
+
+### Making review fast when you have no time
+
+A director of product asked what shortcuts the instructors build for themselves. Shreya's answer was to **vibe-code a custom review interface** for each application in 30 to 60 minutes, aiming to judge a trace as good or bad in about two seconds. Features she reuses:
+
+- A single-pane trace viewer with expandable sections (tool arguments collapsed by default).
+- Hotkeys for labels.
+- Every label auto-saved to a file (Parquet or CSV), ready for judge building.
+- Application-specific highlights, such as flagging calls to tools that don't exist.
+- Search for similar traces, useful when you can't judge one output without knowing what typical looks like.
+
+Her rule for what to build: if she does a task more than twice, she makes it batchable, viewing and labeling a whole cluster of traces at once. She tries to "parallelize herself" rather than hand the work to an agent she would then have to validate. See [Building one fast with an AI coding assistant](/courses/ai-evals/human-review-interfaces#building-one-fast-with-an-ai-coding-assistant).
+
+## Teams and organizations
+
+### How do we sell the time?
+
+Hamel doesn't sell evals as a separate project. People come to him stuck: they have a prototype and don't know how to improve it. You wouldn't ship software without looking at logs or writing tests, and you shouldn't ship AI without a minimal eval process. Vibe checks are the right way to start a prototype. After that, without evals you are guessing. He bakes the time into development estimates. Shreya's addition is to **quantify what error analysis finds**: report "we found 100 bugs," estimate what shipping them would have cost, and show leadership the failure taxonomy. Leaders learn from it, trust the process, and trust you.
+
+### Legal and privacy push back on reading traces
+
+At a large enterprise, a student hit fear about reading user conversations. What has worked in Shreya's academic collaborations on legal and other sensitive data: a small team that completes privacy training and signs a data agreement. The student's own winning argument was a **retention window**: keep traces about a month, then purge. Hamel's candid alternative, which he doesn't recommend: sometimes the argument is only won after a problem surfaces in production. See the callout in [What counts as a trace](/courses/ai-evals/collaborative-evaluation#what-counts-as-a-trace).
+
+### Who should own evals?
+
+Everyone on an AI team benefits from understanding evals. As problems get complex (slicing errors by metadata, debugging subtle issues) the work needs strong data literacy and, "in the limit," looks like a data scientist's job. Both instructors come from data science, and Hamel says nothing in the course is invented: it is the error analysis you would do on a cat-versus-dog classifier ("it fails on rainy days" is an axial code), with train, dev and test splits carried over. "Look at your data" is a muscle: spotting what looks off, quickly. A general data-analysis course trains it; so does reading traces.
+
+### Who does this well?
+
+Companies that do evals well rarely say so, because evals are their moat. Shreya's example: on the Gemini team, humans review messages users dislike and do error analysis on them, which she credits for Gemini catching up so quickly. Notion talks publicly about evals. Scarcity of public examples is part of why the course exists.
+
+### Retention and product metrics
+
+An AI coaching company wanted to predict whether users would reply to a message. Product analytics (engagement, retention, drop-off) is valid work, but it is a different discipline from AI evals. For improving the AI itself, error analysis on conversations comes first, and it often explains drop-off too.
+
+## Cheat sheet
+
+- When in doubt, do error analysis: it answers "where do I start" and "what should I eval."
+- No production data: synthesize only your priority personas and features; if new dimensions stop revealing new failures, that is a ship signal.
+- Seed synthetic data with real queries; for documents, perturb real ones instead of inventing new ones.
+- Multi-turn: real traces (even colleagues role-playing) before simulated users.
+- Multi-agent: evaluate the whole system as one unit first, then drill into agents.
+- Long traces: check input and final output; if bad, read from the top to the first error and stop.
+- Sampling: random, then stratified by dimension, then targeted at suspected problems and outliers.
+- Bring your rubric, but still open code about 100 traces; writing evals first doesn't replace error analysis.
+- If you know the fix, fix it now; save evals for problems you'll iterate on.
+- Low kappa means a vague rubric or labelers outside their expertise; agreement is not a target to max out.
+- Imbalance: don't use accuracy. Stratification: make sure each slice you care about is measured.
+- Reasoning models can rank traces and propose judge edits, but can't learn your unwritten criteria.
+- Highest leverage: error analysis, then trustworthy judges. Everything else is secondary.
+- Stakeholders: one global error rate, the hot-topic failure on its own, validation story in your pocket.
+- Guardrails cost money, latency and false positives; set a tolerable false-positive rate first.
+- Improve with context, then targeted decomposition, then model work; fine-tune last (serving is the real cost).
+- Vibe-code a review UI in under an hour; batch anything you do more than twice.
+- Sell evals by counting the bugs they find; win privacy arguments with training, agreements and retention windows.

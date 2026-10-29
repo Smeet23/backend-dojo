@@ -1,0 +1,255 @@
+import { EvHomeworkStepper } from "@/components/widgets/EvHomeworkStepper";
+
+## What the two homeworks ask
+
+The first two homeworks of the course turn [Evals fundamentals](/courses/ai-evals/evals-fundamentals) and [Systematic error analysis](/courses/ai-evals/error-analysis) into work you do by hand on a small app: the **Recipe Bot**, a FastAPI chatbot from the public [recipe-chatbot repo](https://github.com/ai-evals-course/recipe-chatbot). Its whole "pipeline" is one call: a system prompt from `backend/system_prompt.md` plus the user's messages, sent through `litellm` to a model (`gpt-4o-mini` by default).
+
+| Homework | You produce | Done when |
+|---|---|---|
+| **HW1** | A real system prompt, at least 10 new test queries in `data/sample_queries.csv`, one bulk run | A results JSON exists and you have read every response |
+| **HW2** | Dimensions, reviewed tuples, reviewed queries, traces, open codes, a failure taxonomy | `failure_mode_taxonomy.md` has 4 to 8 named, defined, counted failure modes with real examples |
+
+Three vendors recorded walkthroughs of the same two homeworks: Braintrust, Arize Phoenix and LangSmith. They click different buttons but do the same work. This lesson walks through that work once, tool-neutrally, with the decisions they made along the way, then compares the platforms in one short section. Lesson 14 covers the platforms properly.
+
+## Homework 1: write the first system prompt
+
+The starter prompt is a single run-on paragraph: "You are an expert chef recommending delicious and useful recipes. Present only one recipe at a time..." plus rules about serving size and not asking follow-up questions. It works, which is the trap. Run the three sample queries ("Suggest a quick vegan breakfast recipe", "I have chicken and rice. what can I cook?", "Give me a dessert recipe with chocolate") and the answers look fine. You only see the problems across a dozen varied queries.
+
+### Start from the README's checklist
+
+The HW1 README gives a skeleton that matches the prompt components from [lesson 1](/courses/ai-evals/evals-fundamentals):
+
+1. **Role and objective**: who the bot is and for whom.
+2. **Always and never rules**: precise measurements in standard units, numbered steps; never require unobtainable ingredients without an alternative.
+3. **A safety clause**: decline unsafe requests politely, without preaching.
+4. **Creativity level**: may it invent dishes? If so, say it must flag a novel recipe as such.
+5. **Output format**: Markdown, recipe name as `##`, a 1 to 3 sentence description, `### Ingredients` as bullets, `### Instructions` as numbered steps, optional `### Tips`, plus one full example response.
+
+A compact version looks like this:
+
+```markdown
+You are a friendly home-cooking assistant for busy families. You suggest one
+practical recipe per answer, using ingredients found in a normal supermarket.
+
+Always:
+- List ingredients with quantities in standard units, and state servings (default 2).
+- Respect every dietary restriction the user states. If an ingredient might break it
+  (stock, sauces, cheese rennet), say so and give a safe alternative.
+- Respect stated time limits, counting marinating and resting time.
+
+Never:
+- Ask a follow-up question instead of answering; make a sensible assumption and say it.
+- Require rare equipment or ingredients without a common substitute.
+
+If a request is unsafe or harmful, decline briefly and offer a safe alternative.
+You may adapt known recipes; label anything genuinely new as "my own variation".
+
+Format: ## Recipe name, a one-line description, ### Ingredients (bullets),
+### Instructions (numbered), optional ### Tips.
+```
+
+Every line here is a **specification**. When HW2 later finds the bot ignoring "vegan", you will know it is a generalization failure, because the prompt asked for it. That is the reason to write a decent prompt before error analysis: otherwise your taxonomy fills up with things you never asked for (see [Specification or generalization?](/courses/ai-evals/automated-evaluators#specification-or-generalization)).
+
+### Iterate against outputs, not intuition
+
+All three walkthroughs did the same loop: run the prompt over the query set, read the outputs side by side, change the prompt, run again.
+
+- **Phoenix** started from a deliberately bare prompt and read 13 outputs. Notes from that pass: formatting differed from one answer to the next, lengths swung from very short to wordy, and the bot had "no personality" and never offered follow-ups. The second prompt added core responsibilities, ingredient and instruction guidelines, scope (what it can and cannot answer) and explicit style rules. Run side by side on the same 13 rows, the outputs became consistent in format across both recipes and general cooking questions.
+- **Braintrust** tailored the bot to one family. Reading their queries showed many were not recipe requests at all but questions about protein, macronutrients and weekly meal prep, so the prompt gained a section on how to answer those. Family preferences (no artificial dyes) became explicit rules too.
+- **LangSmith** pasted the README's suggestions into an LLM prompt editor to rewrite the prompt, then turned the hard-coded user message into a `{query}` variable so the same prompt could run over a whole dataset.
+
+<Callout kind="warn">
+Braintrust's walkthrough asked the platform's AI assistant to write a "recipe bot score" and then to optimize the prompt against it, reaching an average of 99%. Treat a number like that as a prompt-iteration aid, not a measurement. Nobody had checked the scorer against human labels, and a prompt optimized against an unvalidated scorer learns to please the scorer. Validating judges is [lesson 5](/courses/ai-evals/trusting-your-judge).
+</Callout>
+
+Lesson 1's advice still applies: write the first draft yourself. Using an LLM to tighten wording is fine once you have spelled out what you want.
+
+## Homework 1: expand the test queries
+
+Add at least 10 queries to `data/sample_queries.csv` (columns `id`, `query`), then run:
+
+```bash
+uv run python scripts/bulk_test.py            # or --csv path/to/other.csv
+```
+
+It sends every query to the bot concurrently and writes `results/results_<timestamp>.json`. The README suggests vibe-coding a small HTML viewer for that file, which is worth the ten minutes: you will read these responses many times.
+
+Aim the ten queries at the README's list of axes, deliberately spread out:
+
+| id | query | probes |
+|---|---|---|
+| 4 | Spicy Thai curry I can make tonight | cuisine, time |
+| 5 | gluten free breakfast ideas for kids | diet, audience |
+| 6 | what can I make with chicken, rice and broccoli | ingredients on hand |
+| 7 | Dinner for two under 30 minutes, beginner cook | time, skill |
+| 8 | something healthy | vague request |
+| 9 | high protein meal prep for the week | non-recipe question |
+| 10 | vegan lasagna without tofu | diet plus exclusion |
+
+Braintrust's version recruited real people: the presenter asked his wife and three sons for 10 to 20 queries each and stored who wrote each query, plus `source: hand_coded`, as metadata. Both fields paid off later: `source` separates hand-written from synthetic queries once they share a dataset, and the submitter lets you check whether failures cluster around one kind of user.
+
+## Homework 2, part 1: dimensions and tuples
+
+HW2 starts by generating synthetic queries with the dimension-and-tuple method from [lesson 2](/courses/ai-evals/error-analysis). The README asks for 3 to 4 dimensions with at least 3 values each, 15 to 20 combinations, then queries for 5 to 7 of them. The walkthrough notebook's dimensions:
+
+```python
+import random
+from itertools import product
+
+dimensions = {
+    "dietary_restriction": ["low carb", "keto", "no seafood", "vegan", "gluten-free"],
+    "meal_purpose": ["potluck", "dinner party", "family meal", "quick lunch"],
+    "time_available": ["under 15 min", "under 30 min", "1 hour", "all day"],
+    "skill_level": ["beginner", "intermediate", "advanced"],
+}
+
+all_tuples = list(product(*dimensions.values()))   # 5 * 4 * 4 * 3 = 240
+random.seed(7)
+candidates = random.sample(all_tuples, 25)         # sample, then review by hand
+```
+
+Phoenix used dietary restriction, cuisine, meal type and skill level, got 450 combinations and sampled 25. Sampling is fine, because no one reviews 450 tuples, but review what you sampled. Some combinations make no sense as a real request: "all day" plus "quick lunch", or "beginner" plus a dinner-party showpiece that only an expert would attempt. Drop or fix them before writing queries.
+
+Braintrust made the review explicit. The tuple-generation step ran as an experiment, and a subject-matter expert marked each tuple with an `is_good` score in the review UI. Only good tuples moved on.
+
+## Homework 2, part 1: tuples into queries
+
+The second prompt takes **one tuple at a time** and writes a message a real user might type:
+
+```python
+QUERY_PROMPT = """You write realistic messages that people send to a recipe chatbot.
+Dietary restriction: {dietary_restriction}
+Meal purpose: {meal_purpose}
+Time available: {time_available}
+Skill level: {skill_level}
+Write 3 different messages this person might send. Vary length and tone:
+some terse and lowercase, some with typos or emoji. Do not list the attributes."""
+```
+
+The reference file `homeworks/hw2/reference_files/query_response.jsonl` shows what realistic looks like: "Whatcha got for a 30 min eggs and cheese dinner? 🤔", "quick egg spinach cheese recipe pls", "need a beginner-friendly dish without heavy sauces also it gotta be low fodmap pls". If your generated queries read like "I am a beginner looking for a gluten-free family meal that takes under 30 minutes", the prompt is leaking the tuple and you should regenerate.
+
+Then review again, query by query (Braintrust ran a second `is_good` pass), and merge the survivors with your hand-written queries into one dataset. If you want to skip generation, the repo ships 250 pre-generated query and response pairs plus a `viewer.html` to browse them.
+
+<Callout kind="tip">
+LangSmith's walkthrough skipped dimensions and used a "generate similar examples" button that few-shots from rows already in the dataset. It is fast, and it showed the catch: because two seed queries were lowercase, most generated ones came out lowercase too. Few-shot generation copies the style and topics of its seeds; tuples force coverage. Use the shortcut only if you seed it deliberately.
+</Callout>
+
+## Run the bot and save full traces
+
+Run every query and keep the **whole conversation**, not just the reply: system prompt, user message, assistant message, model, prompt version and your metadata. A tool-neutral version is a few lines:
+
+```python
+import json
+from backend.utils import get_agent_response, SYSTEM_PROMPT
+
+with open("traces.jsonl", "w") as f:
+    for row in queries:   # id, query, source ("hand_coded" | "synthetic"), tuple
+        messages = get_agent_response([{"role": "user", "content": row["query"]}])
+        f.write(json.dumps({**row, "messages": messages,
+                            "prompt_version": "v2"}) + "\n")
+```
+
+The platforms do the same through instrumentation. Braintrust initialized a logger, wrapped `litellm` so every nested completion lands as a span with token usage, and decorated `get_agent_response` with a trace decorator, turning off automatic input and output capture and logging a clean input (system and user messages) and output (the reply) by hand, so the trace reads well for a domain expert. LangSmith decorated the same function with `@traceable`. Phoenix ran the saved prompt over the dataset in its playground, which records each run as an experiment.
+
+The custom logging is worth copying even without a platform: a trace that a non-engineer can read in five seconds gets reviewed; one full of raw JSON does not.
+
+## Homework 2, part 2: open coding
+
+Read each trace and write a short note on what went wrong, with no categories yet. Mechanics are in [Open coding](/courses/ai-evals/error-analysis); here is what it looked like on the Recipe Bot.
+
+| Query | Bad note | Good note |
+|---|---|---|
+| Advanced vegan American lunch | wrong | Asked for vegan; recipe uses heavy cream and parmesan. |
+| Whatcha got for a 30 min eggs and cheese dinner? | too long | Says "about 30 minutes" but cooks meat, toasts bread and eggs in sequence; realistic total is over 30. |
+| Quick salmon dinner with lemon and herbs | missing info | Claims 20 minutes but includes a 10 minute marinade; no serving count. |
+| got any pescatarian dishes with salmon | fine? | Uses store-bought pesto without warning it may contain animal rennet. |
+| homemade pasta recipe please | (none) | Offers store-bought dough as the main option; should default to homemade and include the dough. |
+
+The Phoenix presenter put it plainly: don't just write "wrong", describe the issue. Her note on that trace was "ignores dietary restrictions". It is useful, and even better when it names the offending ingredients as above: that detail is what you need later when you write a judge.
+
+Two more patterns from the walkthroughs:
+
+- **Not every trace gets a note.** Braintrust's expert read about 50 traces and commented on 21 of them. That is normal. An empty note means "no failure", which is data too.
+- **Your taste is the spec.** LangSmith's notes included "no adjectives in recipe titles" and "missing tips section". Those are legitimate failures *for that product owner*. A good note also says what should have happened.
+
+## Axial coding with an LLM as first drafter
+
+With notes in hand, export them (every platform lets you pull annotations into a notebook) and let an LLM propose clusters. Two walkthroughs did exactly this, and both show the right posture.
+
+```python
+notes = [r for r in annotations if r["note"]]          # trace_id, query, note
+CLUSTER_PROMPT = """Below are reviewer notes on a recipe chatbot's failures.
+Group them into 4 to 8 failure modes. For each give a snake_case name,
+a one-sentence definition, and the trace_ids it covers.
+Only use what is in the notes; do not invent failure types.
+NOTES:
+{notes}"""
+```
+
+- **Phoenix** asked an LLM for labels, then made a second pass that assigned a label to every annotated row, and counted.
+- **LangSmith** asked for the top three failure modes, named in `snake_case` because each was meant to become an evaluator later. The model returned `missing_tips_section`, `no_adjectives_in_title` and `includes_store_bought_dough_option`, and the presenter disagreed with the third: more of his notes were about the bot asking follow-up questions when he wanted several recipes. The draft did not match what was actually most frequent in his notes.
+- **Braintrust** had an LLM *predict* the failure modes for every trace, uploaded the predictions as a dataset, and built a custom review view that hides irrelevant columns and shows the predicted modes as their own column. The expert then went through row by row correcting them, producing a **golden dataset** of failure-mode labels.
+
+The Braintrust pattern is the strongest of the three: the LLM does the tedious first pass, a human corrects every row, and the corrected labels are reusable ground truth for the judges you build in HW3. Whatever you do, never let the LLM's draft be the final taxonomy.
+
+## A finished taxonomy with counts
+
+The deliverable is `failure_mode_taxonomy.md`: per mode a title, a one-sentence definition and one or two real examples. The repo's reference taxonomy lists eight modes. Adding a 0/1 column per mode (HW2's optional step 4) turns it into counts. The numbers below are illustrative, for a 60-trace pass:
+
+| Failure mode | Definition | Traces | Rate |
+|---|---|---|---|
+| Dietary restriction not verified | A stated restriction is broken, or an ingredient that may break it goes unflagged | 11 | 18% |
+| Time estimate inconsistent | Stated or implied time doesn't fit the requested limit once all steps are counted | 9 | 15% |
+| Missing serving size | Recipe never says how many people it serves | 7 | 12% |
+| Overcomplicated simple recipe | Optional extras and extra steps on a "quick" or "simple" request | 5 | 8% |
+| Missing safety guidance | No safe internal temperature for meat or fish | 3 | 5% |
+| Equipment assumed | Requires a grill, non-stick pan or blender with no alternative | 2 | 3% |
+
+```python
+import pandas as pd
+df = pd.read_csv("labeled_traces.csv")            # trace_id, query, note, one 0/1 col per mode
+modes = df.columns[3:]
+print(df[modes].sum().sort_values(ascending=False).to_frame("traces")
+      .assign(rate=lambda t: (t.traces / len(df)).round(2)))
+```
+
+Read the table with HW1 in mind. "Missing serving size" only counts as a generalization failure if your prompt asked for servings (the starter prompt does). If it didn't, the fix is a prompt line, not an evaluator. Braintrust also plotted the distribution twice, once over all traces and once over only the commented ones, which helps you see whether the predicted labels also fire on traces the expert found clean.
+
+<EvHomeworkStepper />
+
+## The same workflow in three platforms
+
+| Step | Braintrust | Phoenix | LangSmith |
+|---|---|---|---|
+| Prompt iteration | Playground; saved prompt that the app loads, with the repo default as fallback | Prompt management with versions and model params; compare two prompts side by side | Open a trace in the playground; rewrite in a prompt canvas; `{query}` variable; save and commit |
+| Datasets | CSV or JSONL import, metadata columns (source, submitter) | Upload from code or CSV (13 rows for HW1) | CSV import; needs an input and output schema before AI-generated examples work |
+| Synthetic data | Tuple and query steps run as experiments with `is_good` review | `llm_generate` over a dataframe of tuples (handles async, retries, rate limits) | Few-shot "generate similar examples" from existing rows |
+| Tracing | Logger, wrapped `litellm`, trace decorator with custom input and output | Experiments recorded automatically from playground runs | `@traceable` on the agent function |
+| Annotation | Review UI with comment and score fields; custom view for predicted failure modes | Free-text annotations, exported to the notebook as explanations | Annotation queue with reviewer instructions and notes |
+| Axial coding | LLM-predicted modes per trace, corrected by an expert into a golden set | LLM proposes labels, second pass labels each row | LLM summarizes notes into top failure modes |
+
+The differences are ergonomic. The method (reviewed tuples, full traces, specific notes, human-owned taxonomy, counts) is identical, and all of it also works with a CSV, a notebook and the repo's FastHTML annotation app in `annotation/`. Pick the tool your team will actually open; see lesson 14 for the deeper comparison.
+
+## Common mistakes
+
+- **Skipping HW1's prompt work.** A one-paragraph prompt makes HW2 rediscover things you never specified.
+- **Trusting a self-generated score.** An AI-written scorer at 99% says nothing until you've checked it against your own labels.
+- **Ten queries that are all "give me a recipe for X".** Include vague, constrained, non-recipe and exclusion queries.
+- **Unreviewed tuples and queries.** Implausible combinations and stiff, attribute-listing queries make the traces unrealistic, and everything downstream inherits that.
+- **Saving only the final reply.** Keep messages, prompt version and metadata.
+- **Notes that are verdicts.** "wrong" and "bad" can't be clustered; "used heavy cream in a vegan recipe" can.
+- **Accepting the LLM's clusters.** It ranks by what sounds important. Map every note back and count.
+- **No counts.** A taxonomy without frequencies can't tell you which eval to build first in HW3.
+
+## Cheat sheet
+
+- HW1: replace the starter system prompt with role, always and never rules, safety, creativity level and an exact Markdown format.
+- Iterate by running the prompt over all queries and reading outputs side by side; draft it yourself first.
+- Add 10+ diverse test queries; tag each with `source` and any useful metadata; run `scripts/bulk_test.py`.
+- HW2: 3 to 4 dimensions, 3+ values each; sample tuples, review them, then write one query per tuple and review again.
+- Generated queries should sound like users ("quick egg spinach cheese recipe pls"), not like the tuple.
+- Save full traces with prompt version and metadata; make them readable for a domain expert.
+- Open codes are specific observations with what should have happened; many traces get none.
+- Let an LLM draft clusters or per-trace labels; a human corrects every one and owns the taxonomy.
+- Final artifact: 4 to 8 binary failure modes, each with a definition, real examples and a count.
+- Braintrust, Phoenix and LangSmith differ in clicks, not in method; a notebook and CSV also work.

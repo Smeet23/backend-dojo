@@ -19,6 +19,44 @@ import L7Lesson from "./08-human-review-interfaces/lesson.mdx";
 import { quiz as L7Quiz } from "./08-human-review-interfaces/quiz";
 import L8Lesson from "./09-improvement-and-cost/lesson.mdx";
 import { quiz as L8Quiz } from "./09-improvement-and-cost/quiz";
+import L9Lesson from "./10-homework-error-analysis/lesson.mdx";
+import { quiz as L9Quiz } from "./10-homework-error-analysis/quiz";
+import L10Lesson from "./11-homework-llm-judge/lesson.mdx";
+import { quiz as L10Quiz } from "./11-homework-llm-judge/quiz";
+import L11Lesson from "./12-homework-rag-evaluation/lesson.mdx";
+import { quiz as L11Quiz } from "./12-homework-rag-evaluation/quiz";
+import L12Lesson from "./13-homework-agent-failures/lesson.mdx";
+import { quiz as L12Quiz } from "./13-homework-agent-failures/quiz";
+import L13Lesson from "./14-eval-platforms/lesson.mdx";
+import { quiz as L13Quiz } from "./14-eval-platforms/quiz";
+import L14Lesson from "./15-evals-for-image-generation/lesson.mdx";
+import { quiz as L14Quiz } from "./15-evals-for-image-generation/quiz";
+import L15Lesson from "./16-rag-evaluation-pitfalls/lesson.mdx";
+import { quiz as L15Quiz } from "./16-rag-evaluation-pitfalls/quiz";
+import L16Lesson from "./17-scaling-judge-compute/lesson.mdx";
+import { quiz as L16Quiz } from "./17-scaling-judge-compute/quiz";
+import L17Lesson from "./18-building-eval-tools-with-agents/lesson.mdx";
+import { quiz as L17Quiz } from "./18-building-eval-tools-with-agents/quiz";
+import L18Lesson from "./19-vibe-checks-to-feedback-loops/lesson.mdx";
+import { quiz as L18Quiz } from "./19-vibe-checks-to-feedback-loops/quiz";
+import L19Lesson from "./20-agents-you-can-trust/lesson.mdx";
+import { quiz as L19Quiz } from "./20-agents-you-can-trust/quiz";
+import L20Lesson from "./21-evals-with-domain-experts/lesson.mdx";
+import { quiz as L20Quiz } from "./21-evals-with-domain-experts/quiz";
+import L21Lesson from "./22-evaluating-agents/lesson.mdx";
+import { quiz as L21Quiz } from "./22-evaluating-agents/quiz";
+import L22Lesson from "./23-evals-for-product-managers/lesson.mdx";
+import { quiz as L22Quiz } from "./23-evals-for-product-managers/quiz";
+import L23Lesson from "./24-thinking-developer-environment/lesson.mdx";
+import { quiz as L23Quiz } from "./24-thinking-developer-environment/quiz";
+import L24Lesson from "./25-testing-ai-products-live/lesson.mdx";
+import { quiz as L24Quiz } from "./25-testing-ai-products-live/quiz";
+import L25Lesson from "./26-dspy-fireside-chat/lesson.mdx";
+import { quiz as L25Quiz } from "./26-dspy-fireside-chat/quiz";
+import L26Lesson from "./27-office-hours-part-1/lesson.mdx";
+import { quiz as L26Quiz } from "./27-office-hours-part-1/quiz";
+import L27Lesson from "./28-office-hours-part-2/lesson.mdx";
+import { quiz as L27Quiz } from "./28-office-hours-part-2/quiz";
 
 /** Lesson bodies and quizzes for each available lecture, keyed by slug. */
 export const lessons: Record<string, { Lesson: ComponentType; quiz: Question[] }> = {
@@ -31,4 +69,23 @@ export const lessons: Record<string, { Lesson: ComponentType; quiz: Question[] }
   "ci-cd-and-monitoring": { Lesson: L6Lesson, quiz: L6Quiz },
   "human-review-interfaces": { Lesson: L7Lesson, quiz: L7Quiz },
   "improvement-and-cost": { Lesson: L8Lesson, quiz: L8Quiz },
+  "homework-error-analysis": { Lesson: L9Lesson, quiz: L9Quiz },
+  "homework-llm-judge": { Lesson: L10Lesson, quiz: L10Quiz },
+  "homework-rag-evaluation": { Lesson: L11Lesson, quiz: L11Quiz },
+  "homework-agent-failures": { Lesson: L12Lesson, quiz: L12Quiz },
+  "eval-platforms": { Lesson: L13Lesson, quiz: L13Quiz },
+  "evals-for-image-generation": { Lesson: L14Lesson, quiz: L14Quiz },
+  "rag-evaluation-pitfalls": { Lesson: L15Lesson, quiz: L15Quiz },
+  "scaling-judge-compute": { Lesson: L16Lesson, quiz: L16Quiz },
+  "building-eval-tools-with-agents": { Lesson: L17Lesson, quiz: L17Quiz },
+  "vibe-checks-to-feedback-loops": { Lesson: L18Lesson, quiz: L18Quiz },
+  "agents-you-can-trust": { Lesson: L19Lesson, quiz: L19Quiz },
+  "evals-with-domain-experts": { Lesson: L20Lesson, quiz: L20Quiz },
+  "evaluating-agents": { Lesson: L21Lesson, quiz: L21Quiz },
+  "evals-for-product-managers": { Lesson: L22Lesson, quiz: L22Quiz },
+  "thinking-developer-environment": { Lesson: L23Lesson, quiz: L23Quiz },
+  "testing-ai-products-live": { Lesson: L24Lesson, quiz: L24Quiz },
+  "dspy-fireside-chat": { Lesson: L25Lesson, quiz: L25Quiz },
+  "office-hours-part-1": { Lesson: L26Lesson, quiz: L26Quiz },
+  "office-hours-part-2": { Lesson: L27Lesson, quiz: L27Quiz },
 };

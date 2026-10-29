@@ -1,0 +1,196 @@
+import { EvRagPitfallTriage } from "@/components/widgets/EvRagPitfallTriage";
+
+## Why RAG failures are hard to find
+
+This guest talk is by Skylar Payne, who has worked on AI at Google, co-created LinkedIn's internal AI Academy for training engineers, and now consults for teams building AI products. He walked through seven pitfalls he has seen at several clients in a single year, each of which gave a significant lift once fixed.
+
+His starting point: RAG systems **fail silently**. Nothing returns a 500 error. The answer just looks a bit wrong, and "the answer looks wrong" doesn't tell you where to look or what to fix. Left alone, these quiet failures pile up into something like technical debt, and the team burns days guessing what broke.
+
+The metrics themselves (Recall@k, MRR, NDCG, synthetic query generation, faithfulness) are covered in [Evaluating RAG, tools and agents](/courses/ai-evals/rag-and-agents). This lesson is about the failure patterns that show up in real deployments, and the cheap checks that catch them.
+
+## Evaluate every stage, independently
+
+If you remember one thing, Skylar said, make it this: **look at your data**. Really look at it. The working version of that principle is *evaluate everything you can, all the time, and independently if possible*.
+
+He described a funnel of how far teams get:
+
+| How far teams go | How common |
+|---|---|
+| Evaluate nothing | Most teams he talks to |
+| Evaluate generation | Fewer |
+| Evaluate retrieval | Fewer still |
+| Evaluate **indexing** (how documents become searchable) | Rarest of all |
+
+You can only fix what you can locate, and you can only locate a failure if each critical stage has its own check. The seven pitfalls map onto the pipeline like this:
+
+| Stage | Pitfall | The question to ask |
+|---|---|---|
+| Indexing | 1. Corpus coverage | Do we even have the documents? |
+| Indexing | 2. Information extraction | Did the text come out of the PDF correctly? |
+| Indexing | 3. Chunk quality | Are the chunks meaningful units? |
+| Query | 4. Query rejection | Was the query answerable as asked? |
+| Retrieval | 5. Retrieval sufficiency | Can the question be answered from what we retrieved? |
+| Generation | 6. Hallucination | Are the claims and citations real and relevant? |
+| Data over time | 7. Changing data | Did the source data change under us? |
+
+## Pitfall 1: corpus coverage
+
+**What goes wrong.** Skylar worked with a company building a support chatbot for a developer product (an SDK and API). Users asked things like "How do I integrate with Salesforce?" and nothing relevant ever came back. Some chunks were retrieved, but none could answer the question. The integration existed. Nobody had written the help doc for it.
+
+When the document isn't in the corpus, the rest of the pipeline is irrelevant. The system can either decline to answer or hallucinate, and no retriever or prompt change helps.
+
+**How to spot it.** Keep a set of queries representative of what users actually ask (real ones, or synthetic ones built as in [Build a retrieval eval dataset](/courses/ai-evals/rag-and-agents#build-a-retrieval-eval-dataset)). For each, check whether **any relevant chunk** exists anywhere in the corpus, not just in the top k. Then group by topic:
+
+```python
+from collections import defaultdict
+
+by_topic = defaultdict(lambda: [0, 0])  # topic -> [has_relevant, total]
+for q in queries:
+    hits = search(q.text, k=50)                   # wide net, not your production k
+    ok = any(judge_relevant(q.text, c) for c in hits)
+    by_topic[q.topic][0] += ok
+    by_topic[q.topic][1] += 1
+
+for topic, (ok, n) in sorted(by_topic.items(), key=lambda t: t[1][0] / t[1][1]):
+    print(f"{topic:<28} {ok}/{n} queries have any relevant chunk")
+```
+
+A whole segment that never finds a relevant chunk ("integrations: 0/14") is the signature. Then confirm by hand that the content truly is missing rather than mangled by extraction.
+
+**The fix** is not an engineering change: write or ingest the missing documents, and until then have the system decline those questions rather than improvise.
+
+## Pitfall 2: information extraction
+
+**What goes wrong.** A lot of knowledge lives in awkward formats, and PDFs are far more complex than people assume (someone has built Tetris inside a PDF). Libraries that turn a PDF into Markdown often run a model under the hood, so extraction is itself an AI step that can be wrong: tables flattened into word soup, code blocks broken, headers and footers spliced into body text, images dropped.
+
+**How to spot it.** Very few teams evaluate this. Sample documents, put the original next to the extracted text, and check the hard parts specifically: tables, code blocks, structured data, figures. Once you know what breaks, a few code-based checks can keep watching it (for example, the number of table rows in the extracted Markdown matches the source, or every fenced code block is closed).
+
+**The fix** depends on what you find: a different extraction tool, special handling for tables, or a format-specific parser. Lesson 6 makes the matching debugging point: [inspect the extracted text](/courses/ai-evals/rag-and-agents#other-input-modalities) before blaming the model.
+
+## Pitfall 3: chunk quality
+
+**What goes wrong.** Skylar notices that many RAG systems he meets were scaffolded by a coding assistant, and their default chunking looks like it was designed for 8K context windows: **over-chunked, with tiny chunks**. At the same developer-tools company, help pages listed numbered steps, and each step became its own chunk. Retrieval returned step 2 from one guide and step 3 from another, and the generator stitched them into instructions that made no sense.
+
+The fix was to ask a question nobody had asked: why chunk at all? The help pages were short, so they indexed **whole pages** and the problem disappeared.
+
+**How to spot it.** Look at chunks directly, at the extremes:
+
+- **The largest chunks.** Are they so packed with unrelated content that they should be split?
+- **The smallest chunks.** He often finds chunks that are nothing but a website footer.
+- **Retrieval frequency.** Log how often each chunk is retrieved across your query set.
+  - Chunks **never retrieved**: irrelevant to your users, or broken during extraction? Ask why.
+  - Chunks retrieved **very often**: he has seen chunks retrieved for about 80% of queries. Working backwards, that chunk was useful context for almost every question, so it belonged **in the prompt**, not in the index.
+
+```python
+from collections import Counter
+
+counts = Counter(cid for q in queries for cid in retrieve_ids(q.text, k=10))
+never = [c for c in all_chunks if counts[c.id] == 0]
+hot = [(cid, n / len(queries)) for cid, n in counts.most_common(5)]
+by_size = sorted(all_chunks, key=lambda c: len(c.text))
+print("never retrieved:", len(never), "| hottest:", hot)
+print("smallest:", [c.text[:60] for c in by_size[:5]])
+```
+
+Tuning chunk size and overlap with a grid search is in [Evaluating and tuning chunking](/courses/ai-evals/rag-and-agents#evaluating-and-tuning-chunking). The point here is earlier: read the chunks before you tune anything.
+
+## Pitfall 4: query rejection
+
+**What goes wrong.** Users write lazy queries, and chat tools have trained them to: keywords instead of sentences. A query like "thing broken" has no answer. Many RAG systems take whatever arrives and run with it, retrieve something loosely related, and reply confidently. The user gets an answer that doesn't address their problem, gets frustrated, and the conversation loops.
+
+**The fix.** Decide whether the query is well formed before retrieving. Two options:
+
+- **Reject**: say plainly that the question isn't clear.
+- **Elicit**: ask a clarifying question ("Which product, and what error do you see?").
+
+**How to evaluate it.** Put deliberately vague and ambiguous queries in your dataset alongside good ones, and measure the **rejection or elicitation rate**: does the system catch the vague ones? Measure the other side too, so a system that asks for clarification on every query doesn't look good.
+
+| Query | Expected behavior |
+|---|---|
+| "thing broken" | Elicit: which product, what happens |
+| "rate limit" | Elicit or answer the most common reading, depending on your product |
+| "What is the rate limit for the search API on the free plan?" | Answer |
+
+## Pitfall 5: retrieval sufficiency
+
+**What goes wrong.** Classic information-retrieval metrics answer "did we rank relevant documents well?" Skylar, who comes from search and recommendations, likes them, but notes that an NDCG number is hard to connect to whether a user got value. Even precision (how many of the 10 chunks passed to the generator were relevant) leaves a gap.
+
+Web search assumes the user wants one good page. A RAG system has to go further and **answer the question**, often by combining several facts. Five relevant chunks can still be insufficient if none states the specific number the user asked for. Then the model fills the gap, and you are relying on it to hallucinate in a harmless direction.
+
+**How to spot it.** Annotate sufficiency directly. For a sample of queries, read only the retrieved context and ask: *could I answer this question using only this information?* It is the standardized-test instruction, "answer based only on the passage." Skylar finds the answer is often no. Once you have enough human labels, you can build an LLM judge for sufficiency, validated as in [Trusting your judge](/courses/ai-evals/trusting-your-judge).
+
+| | Relevant? | Sufficient? |
+|---|---|---|
+| Question asked | Is this chunk about the topic? | Can the whole query be answered from the retrieved set? |
+| Unit | Per chunk | Per query |
+| Blind spot | Five on-topic chunks that all omit the key fact | None for this purpose: it is the property you need |
+
+**The fix** comes from the cause: the missing piece may not exist (pitfall 1), may be split across chunks (pitfall 3), or may need a higher k or a query rewrite.
+
+## Pitfall 6: hallucination
+
+Lesson 6 covers [faithfulness](/courses/ai-evals/rag-and-agents#evaluating-generation-quality) in depth, so Skylar kept this short. His practical recipe: **force in-text citations** in responses, then run two checks on every citation.
+
+1. **The citation exists.** The cited document or chunk ID was really in the retrieved context. This is a cheap code check.
+2. **The citation supports the claim.** The cited passage is relevant to the sentence it is attached to. This is a semantic check, with an LLM judge or a validator. He pointed to Jason Liu's material on semantic validation in the Instructor library.
+
+```python
+import re
+
+def citation_checks(answer: str, context: dict[str, str]) -> dict:
+    cited = re.findall(r"\[(doc-\d+)\]", answer)
+    missing = [c for c in cited if c not in context]          # check 1: exists
+    unsupported = [c for c in cited if c in context
+                   and not supports(answer, context[c])]      # check 2: LLM judge
+    return {"n_cited": len(cited), "missing": missing, "unsupported": unsupported}
+```
+
+Track how often each check fails. A RAG prompt holds a lot of text, and there are many gaps in it where a model can make things up. Citations turn "it might be hallucinating" into a number.
+
+## Pitfall 7: changing data
+
+**What goes wrong.** Retrieval usually depends on a data source that **isn't static**. The developer-tools company's help index stated an API rate limit of 1,000 requests per minute; later the docs said 2,500. Whether that breaks your eval depends on your setup, but something changed, and you need to know what. Otherwise a system that worked yesterday and fails today sends you chasing a ghost: you suspect the prompt, the model or the retriever, when the documents moved underneath you. The same applies if a web search API is part of retrieval.
+
+**The fix**, in increasing order of maturity:
+
+- **Minimum:** know *when* the underlying data changed. A last-modified date field on documents is sometimes enough.
+- **Better:** version the index, and record the index version with every eval run and trace.
+- **Mature teams:** keep the full history so you can **time travel**: rebuild the index as it was on the day of an old eval run and reproduce the result.
+
+Gold labels age too. A reference answer saying "1,000 requests per minute" becomes wrong when the docs change, so tie each label to the document version it was written against.
+
+## Diagnose the pitfall
+
+Each symptom below comes from the patterns in the talk. Pick the pitfall, then read the check that would confirm it and the fix.
+
+<EvRagPitfallTriage />
+
+## Where to start
+
+Seven stages with their own evals sounds like a lot. Skylar's advice in the Q&A was **not to boil the ocean**:
+
+1. Evaluate the core problem end to end first.
+2. Use [error analysis](/courses/ai-evals/error-analysis) to find which component causes the most failures.
+3. Build an eval for that component, fix it, and run error analysis again.
+
+For indexing specifically, list each operation between the raw documents and the searchable index (extraction, chunking, embedding and field indexing) and **look at the data between every step**: is the extracted text correct, are chunks meaningful, can the retriever form queries that return a relevant set?
+
+<Callout kind="tip">
+Asked about late-interaction retrievers such as ColBERT, Skylar said he had tried them with clients and not found a case that justified the extra complexity. BM25 plus a simple embedding search does well. When embedding search fails, it is usually because no chunk contains anything resembling the query, and a fancier retriever can't fix that. This echoes the course's warning about [bikeshedding tools](/courses/ai-evals/rag-and-agents#rag-pitfalls).
+</Callout>
+
+He also observed that strong engineers who would never ship an uninstrumented service often skip logging when they build AI features. Observability is the foundation here as everywhere: you can't look at data you never recorded.
+
+## Cheat sheet
+
+- RAG fails silently. "The answer looks wrong" isn't actionable, so evaluate each stage separately to locate failures.
+- Look at your data, between every step of the pipeline.
+- Coverage: if a whole topic never retrieves a relevant chunk, the document probably doesn't exist. Write it, or decline those questions.
+- Extraction: PDF-to-Markdown is an AI step. Compare tables, code and structured data against the source.
+- Chunks: inspect the biggest, the smallest, the never-retrieved and the always-retrieved. Short pages may need no chunking.
+- A chunk retrieved for about 80% of queries probably belongs in the prompt.
+- Query rejection: seed vague queries like "thing broken" and measure the reject or elicit rate, plus false alarms on clear queries.
+- Sufficiency beats NDCG: ask "could I answer this from only the retrieved text?" per query.
+- Hallucination: force in-text citations, then check each citation exists and supports its claim.
+- Changing data: at minimum know when the index changed. Version it, log the version with evals, and keep history for time travel.
+- Start end to end, find the worst component with error analysis, and eval that next. Don't boil the ocean.

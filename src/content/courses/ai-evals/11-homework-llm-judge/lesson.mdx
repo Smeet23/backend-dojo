@@ -1,0 +1,267 @@
+import { EvJudgeConfusionLab } from "@/components/widgets/EvJudgeConfusionLab";
+
+## What the homework asks
+
+Homework 3 takes one failure mode from the Recipe Bot's error analysis and turns it into a validated, automated measurement. The failure mode is **dietary adherence**: when a user states a restriction (vegan, gluten-free, keto, ...), does the recipe actually respect it? It was picked because the rules are clear and fairly objective, and because it was one of the most common failures found in the earlier homeworks: the bot gives a reasonable recipe that quietly includes honey for a vegan, or regular soy sauce for someone avoiding gluten.
+
+The concepts all come from two core lessons, so this page does not re-teach them: the judge prompt and the train, dev and test discipline are in [Automated evaluators](/courses/ai-evals/automated-evaluators), and TPR, TNR, bias correction and confidence intervals are in [Trusting your judge](/courses/ai-evals/trusting-your-judge). What follows is the hands-on version: the files, the code and the numbers you actually get.
+
+The deliverables:
+
+1. A labeled dataset with train, dev and test splits.
+2. A final judge prompt with few-shot examples.
+3. The judge's TPR and TNR on the test set.
+4. A corrected success rate with a 95% confidence interval, computed with the `judgy` library.
+5. One or two paragraphs saying how well the bot follows dietary restrictions and how sure you are.
+
+Everything lives in `homeworks/hw3` of the public [recipe-chatbot repo](https://github.com/ai-evals-course/recipe-chatbot). The course also published two video walkthroughs, one built on Braintrust and one on Arize's hosted platform (the commercial sibling of the open-source Phoenix). This lesson presents the workflow once, tool-neutrally, then notes what each platform made easier.
+
+### Three starting points
+
+| Option | You start from | You do |
+|---|---|---|
+| 1. Full | Nothing | Generate traces, label them, build the whole pipeline |
+| 2. Traces | `raw_traces.jsonl`, about 2,400 bot responses | Label 100 to 200 of them, then build the judge |
+| 3. Labels | `labeled_traces.jsonl`, 101 labeled traces | Skip straight to splitting and judge building |
+
+The raw traces were generated from `dietary_queries.csv`: 60 deliberately awkward queries such as "I'm vegan but I really want to make something with honey" or "Dairy-free but cheese is okay sometimes". Contradictory and vague requests are where the bot (and later the judge) gets tested hardest.
+
+## Step 1: label your data
+
+If you take option 1 or 2, labeling is the first and most valuable step. The homework notes that labeling skill is undervalued and skipped far too often in commercial projects; it is where your definition of "adherent" actually gets decided.
+
+Each record you end up with looks like this (response shortened):
+
+```json
+{
+  "trace_id": "26_4",
+  "query": "I'm on a sugar-free diet but I want to make candy",
+  "dietary_restriction": "sugar-free",
+  "response": "... Lemon Coconut Bliss Balls ... 2 tbsp honey or sugar-free syrup ...",
+  "label": "FAIL",
+  "reasoning": "Offers honey as a sweetener, which is an added sugar. The stevia alternative doesn't make the honey option compliant.",
+  "confidence": "HIGH"
+}
+```
+
+Note the decision encoded in that label: **offering a non-compliant option counts as a fail**, even when a compliant alternative sits next to it. That is a rule you have to decide and then apply consistently. The provided labels apply it to optional feta, optional cheese toppings and "honey or maple syrup" alike.
+
+A few practical points:
+
+- **Use a viewer.** The repo ships `trace_viewer.html`, a single-file page (itself vibe-coded with an AI assistant) for stepping through JSONL traces. A labeling queue in an eval platform does the same job; both beat scrolling a spreadsheet. See [Interfaces for human review](/courses/ai-evals/human-review-interfaces).
+- **Write a one-line reason for every fail.** You will mine these reasons for the judge's definitions in step 3.
+- **Watch the judgment calls.** The provided set has 7 MEDIUM-confidence labels, mostly "gluten-light" requests tagged gluten-free. Is a naturally gluten-free quinoa salad a fail because the user said "gluten-light"? Decide, write the rule down, and relabel to match.
+
+The reference set ends up with **75 PASS and 26 FAIL** across 16 restrictions (vegetarian 18, vegan 11, low-carb 11, gluten-free 10, paleo 10, and smaller groups).
+
+## Step 2: split train, dev and test
+
+The notebook shuffles with a fixed seed and cuts at 15% and 55%:
+
+```python
+import json, random
+from collections import Counter
+
+traces = [json.loads(l) for l in open("reference_files/labeled_traces.jsonl") if l.strip()]
+random.seed(42)
+random.shuffle(traces)
+
+n = len(traces)
+train, dev, test = traces[: int(n * 0.15)], traces[int(n * 0.15) : int(n * 0.55)], traces[int(n * 0.55) :]
+for name, split in [("train", train), ("dev", dev), ("test", test)]:
+    print(name, len(split), dict(Counter(t["label"] for t in split)))
+```
+
+```text
+train 15 {'PASS': 11, 'FAIL': 4}
+dev   40 {'PASS': 33, 'FAIL': 7}
+test  46 {'PASS': 31, 'FAIL': 15}
+```
+
+This matches the homework's guidance (train 10 to 20%, dev about 40%, test 40 to 50%), but look at the output before moving on. Two things deserve a fix:
+
+- **Dev has only 7 failures.** Each one is worth about 14 points of dev TNR, so you cannot tell a real improvement from noise. Split **per label** (stratify) so every split gets its share of failures, and if you can, label more failing traces.
+- **Traces share queries.** The 101 traces come from only 47 distinct queries; the bot answered "I avoid processed foods but I'm lazy" several times. With a plain shuffle, 9 dev and test traces share a query with a train trace. If one of those train traces becomes a few-shot example, the judge has seen a near-copy of a dev case. Split by `query_id` instead of by trace.
+
+```python
+by_query = {}
+for t in traces:
+    by_query.setdefault(t["query_id"], []).append(t)
+groups = sorted(by_query.values(), key=lambda g: g[0]["query_id"])
+random.Random(42).shuffle(groups)
+# then assign whole groups to train/dev/test until each split has its quota of FAILs
+```
+
+Why the ratios look backwards compared with ordinary ML, and why the test set stays untouched, is covered in [Train, dev and test splits](/courses/ai-evals/automated-evaluators#train-dev-and-test-splits).
+
+## Step 3: write the judge prompt
+
+The homework's checklist is the standard four parts: task and criterion, pass and fail definitions, two or three few-shot examples from **train only** (input, output, reasoning, label), and a JSON output format. A first version:
+
+```text
+You are evaluating whether a recipe chatbot followed the user's dietary restriction.
+
+PASS: every ingredient the recipe uses or offers is compliant with the
+stated restriction.
+FAIL: any required or optional ingredient violates it (for example honey
+for vegan, regular soy sauce for gluten-free, sweet potato for keto),
+or the method violates it (cooking above 118°F for raw vegan).
+Do not fail an ingredient on speculation: plain dried herbs, olive oil
+and fresh produce are compliant unless the restriction says otherwise.
+
+Restriction reference:
+- Vegan: no meat, fish, dairy, eggs or honey
+- Gluten-free: no wheat, barley, rye; watch soy sauce, pasta, flour
+- Keto: under about 20 g net carbs; no grains, potatoes, sugar
+- Paleo: no grains, legumes, dairy, refined sugar
+(... one line per restriction you saw in the data ...)
+
+Example (FAIL)
+Restriction: sugar-free
+Query: I'm on a sugar-free diet but I want to make candy
+Response: Lemon Coconut Bliss Balls ... 2 tbsp honey or sugar-free syrup ...
+Reasoning: Honey is an added sugar; offering it as an option violates the restriction.
+
+Example (PASS)
+Restriction: keto
+Query: Keto meal that doesn't make me feel gross
+Response: Garlic Butter Shrimp with Spinach ... shrimp, spinach, butter, garlic ...
+Reasoning: Protein, leafy greens and fat; no grains, starches or sugar.
+
+Now evaluate:
+Restriction: {dietary_restriction}
+Query: {query}
+Response: {response}
+
+Reply with JSON only: {"reasoning": "<one or two sentences>", "judgment": "PASS" | "FAIL"}
+```
+
+Three choices worth copying:
+
+- **The restriction reference is part of the prompt.** The README gives one-line definitions for 16 diets. A judge that has to recall what Whole30 excludes will be inconsistent; one that reads it will not.
+- **The definitions encode your labeling rules**, including the "optional ingredients count" rule from step 1 and a guard against speculative fails.
+- **Reasoning comes before the verdict**, which helps the judge and gives you something to read when it disagrees with you.
+
+The notebook picks the first PASS and first FAIL it finds in train. That is fine for a baseline. Once you see dev errors, replace them with the boundary cases the judge gets wrong ([Choosing few-shot examples](/courses/ai-evals/automated-evaluators#choosing-few-shot-examples)).
+
+## Step 4: measure on dev and iterate
+
+Run the judge on every dev trace and compare with your labels. Any LLM client works; `call_llm` stands in for yours.
+
+```python
+def judge(trace: dict) -> str:
+    prompt = JUDGE_PROMPT.format(**{k: trace[k] for k in ("query", "dietary_restriction", "response")})
+    return json.loads(call_llm(prompt, temperature=0))["judgment"]
+
+def tpr_tnr(pairs):  # pairs of (human, judge); PASS is the positive class
+    tp = sum(h == "PASS" and j == "PASS" for h, j in pairs)
+    fn = sum(h == "PASS" and j == "FAIL" for h, j in pairs)
+    tn = sum(h == "FAIL" and j == "FAIL" for h, j in pairs)
+    fp = sum(h == "FAIL" and j == "PASS" for h, j in pairs)
+    return tp / (tp + fn), tn / (tn + fp), (tp, fn, fp, tn)
+
+dev_pairs = [(t["label"], judge(t)) for t in dev]
+print(tpr_tnr(dev_pairs))
+```
+
+Then read every disagreement. The two walkthroughs hit the two classic failure shapes:
+
+- **Too lenient.** The first Braintrust judge had **no false fails at all**: every trace it failed really was a failure. But it passed many real failures (eight in validation and four in train). For dietary restrictions that is the worse error, since someone with an allergy is exactly who you are trying to protect. The fix was few-shot examples of failures plus sharper restriction definitions, after which the false passes dropped noticeably.
+- **Too harsh.** In the Arize run, a recipe the human labeled correct was failed because "dried oregano could potentially contain gluten". The judge was inventing risk. That is a definition problem: say what counts as evidence of a violation, as the "do not fail on speculation" line above does.
+
+Each round, change one thing (a definition, an example swap), re-run dev, and compare TPR and TNR with the previous round. The Arize walkthrough tried three prompt versions and plateaued at about 0.87 agreement on a 15-row sample; on the full set, accuracy settled around 0.84. Agreement is a fine progress bar, but as the widget shows, it can hide a judge that misses most failures. Always report both rates. The detailed loop, and what to try when it stalls, is in [Refining the judge in practice](/courses/ai-evals/trusting-your-judge#refining-the-judge-in-practice).
+
+<EvJudgeConfusionLab />
+
+<Callout kind="warn">
+Look at train and dev disagreements only. The Braintrust video filters the table across all three splits for convenience and shows test errors too. In your own work, keep test results hidden until the prompt is frozen, or test stops being an honest measure.
+</Callout>
+
+## Step 5: final numbers on the test set
+
+Freeze the prompt and the model. Run the judge **once** on the 46 test traces and compute TPR and TNR the same way. These, not the dev numbers, go in your report, because you tuned against dev.
+
+```text
+Test set (final)
+TPR: 0.774   (24 of 31 human PASS traces judged PASS)
+TNR: 0.867   (13 of 15 human FAIL traces judged FAIL)
+```
+
+<Callout kind="warn">
+These particular numbers come from the walkthrough notebook, which **simulates** a judge (it flips the human label 15% of the time) so the notebook runs without an API key. They show the output format, not a real result. Your real judge will land wherever your prompt puts it.
+</Callout>
+
+If either rate is near 50 to 60%, stop: the correction in step 6 is meaningless for a coin-flip judge. Lesson 5 suggests aiming for at least 80% on each.
+
+## Step 6: run on new traces and correct the rate
+
+Now point the frozen judge at traces nobody labeled. The homework asks for 500 to 1,000; the Braintrust walkthrough sampled 500 of the 2,400 raw traces and the Arize one ran the 60 dietary queries live through the bot. The share judged PASS is the raw rate, p_obs. Because the judge errs in known ways, `judgy` corrects that rate and bootstraps a confidence interval from the test-set labels:
+
+```python
+from judgy import estimate_success_rate
+
+to01 = lambda xs: [1 if x == "PASS" else 0 for x in xs]
+test_labels = to01(t["label"] for t in test)
+test_preds = to01(judge(t) for t in test)
+unlabeled_preds = to01(judge(t) for t in sample_500)
+
+theta, lo, hi = estimate_success_rate(test_labels, test_preds, unlabeled_preds)
+print(f"raw {sum(unlabeled_preds) / len(unlabeled_preds):.3f}  corrected {theta:.3f}  95% CI [{lo:.3f}, {hi:.3f}]")
+```
+
+The reference solution reports:
+
+```text
+Raw Observed Success Rate: 0.857 (85.7%)
+Corrected Success Rate:    0.926 (92.6%)
+95% Confidence Interval:   [0.817, 1.000]
+Correction Applied:        +6.9 percentage points
+```
+
+The correction goes **up**, so this judge was on the harsh side: it failed more good recipes than it let bad ones through, and the raw 85.7% understated the bot. The Braintrust run landed elsewhere: about 75% raw on its 500 traces, with an interval of roughly 0.72 to 0.92. Different labels, prompt and judge model give different numbers; what carries over is the method. The formula and the bootstrap behind `judgy` are explained in [Estimating the true success rate](/courses/ai-evals/trusting-your-judge#estimating-the-true-success-rate).
+
+### Writing the interpretation
+
+The last deliverable is short prose, and it should lead with the interval, not the point estimate. Something like:
+
+> On 500 unlabeled traces the judge passed 85.7%. Correcting for its test-set error rates gives an estimated 92.6% dietary adherence, with a 95% interval from 82% to 100%. The bot usually respects restrictions; in the labeled set, failures cluster in vague requests ("light but filling" with low-carb, "clean eating" with Whole30). The interval is wide because the test set has only 15 failures, so the next step is labeling more failing traces, not tuning the bot.
+
+The width is the honest part. An interval that runs from 82% to 100% says "probably good, but we cannot rule out one bad answer in five", and the cause is almost always too few labeled failures in the test set.
+
+## What each platform made easier
+
+The workflow above runs in a notebook with nothing but an LLM client and `judgy`. Both platforms wrap the same steps in a UI:
+
+| Step | Braintrust walkthrough | Arize walkthrough |
+|---|---|---|
+| Labeling | Skipped (done in earlier homeworks) | Labeling queue over an uploaded dataset, with hotkeys and optional annotator assignment |
+| Dataset and splits | CSV import with the split stored as a metadata field per row | Dataset upload from a random sample of raw traces |
+| Judging stored traces | A pass-through "task" that just echoes the stored response, so the judge scores it as output | Playground runs the judge template directly over dataset rows |
+| Measuring alignment | Custom LLM-judge scorer (PASS = 1, FAIL = 0) and query filters for false passes and false fails | A "label match" evaluator that scores 1 when the judge agrees with the human annotation |
+| Iterating | Built-in assistant (Loop) asked to add train-only few-shot examples and tune the scorer | Prompt versions saved in a prompt hub and compared as experiments |
+| Production | Experiment on 500 raw traces, results pulled into the notebook for `judgy` | Online evaluation task that judges every new trace as it arrives |
+
+Two transferable lessons from these demos. First, **check what an assistant edits**: the Braintrust presenter asked Loop to use train examples only and still verified it, and had to restore a section of the prompt it kept deleting. Second, the pass-through trick generalizes: when you judge traces that already exist, the "task" under test is the identity function, and the judge is the only model call.
+
+## Common mistakes
+
+- **Few-shot examples from dev or test.** Even near-duplicates count: split by query, not by trace.
+- **Judging with an undecided rule.** If you have not decided whether "optional cheese" fails a dairy-free request, neither has the judge, and your labels will disagree with each other.
+- **Reporting accuracy alone.** With 75% PASS labels, a judge that always says PASS scores 75% accuracy and catches nothing.
+- **Tuning on test**, or quoting dev TPR and TNR as final.
+- **Treating p_obs as the answer.** The raw rate carries the judge's bias; report the corrected rate with its interval.
+- **Too few failures.** With 7 dev failures and 15 test failures, every number moves in big steps. Label more fails before polishing the prompt.
+
+## Cheat sheet
+
+- Homework 3 builds one judge for one failure mode: does the recipe respect the user's dietary restriction.
+- Start from scratch, from 2,400 raw traces, or from 101 labeled traces (75 PASS, 26 FAIL).
+- Decide edge rules while labeling (optional non-compliant ingredients fail) and write them into the judge.
+- Split about 15 / 40 / 45; stratify by label and keep traces of the same query in one split.
+- Judge prompt: criterion, PASS/FAIL definitions, restriction reference, 2 to 3 train examples, JSON with reasoning first.
+- Iterate on dev by reading every false pass and false fail; change one thing per round.
+- Lenient judges miss failures (low TNR); harsh ones invent risk (low TPR). Fix definitions before adding examples.
+- Freeze the prompt, run test once, report test TPR and TNR.
+- Run the judge on 500 to 1,000 unlabeled traces, then `estimate_success_rate(test_labels, test_preds, unlabeled_preds)`.
+- Report raw rate, corrected rate and the 95% interval; a wide interval means you need more labeled failures.
+- Platforms add labeling queues, experiment tracking and online evals, but the steps are the same in a notebook.

@@ -1,0 +1,198 @@
+import { EvPlanReviewDesk } from "@/components/widgets/EvPlanReviewDesk";
+
+## What this workshop is about
+
+[Interfaces for human review](/courses/ai-evals/human-review-interfaces) argued that a custom review app is one of the highest-leverage things an eval team can build, and laid out what makes one good: render the trace natively, one item per screen, hotkeys, progress, notes. This guest workshop, by Isaac Flath (who teaches a course on AI-assisted coding with Eleanor Berger), is about the other half: **how to actually get that app built quickly with a coding agent without losing control of it.**
+
+The backstory matters. In the previous cohort Isaac built the same annotation app by hand in FastHTML (a Python web framework) with HTMX, walking through every line. This time he built the same app again, but agent-first, mostly with Claude Code. Same destination, different way of working. His view is that you want a bit of both: enough understanding of the framework to judge the code, and an agent to do the typing.
+
+The process had four steps:
+
+1. Put project context (framework patterns, UI component rules) in files the agent always reads.
+2. Have the agent write a plan as a markdown file.
+3. Edit that plan by hand until it says exactly what you want.
+4. Let the agent generate the code and test it in a real browser through a small custom MCP server, then check it yourself.
+
+The rest of this lesson takes each step in turn, then covers the habit that ties them together: consistency.
+
+## The tool being built: a RAG relevance annotator
+
+The app supports retrieval evaluation (see [Build a retrieval eval dataset](/courses/ai-evals/rag-and-agents) for why you need these labels). The data:
+
+- A corpus of about **7,000 records**. Some are PDF documents, some long-form text, some short.
+- A set of user queries. For a single query, an annotator has to judge roughly **400 candidate records**: relevant or not relevant.
+- A small notes field next to each judgment.
+
+That volume is the design constraint. Four hundred judgments for one query is tedious even in a good tool, and as Isaac put it, going through thousands of records just won't happen if it isn't convenient. Every design choice is about making one judgment as cheap as possible: show the query and one document, two obvious buttons, the active choice highlighted, move on.
+
+<Callout kind="remember">
+The principles (low friction, one item per screen, visible state) come from the review-interface lesson. This lesson is about getting an agent to build something that follows them, which is a different skill.
+</Callout>
+
+## Step 1: put your context in files
+
+Before asking for any code, Isaac wrote down how he wants code written in this project. Two markdown files did the job:
+
+- **FastHTML patterns**: how routes, components and HTMX interactions should look in this codebase.
+- **UI component guidelines** for MonsterUI, the component library he uses on top of FastHTML.
+
+Without these, an agent writes whatever is most common in its training data, which for a web app usually means a JavaScript framework and a REST API. With them, it writes code in the style you can read and maintain.
+
+He keeps these files in a `.ruler/` folder managed by **Ruler**, an open-source tool Eleanor Berger wrote. Every coding agent wants its context in a different place (Cursor rules, Windsurf rules, `CLAUDE.md`, Gemini CLI and OpenHands config files, and so on). Ruler lets you maintain one folder of markdown and "compile" it into each tool's native format:
+
+```text
+.ruler/
+  fasthtml-patterns.md
+  monsterui-guidelines.md
+
+$ ruler apply                       # writes configs for every supported agent
+$ ruler apply --agents claude,cursor  # or only the ones you choose
+```
+
+The default targets can also live in a config file instead of being passed each time. Why this matters beyond convenience:
+
+- **Fair tool trials.** When you try a new agent, it starts with the same context as your usual one, so you are testing the tool, not your missing config.
+- **Teams.** People have strong preferences about AI tools, just as they do about editors. A shared context folder lets everyone keep the same project standards while working in whichever agent they like.
+- **Native beats indirection.** A common workaround is an agent file that says "go read the Cursor rules." In practice the host found that works worse than having the context in each tool's native place.
+
+### Context for libraries the model barely knows
+
+FastHTML is young, so models have seen little of it. The same is true of many eval tools: a vendor SDK you're about to script against, or the newest release of one. Isaac uses levels of effort that match how much you'll use the library:
+
+| How committed you are | What to do |
+|---|---|
+| Just trying it out | Automated context tools that work on almost any library (Repomix, PasteMax, GitMCP), or simply tell the agent to read the docs |
+| Using it regularly | Use what the vendor publishes for agents: an MCP server (Braintrust has one) or an `llms.txt` file (Phoenix and Inspect do), which can be turned into an MCP server with existing tools |
+| Months of work ahead | Spend two to four hours building your own context: get the relevant docs into markdown (with a model, or by copying the page HTML), one file per topic, in the `.ruler/` folder |
+
+The last level is where the payoff is, and it doesn't stop at copying docs. Over time Isaac **personalizes** the files: where the docs say "you can do this or that", he edits them to say which one his project does. Be opinionated. When the agent does something odd, the answer to "why did it do that?" is usually that the context wasn't quite right, so tweak the file and the problem stays fixed.
+
+Two hours sounds like a lot for one app, and it would be if this were your only FastHTML app ever. His comparison: if three hours of practice made you type 10% faster, you'd do it, because you type all day. Context you reuse across projects for months is the same deal.
+
+What about libraries that change fast? If the context is good and in your format, an API change is an easy job for a model: "this library changed its datasets API, here is the new one, update this file." Your code probably broke too, so you're spending that time anyway. Tools also help with upkeep: SpecStory saves your agent chat history as markdown, which any agent can scan for repeated complaints that should become rules, and some editors suggest new rules on their own.
+
+## Step 2: get a written plan
+
+For anything non-trivial, Isaac starts with spec-driven development: tell the agent what you want, have it produce a plan, and only then generate code.
+
+Two practical details:
+
+- **Dictate the request.** Voice transcription is a fast way to give the agent a rich description, because people say more than they type.
+- **Ask for the plan in a markdown file**, not just in the chat. Here the agent read the existing database schema itself and drafted the plan from it, which saved him from describing the tables.
+
+Agents like Claude Code and Amp already make internal plans and to-do lists. The host asked what a markdown plan adds. Isaac's answer: nothing magical about the plan itself; the difference is that **a file is something you can edit**. For tasks that are tricky, or where he wants to stay hands-on, he goes one step further: a `plan.md` for the design, then a `todo.md` that breaks it into steps, and he works through the to-dos one at a time.
+
+An excerpt of what such a plan looks like for this app (illustrative, not his exact file):
+
+```markdown
+# Relevance annotator: plan
+- Stack: FastHTML + MonsterUI, follow .ruler/fasthtml-patterns.md
+- Data: read queries and documents from the existing database;
+  write one judgment row per (query, document) with label and note
+- Screen: query on top, one document below, rendered readably (PDF text, long form)
+- Controls: Relevant / Not relevant buttons; the active label is highlighted
+- Notes: optional text box saved with the judgment
+- Navigation: next / previous, plus a "judged 124 of 400" counter
+- Testing: start the app, label, reload, check the database and the browser console
+- Stop when: one query can be fully judged and labels survive a restart
+```
+
+## Step 3: edit the plan before any code exists
+
+This is the step most people skip, and the one Isaac spent the most time on screen. He read the agent's plan line by line and rewrote what was wrong. One example from the talk: the draft introduced a separate "current eval type" feature to track which label was selected. His reaction was that this should not be its own thing at all. The Relevant / Not relevant button should simply be highlighted when it is the active label.
+
+That is a small change in a plan and a large one in code. Caught in the plan, it costs one edited line. Caught after generation, it means unpicking state, routes and templates the agent built around a concept you never wanted. His edits ranged from "that's not quite what I want" to "this is completely off base", and every one of them was cheap because no code existed yet.
+
+The host's observation from watching Isaac work: what separates his successful AI coding projects from the "type it in and hope" kind is exactly this care over the plan.
+
+Two more things belong in the plan besides features: **when the agent should stop**, and **how it should test** its work. And this doesn't take long. People skip it because it sounds like a burden, but Isaac spends three to four minutes on a plan review. Once you know what to look for (unwanted concepts, the wrong stack, missing basics), it's a quick read.
+
+<EvPlanReviewDesk />
+
+## Step 4: generate, then verify in a browser
+
+With context files and an edited plan in place, Claude Code generated the app. Then it tested its own work.
+
+Think about how you test a web app by hand: start it, click around, type something, save, refresh to see if it stuck, look in the database. The agent knows all those steps too; it just needs the tools. Isaac gave it a small **MCP server built on Playwright** with tools to:
+
+- start the local app,
+- navigate to pages and routes,
+- click elements and interact with the page,
+- read the **browser console logs**.
+
+The last one is the important one. Server logs are easy to give an agent (redirect them to a file and tell it to read the file). Client-side errors, such as HTMX or JavaScript failures, never reach the server log. Without a browser tool the loop is: you click around, copy the error, paste it into the chat, wait for a fix, click around again. It works, but it's slow.
+
+In the recorded run, the agent navigated to a route for a specific record, clicked an element, got a 404, looked up the route definition, checked the server logs and the browser console, and fixed the problem without Isaac relaying anything. When it was done, he still navigated the app himself and looked for errors.
+
+This was not a general-purpose Playwright server. It was written for this project: it knows how to run this `main.py` on a port. That took five or ten minutes to build with the agent, less time than learning a more general product's docs. And it is reusable: copy the server file into any FastHTML app with a `main.py` and it works there too.
+
+<Callout kind="tip">
+Isaac's rule: if you find yourself copying and pasting the same kind of thing into the model more than once, either your context file needs fixing or you need a quick tool (often a small MCP server) that fetches that information for the agent.
+</Callout>
+
+Agent testing does not replace your own. For an annotation tool, the checks worth doing yourself are the ones that decide whether labels can be trusted and whether anyone will use it:
+
+| Check | Why it matters |
+|---|---|
+| Label a few documents, restart the app, reload | Judgments must be saved as you go, not held in memory |
+| Click the other button on a labeled document | Relabeling must overwrite, not create a second row |
+| Open the longest PDF and the shortest record | Rendering has to work for both extremes of the corpus |
+| Judge 20 documents in a row with real data | Friction you only feel at volume: slow page loads, a button that moves, too much scrolling |
+| Read the generated code for the save path | The one place a bug silently corrupts your eval data |
+
+The last row is where knowing the framework pays off. You don't need to read every template, but the code that writes labels to the database is your ground truth for every metric downstream (see [Retrieval metrics](/courses/ai-evals/rag-and-agents)).
+
+## Consistency is the real goal
+
+Isaac's main argument is subtle. Careful context and plans do help you finish more tasks with AI. But the bigger benefit is **consistency**: if you work the same way every time, you learn which requests the agent handles well and which it fumbles. If every session is an ad hoc prompt, results vary for reasons you can't see: sometimes it feels like magic, other times you go down a rabbit hole and don't know why. You never build intuition from that. He suggested this is why many people conclude AI coding doesn't make them more productive.
+
+This should sound familiar. It is the same argument the course makes about evals: you can't improve what varies for unexplained reasons. Fix the inputs (context files, a reviewed plan, the same workflow), and the outputs become something you can reason about.
+
+## Evaluating the coding agents themselves
+
+Part of the session covered how Isaac reviews AI coding tools, and it is a good example of eval thinking applied to developer tools. Instead of toy demos ("I built a to-do app"), he runs each agent on a **real task**, such as a change that was actually merged into an open-source library, and records the diffs he had to make by hand before he was comfortable with the result.
+
+Comparing Claude Code and Amp on infrastructure work (building an app, containerizing it, deploying it, adding CI), he judged each step on several axes:
+
+- **Did it work?** Both deployments did. Did the health-check route behave correctly? Was one buggy?
+- **Is it what I'd want?** Twenty lines of CSS embedded in a Jinja template versus a separate CSS file: both functional, one better organized.
+- **Cost and judgment.** One agent allocated more memory to the deployed app than the task needed, which works but costs more.
+- **Following versus improving.** Did it just follow instructions, or suggest a better approach?
+
+This is error analysis on a coding agent: real inputs, read the outputs, write down specific failures by category. He also noted that free tiers often run weaker models, so a good tool can feel bad in a trial for reasons unrelated to the tool. Because Ruler gives every agent the same context, the comparison is between tools rather than between setups.
+
+## Small internal tools everywhere
+
+The annotation app was one example of a broader habit: build small, task-specific tools whenever a workflow is painful. Two others came up:
+
+- **Slides as HTML.** His presentation was plain HTML, CSS and JavaScript generated by an agent. Styling took two or three prompts ("this looks kind of ugly, try again"), and he edits text directly in the file. He keeps prompt history with SpecStory so the process can be shared.
+- **A human-in-the-loop writing pipeline.** A small app downloads a talk video, transcribes it with timestamps, drafts a content plan (spoken order is not always the right written order), grabs a screenshot every five seconds, and asks a model to draft a markdown post with screenshots placed by timestamp. He then reviews and edits the draft in his own viewer. The AI drafts; a person decides what ships.
+
+The second one has exactly the shape of a good eval workflow: automate the tedious part, keep a person reviewing every output, and build the review screen to make that fast.
+
+## Common mistakes
+
+- **Prompting straight to code** for a tool with real design decisions, then fighting the result.
+- **Accepting the agent's plan without reading it.** Extra concepts (like a separate "current label" feature) are cheap to delete in a plan and expensive in code.
+- **No project context**, so the agent picks a stack you can't maintain or a component style that doesn't match the rest of the app.
+- **Per-tool context files that drift apart**, or one tool's file pointing at another's.
+- **Trusting "it works" from the agent** without labeling, reloading and relabeling yourself on real data.
+- **Being the agent's clipboard**: pasting browser errors and logs into the chat by hand, again and again, instead of giving it a tool to read them.
+- **Leaving context stale**: not fixing the context file when the agent repeats a mistake, or when the library's API changes.
+- **Judging a coding agent on a toy task**, a free-tier model or a missing config.
+
+## Cheat sheet
+
+- Isaac Flath rebuilt the course's FastHTML annotation app agent-first: context files, written plan, hand edits, generation, browser testing.
+- The app: one query, about 400 of 7,000 records to judge relevant or not, plus notes; friction decides whether labeling happens at all.
+- Keep framework and UI conventions in markdown context files; Ruler compiles one `.ruler/` folder into every agent's native config.
+- Shared context means fair tool trials and lets a team use different agents with the same standards.
+- Dictate the request, ask for the plan in a markdown file, add a `todo.md` for tricky work.
+- Edit the plan line by line before generating; the "highlight the active button, no separate state" fix is the model example.
+- Put when to stop and how to test in the plan; a practiced plan review takes three to four minutes.
+- For new libraries, scale context effort to commitment: automated tools, then vendor MCP or `llms.txt`, then a few hours of personalized markdown docs.
+- A small project-specific Playwright MCP server (start app, navigate, click, read the browser console) takes minutes and lets the agent fix its own client-side errors.
+- Pasting the same kind of thing into the model twice means: fix the context or build a tool.
+- After the agent tests, verify persistence, relabeling, rendering extremes and the save code yourself.
+- Consistent workflow beats clever prompts: it is how you learn what the agent can be trusted with.
+- Evaluate coding agents like any AI system: real tasks, read the diffs, categorize failures, note cost.

@@ -1,0 +1,162 @@
+import { EvStepCheckpointPlanner } from "@/components/widgets/EvStepCheckpointPlanner";
+
+## Why this talk is in an evals course
+
+This guest session is by **Jeremy Howard** and **Johno Whitaker** of Answer.AI (Jeremy is also the founder of fast.ai). They demonstrated Solveit, an environment they built for working with code, prose and an AI model in one dialogue. The tool is not the point. The point is the way of working it is built around, and that way of working is the same habit this whole course keeps asking for: **look at every intermediate result yourself instead of trusting a pipeline you never inspected.**
+
+Hamel made the connection explicit during the session. The most common failure he sees in students is going too far too fast with AI: dumping all their traces into an LLM and asking it what is wrong with the application, instead of doing [error analysis](/courses/ai-evals/error-analysis) themselves. The talk is about the same failure, one level up: handing a whole coding task to an agent and accepting what comes back.
+
+This lesson covers the method, a reconstructed demo in which Johno builds a small eval step by step, a few concrete techniques for steering a model, and how it all ties back to looking at data and building review tools.
+
+## The cost of handing over the whole task
+
+Jeremy's argument starts from what you want out of your work over months, not minutes:
+
+- **Your skills should improve.** That needs deliberate practice, which by definition feels hard. If every task feels effortless, you are not learning.
+- **Your project should get easier to extend the longer you work on it.** That only happens if you build a concise system that you and your team fully understand, with foundations you can build on next time.
+- **The AI is only as strong as the foundations you give it.** A model can write a 3D browser game because a library like Three.js exists. The better the building blocks you write, the more you (and the model) can build on top of them.
+
+Handing a whole task to an agent ("vibe coding") gives a quick reward, and Jeremy compared it to pulling a slot machine lever. The trade is short-term output for long-term debt: more code nobody understands, more concepts you never learned, and a project that gets harder to change. Their own experience at Answer.AI, after investing heavily in agentic coding, was that it helped in some narrow areas but did not produce the speed-up it seemed to promise.
+
+The proposed alternative inverts the roles. The human is the agent, and the AI is a collaborator that sees everything you see. The method also has a cost: the speakers say plainly that it feels slower and more effortful, and that the payoff comes from practice over weeks, not from the first session.
+
+## Polya's loop, at every scale
+
+The name comes from George Polya's *How to Solve It* (1945), a classic book on solving hard math problems. Its four steps, adapted:
+
+1. **Understand the problem.** Read it yourself and restate it in your own words. Then ask the AI whether your restatement missed anything, not the other way round.
+2. **Devise a plan.** Think of several strategies first, then ask the AI for more. Look for analogies to problems you have solved.
+3. **Carry out the plan.** Systematically, one step at a time, checking each step.
+4. **Look back.** Review what worked and what you would reuse. This is the step people skip, and it is what turns the steps into a loop.
+
+Jeremy pointed out that the same loop has been rediscovered many times: the OODA loop from fighter pilots, Toyota's rapid iteration on assembly lines, and Eric Ries's lean startup cycle. Johno added that it applies **fractally**: to a week-long project, to a single section ("pull this field out of the API response"), and to a ten-second step. At every scale you state what you are trying to do, do it, look at the output, and decide whether it did what you wanted.
+
+The evals lifecycle from [the first lesson](/courses/ai-evals/evals-fundamentals) is this loop applied to an LLM product: analyze, measure, improve, repeat.
+
+## Small steps, and look at every output
+
+The single most repeated rule of the method: **after every one or two lines of code, look at the result.**
+
+That does not scale to 100,000 records, and it does not need to. Pick one example and push it through the whole pipeline by hand:
+
+```python
+x = results[0]                     # one observation, end to end
+x["photos"][0]["url"]              # look: ends in "square.jpg", a thumbnail
+url = x["photos"][0]["url"].replace("square", "medium")
+url                                # look again before moving on
+```
+
+Each line is its own cell, and each output is checked against what you expected. Only once the five or six lines work on `x` do you merge them into a function, then run the function on several other examples, then on the full set.
+
+Two things make this work better than it sounds:
+
+- **The environment is live.** The 100 API results stay in memory. Johno could poke at `results[0]`, use autocomplete on live objects, and try a variation without re-running a script or re-downloading anything.
+- **Small steps make the model smarter too.** The speakers found that the AI gives better help on a small, well-specified step with all the context above it than on a large vague request. Small batches suit both people and models.
+
+<Callout kind="remember">
+If you cannot say what output you expect before running a line, you are not ready to run it. The surprise is the bug report.
+</Callout>
+
+## Worked demo: an eval for species identification
+
+Johno built a small eval live: can current vision-language models identify organisms from photos at species level? The data came from his own iNaturalist observations (a site where people record organisms they find, which experts then confirm). He used only "research grade" observations, where other identifiers had agreed with the label, and only his own, so that he would know the species well enough to spot mistakes. The goal was about 50 multiple-choice questions, each with the photo, the correct species and four distractors.
+
+He wrote the plan as a note at the top, with a heading per stage, then worked through it:
+
+| Stage | What he did | What looking caught |
+|---|---|---|
+| Fetch data | Asked the AI how to query the iNaturalist API for 100 research-grade observations; ran it; inspected `results[0]` | A huge JSON record with dates, locations and identifications, now understood |
+| Get the photo | Drilled into `photos`, found the URL | The default URL was a square thumbnail; the API also offers larger sizes |
+| Pick distractors | Fetched species in the same genus, sampled four | The list contained a **duplicate** and **the correct species itself**. He had used `random.choices` (with replacement) instead of `random.sample` |
+| Build the prompt | Shuffled the five options, printed the prompt | Read it as the model would see it before sending anything |
+| Call the model | Asked the AI for the current structured-output API (web search, with citations), then sent one question | Inspected the raw response, then extracted the chosen species and compared it to the answer |
+| Score | Ran all questions | Better than chance (one in five), so the eval was at least doing something |
+
+Both distractor bugs would have survived a one-shot "write me an eval script" request. A duplicate option or a second copy of the correct answer does not crash anything. It quietly makes questions easier, and the final accuracy still looks like a plausible number. Inspection after each step caught them where they were introduced, when there were two lines to suspect instead of a whole script.
+
+His next steps were the ones this course teaches: print the questions the model got wrong and inspect them, then establish a human baseline (more on that below).
+
+<EvStepCheckpointPlanner />
+
+## Steering the model: edit, don't scold
+
+When the AI gave Johno a verbose example and he preferred concise code, he did not argue. He **edited the AI's earlier response** to contain the code he wanted, then re-ran the prompt. The next answer followed his style.
+
+Jeremy explained why this works and why the usual habit backfires. Language models are autoregressive: they predict what comes next given everything so far. Examples inside the model's own previous turns are the strongest signal of what the next turn should look like. So:
+
+- Replying "that's a dumb mistake, fix it" adds another mistake to the transcript. A dialogue full of mistakes makes another mistake the likeliest continuation.
+- Editing the bad response into a good one leaves a transcript where the model behaves well, and the next turns follow that pattern.
+- If you do ask for a correction, ask once, then edit the corrected answer into the history so the clean version is what stays.
+
+This is the same reason [judge prompts](/courses/ai-evals/automated-evaluators) carry worked examples: the model imitates what it sees.
+
+## Read what the AI hands you
+
+Small steps are only half of it. The other half is refusing to run what you do not understand:
+
+- **Unfamiliar function, library or API? Stop.** Read its documentation, try a few inputs, look at the outputs, and only then move on. That is how Johno found `random.choices` samples with replacement: he looked at its signature.
+- **Prefer grounded answers.** APIs change; models trained a year ago write last year's client code. Ask the AI to search the current docs and cite them, then verify by running the example.
+- **Check the AI's tool use too.** When Jeremy had the AI search the Cloudflare API docs with `rg` (ripgrep), some of its suggested commands used silly flags. Reading the commands before running them caught that, and taught him a useful flag (`-C` prints context lines around each match).
+
+## Keep shared context in the dialogue
+
+In this way of working, the human and the model see the same dialogue: notes, code, outputs and prompts. A few consequences:
+
+- **Write your plan and thoughts as notes.** Johno's notes ("next I should inspect the mistakes") helped him later, and also told the model what the next step was when he asked for help.
+- **The model only sees what is above the current message.** Order matters: put the plan first.
+- **Long tool outputs get truncated in context.** After the AI explored the Cloudflare docs with tools, Jeremy asked it to write a detailed summary of everything needed, so that summary would be in the dialogue for both of them later.
+- **Watch the size of outputs.** Collapse long outputs and check how many tokens each one adds before it fills the context window.
+
+## Tools are just functions
+
+Jeremy showed how little machinery an agent needs. He wrote a Python function that runs a shell command, wrapped it in an `rg` function and a `sed` function (for reading a range of lines from a file), and exposed them to the model as tools. The model then searched the docs on its own, several calls in a row, and he could read every call and result.
+
+```python
+def rg(argstr: str) -> str:
+    "Run ripgrep with the arguments in `argstr`."
+    return run_cmd("rg", argstr)
+```
+
+No server and no hand-written schema: the type hints and docstring are enough to generate the tool definition (several libraries, including Answer.AI's own, do this). For evals this matters because a small agent whose every tool call you can read is far easier to [debug](/courses/ai-evals/rag-and-agents) than a framework you cannot see into.
+
+## Look at your data, then build a tool to look faster
+
+Johno finished the demo the way this course would: by taking his own eval. He built a small quiz web app (FastHTML, a Python web framework, with HTMX buttons that post each answer back to the server) that showed each photo and the five options and kept score. It ran in the same live session as the eval code, so he could inspect the app's state as he clicked.
+
+Taking the quiz did three jobs at once:
+
+1. **Checked the eval for bugs.** Any broken question (two correct options, unreadable photo) is obvious when you answer it yourself.
+2. **Gave a human baseline.** A model score means little until you know what a knowledgeable person scores on the same questions.
+3. **Explained the model's misses.** The questions the model got wrong were the genuinely hard ones: a beetle he had needed specialists to identify, and two similar fish that he could only tell apart because he knew it was found in a fast freshwater stream, context the photo did not contain. That is error analysis: the errors were not the model's fault, they were missing information in the question.
+
+He admitted he leaned on the AI more for this app, close to vibe coding, because it was a throwaway tool for a side project. That is a reasonable call, and it is the same trade [Interfaces for human review](/courses/ai-evals/human-review-interfaces) and [Building eval tools with coding agents](/courses/ai-evals/building-eval-tools-with-agents) make: small review tools are cheap to generate, so build them freely, but understand the eval itself line by line.
+
+<Callout kind="tip">
+For any eval with a single correct answer, answer a sample of its questions yourself before trusting the score. It finds broken items, sets a baseline, and tells you whether the model's misses are fair.
+</Callout>
+
+## When the eval is people using it
+
+Asked how they evaluate their own product, Johno said their main eval is the community using it and the team building with it: writing a book in it, building a large web app in it, writing their blog posts in it, and watching what works. That is dogfooding with very fast feedback on small changes. It is a valid signal for a tool whose users are also its builders. For an LLM product whose users are not you, you still need to read real traces, as in [error analysis](/courses/ai-evals/error-analysis).
+
+## Common mistakes
+
+- **Asking an LLM to do the looking for you,** whether that is diagnosing your traces or writing a whole eval script, and accepting the summary.
+- **Running a whole pipeline before inspecting any intermediate output,** so a plausible final number hides the bugs.
+- **Scaling to the full dataset before one example works end to end.**
+- **Arguing with the model about its mistakes** instead of editing its responses into the pattern you want.
+- **Running code that calls an API you have never read about.**
+- **Trusting a model score with no human baseline,** and never checking whether the questions it missed were answerable.
+
+## Cheat sheet
+
+- The method: understand, plan, carry out step by step, look back; apply it at every scale from a week to ten seconds.
+- After every one or two lines, look at the output and compare it to what you expected.
+- Work on one example (`x = data[0]`) end to end, then wrap the lines into a function, then scale.
+- Bugs like duplicate or leaked answer options do not crash; they only show up in intermediate outputs.
+- Restate the problem yourself first, then ask the AI what you missed.
+- Edit bad model responses into good ones; scolding makes more mistakes likelier.
+- Read the docs for any unfamiliar function or API before moving on; prefer cited, searched answers.
+- Keep plans and notes in the shared dialogue; ask for a summary after tool-heavy exploration.
+- Any typed, documented Python function can be a tool; keep agents small enough to read.
+- Take your own eval: it catches broken items, sets a human baseline, and explains the model's misses.

@@ -1,0 +1,192 @@
+import { EvTrustPlaybookAudit } from "@/components/widgets/EvTrustPlaybookAudit";
+
+## The talk in one picture
+
+This guest talk is by **Udi Menkes**, who leads product management for several AI areas at **Intuit** (the company behind QuickBooks, TurboTax, Mailchimp and Credit Karma). His team runs an internal GenAI evaluation platform used by thousands of Intuit developers, and he also owns Intuit's "AI standards": the bar teams are held to for quality, safety and security. Before Intuit he built fraud and anti-money-laundering models for banks, so his view is that evals are not new: they were the core of good ML products long before LLMs.
+
+The talk is deliberately strategic rather than code-level. It is one company's **playbook** for getting an agent from "it seems to work" to "we trust it in front of customers", in four parts:
+
+| Part | The question it answers |
+|---|---|
+| **Foundation 1: strategy and visibility** | Can we see what the agent does, what it should handle, and what "good enough" means? |
+| **Foundation 2: the right metric per component** | Which evaluator fits each output and each step? |
+| **Foundation 3: insight, not just scores** | Why is it failing, for whom, and what happens under attack? |
+| **Close the loop** | When production differs from development (it will), how fast do we notice and learn? |
+
+Most individual techniques here are taught in the core lessons, and this page links to them. What is new is the **ordering** and the **organizational** view: what a large company standardizes so that every team starts from a strong default instead of a blank page.
+
+## Why agents are hard to trust
+
+Udi's running example comes from a deep dive in Lenny's Newsletter: a travel agent asked to "book me a trip to San Francisco". To answer, it must:
+
+1. Decide which tool to call (it can pick the wrong one).
+2. Build a flight search (it can construct the query wrongly).
+3. Use the results as context for the next step (it can misread them).
+4. Write a final response (every step can be right and the answer still miss what the user wanted).
+
+The failure he describes: the agent ends up booking a trip to **San Diego**. Nothing crashed. The final output alone gives no clue which step went wrong.
+
+The arithmetic is the point. Even a low error rate per step compounds across a chain:
+
+| Per-step success | 3 steps | 5 steps | 10 steps |
+|---|---|---|---|
+| 99% | 97% | 95% | 90% |
+| 95% | 86% | 77% | 60% |
+| 90% | 73% | 59% | 35% |
+
+(These figures assume independent steps and are for illustration; the talk made the point without a table.) Udi lists what makes agents harder than single LLM calls:
+
+- **Hidden failure points.** Checking only the final output misses where it broke.
+- **Blind spots.** Without step-level visibility you cannot debug or improve.
+- **Subjectivity.** Several steps have no obvious "correct", so you must define good before writing code.
+- **Non-determinism that keeps evolving.** Prompts, models and tools change, so monitoring and strategy must adapt too.
+
+His conclusion: vibe checks are already insufficient for plain LLM flows and are hopeless for agents. The step-by-step diagnosis (first failing step, failure funnels, transition matrices) is covered in [Evaluating RAG, tools and agents](/courses/ai-evals/rag-and-agents).
+
+## Foundation 1: strategy and visibility
+
+### Trace before anything else
+
+Before writing a single eval, instrument the agent so every step is visible. Without tracing you are "flying blind": you see final outputs and maybe some logs. Udi showed LangSmith and named Langfuse, Braintrust and Arize as alternatives, and said the vendor matters little at the start. What matters is that the **trace structure mirrors the agent's real steps**: if the agent plans, searches, then books, the trace should show those three spans, not one opaque blob. Traces, spans and sessions are explained in [CI, CD and online monitoring](/courses/ai-evals/ci-cd-and-monitoring).
+
+### Design the dataset on purpose
+
+Next comes what he calls the **golden dataset**. Real production data is best, but a new agent usually has none, so you generate synthetic data. The step people skip is the thinking before generation: write a **one-page note** listing the scenarios the agent must handle, what you expect it to do in each, and the edge cases you think you need. Feed that note plus the PRD into synthetic generation with clear guidelines. Udi's claim is that this one page pays for itself many times over. The mechanics of dimension-based synthetic queries are in [Systematic error analysis](/courses/ai-evals/error-analysis).
+
+### Measure coverage
+
+Once you have a seed dataset, ask: **what does it actually cover?** Intuit measures coverage two ways:
+
+- **Statistically**, with diversity measures such as how heterogeneous the inputs are.
+- **Semantically**, by comparing the dataset with the use case: the PRD, the agent's code and its stated goals. The output is a coverage score plus a list of gaps ("your PRD mentions refunds for annual plans; no example covers them"), with suggested examples to add, and eventually generated ones.
+
+He showed a mock coverage report for a sales outreach agent, since the real ones are confidential. A minimal version of the semantic check is easy to build yourself:
+
+```python
+SCENARIOS = ["new lead, no prior contact", "follow-up after no reply",
+             "lead asks for pricing", "lead says unsubscribe", "non-English reply"]
+
+def coverage(examples, tag_scenario, min_per_scenario=5):
+    # tag_scenario: an LLM call that maps one example to a scenario name (or "other")
+    counts = {s: 0 for s in SCENARIOS}
+    for ex in examples:
+        s = tag_scenario(ex, SCENARIOS)
+        if s in counts:
+            counts[s] += 1
+    gaps = [s for s, n in counts.items() if n < min_per_scenario]
+    covered = 1 - len(gaps) / len(SCENARIOS)
+    return covered, gaps
+```
+
+The scenario list comes from your one-pager and PRD. If a scenario has two examples, no metric on it means much.
+
+### Pick one North Star, with a threshold
+
+Teams love dashboards of seven or thirteen metrics. Keep them for error analysis, but also pick **one primary metric**: either one of the sub-metrics or a combination. It tells you at a glance whether the agent is getting better or worse over time. Track it on a dashboard from day one.
+
+The harder part is the **threshold**. Is 0.8 good enough, or 0.9? Udi ties it to the **cost of an error**:
+
+| Agent | What a mistake costs | Implied bar |
+|---|---|---|
+| Coding agent in an IDE | The developer iterates or edits the code | Can be lower |
+| Customer support chatbot | A customer gets a made-up answer and may stop trusting you entirely | Must be high |
+
+Set the threshold up front with the business and product leaders, then keep revisiting two things: is the threshold still right, and does the primary metric really track the business outcome?
+
+<Callout kind="tip">
+A threshold without a cost-of-error conversation is just a number someone liked. Write down what one failure costs in each major scenario before you argue about 0.85 versus 0.9.
+</Callout>
+
+## Foundation 2: the right evaluator for each component
+
+Intuit's answer to "how do we measure this?" is a set of reusable **cookbooks**: code examples plus guidance on when to use each, organized along the lifecycle. The pre-production phase covers instrumenting observability, building the dataset, deciding what to measure, implementing evals and advanced evals. The production phase covers analyzing results and automating governance. The goal is that a team starts at an advanced point instead of a blank one.
+
+Three rules from the cookbooks:
+
+1. **Use programmatic checks wherever outputs are objective.** They are fast, cheap and deterministic. Numeric outputs with ground truth, code that can be run, schema validation: none of these need an LLM judge. See [Automated evaluators](/courses/ai-evals/automated-evaluators).
+2. **Make judges single-criterion and binary, and align them with experts.** Udi has seen teams start with rating scales "and then it becomes a mess". One rubric per judge, pass or fail, with a written critique. Then measure alignment against expert labels and **set a minimum alignment target up front**. Missing the target is a gate: you do not proceed until you understand why and refine the instructions. The alignment metrics are in [Trusting your judge](/courses/ai-evals/trusting-your-judge).
+3. **Use templates for the hard architectures.** Intuit keeps eval templates for RAG, for agent **planning**, for **trajectory** (the sequence of tool calls) and for **multi-turn** conversations, so teams do not reinvent them.
+
+## Foundation 3: insight, not just scores
+
+The third foundation is a mindset shift. Watching scores go up or down matters, but **error analysis** is where the insight comes from, and Udi calls it the highest-ROI activity in practice, matching what this course argues.
+
+His addition is that **root cause analysis depends on who is doing it**:
+
+| Persona | Needs to see | Why |
+|---|---|---|
+| Domain expert (say, a tax accountant) | Input, output, and the context it happened in | Judges whether the answer is right for the customer |
+| Developer | Every step through the agent's architecture | Finds which component broke |
+
+These need different data views and sometimes different tools. Build or buy whatever serves each, as in [Interfaces for human review](/courses/ai-evals/human-review-interfaces).
+
+The second addition is **safety and security as part of the dataset**, not a separate audit. If someone tries to hack the agent tomorrow, adversarial inputs (prompt injection, attempts to extract data, abuse) should already be test cases next to the normal scenarios.
+
+## Close the loop with production
+
+Udi's near-guarantee: you will iterate until the metrics look great ("we got to 95%"), ship, and then production will show you things development never did. Plan for that before launch:
+
+- **Monitor and alert on the same metrics.** Production monitoring should track the same North Star and sub-metrics you used offline, so a drop fires an alert and you can open the traces. How to run evals online is in [CI, CD and online monitoring](/courses/ai-evals/ci-cd-and-monitoring).
+- **Capture both kinds of feedback.** *Explicit* feedback is a thumbs up or down or a feedback button. *Implicit* feedback is behavior that signals failure: a user copying the answer out to fix it elsewhere, or re-asking the same thing. Decide which implicit signals matter for your agent and log them as events **joined to the traces**, so you can study them at scale.
+- **Run a data flywheel.** Route production failures and negative signals into the same annotation workflow as everything else. Use clustering or similar methods to surface cases that are **not in the golden dataset yet**, and add them. Over time the dataset fills with real user scenarios, and every improvement is tested against them.
+
+<Callout kind="warn">
+Design feedback capture before launch. Once the agent is live and data is flowing, adding feedback hooks and wiring them to traces is much harder, and the weeks before you do are lost learning.
+</Callout>
+
+## Audit an agent against the playbook
+
+Pick an example agent below. Each starts with the practices its team already has; toggle them to match your own agent instead. The audit walks the playbook in order and names the **first gap** as your next action, because later steps rest on earlier ones (a judge aligned to experts is little use if no trace shows where it should look).
+
+<EvTrustPlaybookAudit />
+
+Try the support chatbot: it is live, its scores look fine, and it has no feedback capture. That combination is the one Udi warns about most. Then try the trip planner and notice that its first gap is not a metric at all: it is tracing.
+
+## How Intuit organizes it
+
+A single product team cannot build all of this while also building the product. At Intuit a central **platform team** owns GenAI development tooling, and the eval platform is one part of it. Teams bring their agent onto the platform and plug in their own metrics, datasets and pipelines. The platform team measures itself on agent quality, **time to production**, and whether shipped agents are more reliable.
+
+On build versus buy, the rule is pragmatic:
+
+- **Buy** where vendors are ahead. Automatic observability is the example: no point building it.
+- **Build** where Intuit has an opinionated approach, layered on top of vendors. Example: aligning a judge with humans, choosing which statistics to report, and automatically surfacing the most critical disagreements for review. Tools were only starting to offer this.
+
+The opinions live in the **AI standards**: what a good dataset is, what coverage means, how feedback is collected, how alignment is done. Humans stay central: tax and accounting experts do error analysis and give the feedback that improves the products. The platform's job is to scale that expert knowledge, not replace it.
+
+## Where it is heading: agents that run evals, humans who supervise
+
+Udi's view of the future is a shift from human-driven to **human-supervised, agent-driven** evaluation. He demoed the concept in Cursor: the cookbooks are written as markdown rule files, and the agent can read them alongside the golden dataset, the PRD and the agent's code. Asked which eval method to use, it read the guidance, noted that the dataset had ground truth and the product was conversational, recommended a **multi-judge, pairwise-comparison** approach, explained why, and wrote the code for the team to test.
+
+When Hamel asked whether this meant fully automating evals, Udi was clear on two points:
+
+- **It is a concept, not current practice.** He does not think models are ready to automate this end to end.
+- **The cookbooks are containers, not content.** They teach how to write a good judge and a good rubric (binary, with an explanation, wired to the platform so the same code runs on production traces). They do not say what "completeness" means for your product: you define that and plug it in. Intuit also collects **reference implementations** ("this worked for a QuickBooks chatbot") as starting points, which teams adapt with their own taste.
+
+The setup stays human: the owner of the experience writes the PRD, the scenarios and the initial calibration, and the agent takes on downstream work under supervision.
+
+## Plan roadmaps as experiments
+
+Udi's closing takeaways, in his order:
+
+- **Evals matter more than prompts.** Prompt tuning is important, but systematic evaluation is what tells you which tuning helped.
+- **Vibe checks are for spotting errors, not for deciding quality.**
+- **Error analysis is the highest-ROI activity.** You must look at the data to know why the agent fails.
+- **Think about feedback very early.**
+- **Build trust deliberately:** binary decisions with critiques, and judges aligned to humans.
+- **Invest in tooling,** bought or custom-built views. There is no other way to see what an agent does.
+- **Treat the roadmap as experiments.** Don't promise "we ship this agent in a month no matter what": the quality might be poor. Plan each sprint as an experiment that moves a specific capability, and count "we learned the agent cannot do X" as progress.
+
+## Cheat sheet
+
+- Agents fail at hidden steps and errors compound: 95% per step over 5 steps is about 77% end to end.
+- Trace first, and make the trace structure match the agent's real steps. Vendor choice matters less than visibility.
+- Write a one-page list of scenarios and edge cases before generating synthetic data; feed it and the PRD to the generator.
+- Measure dataset coverage statistically and semantically against the PRD, and list the gaps.
+- Keep many metrics for diagnosis but one North Star, with a threshold set from the cost of an error and agreed with business owners.
+- Programmatic checks for objective outputs; binary single-criterion judges aligned with experts, with an alignment target as a gate.
+- Root cause analysis differs by persona: experts need input, output and context; developers need every step.
+- Put adversarial and security cases in the golden dataset.
+- In production, alert on the same metrics, capture explicit and implicit feedback joined to traces, and feed new failure clusters back into the dataset.
+- Centralize the platform, buy commodity tooling, and build the opinionated layer (standards, judge alignment, coverage).
+- Agent-driven evals are a direction, not a replacement: playbooks are containers, and humans define good.
+- Plan the roadmap as experiments, not fixed ship dates.

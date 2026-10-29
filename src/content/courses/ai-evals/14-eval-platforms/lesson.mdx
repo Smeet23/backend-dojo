@@ -1,0 +1,216 @@
+import { EvPlatformNeedsMapper } from "@/components/widgets/EvPlatformNeedsMapper";
+
+## What an eval platform is for
+
+Everything in this course can be done with a notebook, a CSV and a small review app. An **eval platform** packages the repetitive parts of that loop: capturing traces, storing datasets, running a pipeline over a dataset and comparing runs, scoring, collecting human labels, versioning prompts, and running judges on production traffic. None of it replaces the method. As the Phoenix presenter put it, no tool is going to solve your eval process for you; it can only make each step cheaper.
+
+Three tutorials in the course demoed three platforms, each on its own toy application:
+
+| Tutorial | Presenter | Demo application |
+|---|---|---|
+| Braintrust | Wade Gilliam, developer advocate | Customer support bot for the City of Encinitas: answers a request and routes it to one of 11 departments |
+| Arize Phoenix | Mikyo King, Arize | Movie question answering: text to SQL over a movie table in DuckDB, then a synthesis step |
+| LangSmith | Harrison Chase, LangChain CEO | Tour of existing projects: a docs chatbot, a receipt extractor, an email assistant |
+
+The homework lessons ([error analysis](/courses/ai-evals/homework-error-analysis), [LLM judge](/courses/ai-evals/homework-llm-judge), [retrieval](/courses/ai-evals/homework-rag-evaluation), [agents](/courses/ai-evals/homework-agent-failures)) show the same tools doing the same homework. This lesson goes the other way: concept by concept, what each platform does, so you can choose and use one with your eyes open.
+
+## The shared data model
+
+The three products use different words for nearly the same objects. Learn the objects once:
+
+| Concept | What it is | Braintrust | Phoenix | LangSmith |
+|---|---|---|---|---|
+| Project | One application or pipeline | Project (inside an org) | Project | Tracing project |
+| Trace | One request end to end | Trace in Logs | Trace | Trace (a run tree) |
+| Span | One step inside a trace | Span (subtask) | Span | Run |
+| Session | Related traces, e.g. one conversation | (not shown) | Session | Thread |
+| Dataset | Fixed inputs, optionally expected outputs | Dataset | Dataset (versioned) | Dataset of examples |
+| Experiment | One run of a task over a dataset, scored | Experiment | Experiment | Experiment |
+| Score | A number or label attached to a span or trace | Score | Evaluation or annotation | Feedback |
+
+Trace, span and session are the same terms as in [CD: observability first](/courses/ai-evals/ci-cd-and-monitoring#cd-observability-first). The rest of the lesson follows the loop: capture traces, turn them into datasets, run experiments with scorers, review by hand, then watch production.
+
+## Tracing and instrumentation
+
+Tracing is the step every presenter called non-negotiable. Mikyo King called it the scientist's camera; Harrison Chase said that if a beginner does one thing, it should be turning tracing on, because you may use it only 5% of the time but that 5% is when you need it.
+
+### Auto-instrumentation versus manual spans
+
+There are two ways to get spans, and all three demos mixed them:
+
+- **Auto-instrumentation** patches an LLM SDK or framework so every model call becomes a span with prompt, response, model parameters and token counts, without touching your code. Phoenix turns on every installed instrumentor with one flag. Braintrust's homework walkthroughs wrapped the `litellm` client.
+- **Manual spans** wrap your own functions: the SQL execution, the retriever, the routing step. These are the steps where your bugs live, and no SDK patch can see them. LangSmith's entry point is a `@traceable` decorator; Braintrust and Phoenix have equivalents.
+
+```python
+# Phoenix: register an OpenTelemetry tracer, auto-instrument installed SDKs
+from phoenix.otel import register
+tracer = register(project_name="movie-agent", auto_instrument=True).get_tracer(__name__)
+
+@tracer.chain                      # manual span around your own step
+def execute_sql(query: str) -> list[dict]:
+    return conn.execute(query).fetchall()
+
+# LangSmith: the decorator is the whole setup
+from langsmith import traceable
+
+@traceable
+def answer(question: str) -> str: ...
+```
+
+Mikyo's rule for what to trace: not everything, but every LLM call, tool call and retrieval. His first demo trace showed exactly why: the question "which anime topped the box office in the 2010s" produced valid SQL that returned **zero rows**. The final answer only said "I don't know"; the SQL span showed the cause.
+
+### OpenTelemetry
+
+Phoenix is built on **OpenTelemetry** (OTel), the standard tracing protocol from DevOps, with LLM-specific conventions called OpenInference and maintained instrumentors for frameworks like LangGraph, LiteLLM and Flowise. Harrison said LangSmith also accepts OTel alongside its own LangChain and LangGraph integrations. The practical point: instrumentation written against OTel can point at a different backend later by changing an exporter, while vendor-specific decorators have to be rewritten.
+
+### Which level to annotate
+
+In the Phoenix demo Hamel asked where a note goes. Mikyo annotated the **root span** on purpose, because that is what the end user saw and it pairs the question with the answer for building a judge later. Span-level feedback has its place too: retrieval metrics belong on the retriever span. If a reviewer needs retrieved rows to judge the answer (Hamel's point, as a non-movie-buff), query the root and join the nested retrieval span instead of restructuring your code. Choose the level by what the reviewer must see, as in [Interfaces for human review](/courses/ai-evals/human-review-interfaces).
+
+## Datasets
+
+A dataset is the constant in an experiment. The demos built them three ways:
+
+- **From production traces.** Filter logs, select, "add to dataset". Braintrust filtered to traces tagged as reviewed and created an "error analysis" dataset; LangSmith can add a trace to a dataset from the trace view or the annotation queue, editing the reference answer first if it was wrong.
+- **Synthetic.** Braintrust generated 19 dimension tuples with a prompt, had the domain expert review them (she rejected one: a combination unlikely from someone under 18), and produced 165 queries, 55 of them hand-written (five for each of 11 departments). The tuple method itself is in [Create a starting dataset](/courses/ai-evals/error-analysis#create-a-starting-dataset).
+- **Uploaded from code.** Phoenix uploaded its handful of test questions from a dataframe.
+
+Two features earned their keep. **Metadata on every row** (department, source: hand-coded or synthetic) let Braintrust group by department to check coverage and filter to the 55 hand-coded rows as a first golden set. **Versioning** (shown in Phoenix, and implied in Braintrust by saving a new version after edits) means an experiment can name exactly which rows it ran on.
+
+<Callout kind="warn">
+Datasets have bugs. Braintrust's first experiment scored 76% on routing. Reading the failures showed several hand-coded labels were wrong: a request labeled "general" really belonged to Parks and Rec, and the expert agreed. Fixing the labels alone moved the score to 85.45% without touching the bot. Read failing rows before you change the prompt.
+</Callout>
+
+## Experiments
+
+An experiment runs a **task** over a **dataset** and applies **scorers**, the three parts Wade named. What a platform adds over a notebook loop is storage and comparison: every run is kept with its metadata, and two runs can be diffed row by row.
+
+```python
+from braintrust import Eval, init_dataset
+
+Eval(
+    "encinitas-support",
+    data=init_dataset("encinitas-support", name="error-analysis"),
+    task=route_request,                    # your pipeline
+    scores=[is_correct_triage],            # plain Python functions
+    metadata={"what_changed": "fixed mislabeled hand-coded rows"},
+)
+```
+
+What the comparison views were used for:
+
+- **Group by a metadata field** to see per-segment scores (Braintrust grouped by the department slug and saw that requests meant for "general" failed most).
+- **Filter to regressions**: rows that passed before and fail now. An aggregate that goes up can still hide new failures.
+- **Click from a failing row into its trace.** Phoenix filtered its experiment to rows where the "has results" check scored 0 and opened the traces: the model wrote `genre = 'anime'` and `'sci-fi'`, while the table says Animation and Science Fiction.
+- **Record what changed.** A `what_changed` metadata field, or a `query_rewrite: true/false` flag as in lesson 12, turns the list of runs into a lab notebook.
+
+Phoenix's fix was to put example rows in the text-to-SQL prompt so the model saw the real genre values. The rerun returned rows for every question, and the prompt's version history showed the before and after side by side.
+
+LangSmith showed two ways to run experiments. The `evaluate` loop runs a target over every example with the same evaluators. The **pytest and Vitest integrations** let each test case carry its own assertions while still logging to LangSmith. Harrison argued this suits agents, whose outputs (an essay, a generated repository) often need different checks per example. LangSmith can also repeat each example several times and report a pass rate, which addresses non-determinism.
+
+## Scorers and evaluators
+
+All three platforms accept the two evaluator types from [Automated evaluators](/courses/ai-evals/automated-evaluators): code checks and LLM judges.
+
+- **Code.** Phoenix's first evaluator was a heuristic, "did the SQL return any rows", and Mikyo stressed that eval-driven development does not have to start with LLMs: regex, contains, non-empty all count. Braintrust's routing scorer compared the predicted department to the label.
+- **LLM judges.** Phoenix ran a usefulness judge after retrieval was fixed: every query now returned rows, but the judge still marked many answers not useful, and its explanation caught why (Frozen II offered as an anime). Phoenix also traces the judge calls themselves, so you can read the exact judge prompt and keep judge inputs and outputs as a dataset for improving the judge.
+- **Off-the-shelf libraries.** LangChain's open-source `openevals` has prebuilt and customizable judges for RAG, extraction and tool calls, plus code checks such as type-checking generated code; `agentevals` scores tool-call trajectories (strict order, unordered, subset or superset, or an LLM judge). Phoenix has its own prebuilt evals. Use these as templates, then validate.
+
+**Aligning judges in the product.** LangSmith's **Align Evals** flow, inspired by Eugene Yan's work, builds the judge-alignment loop from [Trusting your judge](/courses/ai-evals/trusting-your-judge) into the UI: pick sampled runs, label them pass or fail yourself, then edit the judge prompt in an evaluator playground until its labels match yours. It is restricted to **binary** labels on purpose. Live, Harrison's first judge scored terribly because the input mapping pointed at an empty field (the last message instead of `output.answer`); turning on the judge's reasoning made that visible. After the fix it matched all of his labels. Phoenix showed the cheaper version: pull human annotations into a notebook, write a judge, log its labels back, and look at rows where human and judge disagree.
+
+<Callout kind="warn">
+A small labeled set that the judge matches 100% is a sanity check, not validation. Harrison labeled a handful of runs for an easy criterion (does the answer contain a code snippet). For a real failure mode you still need enough labels for a held-out test set and TPR and TNR, as in lesson 5. Also note that the demo dataset's stored judge in LangSmith used a 1 to 10 correctness scale; Harrison himself recommended binary for consistency.
+</Callout>
+
+## Annotation and human review
+
+Every platform lets you attach labels and notes to traces. They differ in workflow:
+
+- **Braintrust**: human review scores are defined per project (the demo used a free-text comment and an `is_good` boolean), plus tags such as `needs review` and `reviewed` to track state, and a review page for going through traces.
+- **Phoenix**: an annotation panel on each trace with free-text notes and structured labels (correct or incorrect), **hotkeys** to page through traces (Mikyo credited the course's first cohort for these), and multi-user annotations that record **who** gave each label. Human and LLM labels sit side by side, with an average summary you can hide to avoid biasing the reviewer.
+- **LangSmith**: **annotation queues**, a dedicated labeling view with reviewer instructions, feedback criteria, notes and an "add to dataset" button. Rules can fill a queue automatically (below), which is how Harrison's queue reached about 9,000 runs.
+
+Keeping each annotator's label separate, rather than overwriting one field, is what makes agreement measurable later ([Measuring agreement](/courses/ai-evals/collaborative-evaluation#measuring-agreement)).
+
+## Prompt management and playgrounds
+
+All three store **versioned prompts** and offer a **playground** where you edit a prompt, change model and parameters, add tools or an output schema, and run it on one input or a whole dataset.
+
+- **Replay from a trace.** Phoenix and LangSmith both open any LLM span in the playground with its exact inputs, so you can ask "what if the prompt said this instead" without rerunning the app.
+- **Prompts as shared artifacts.** Braintrust's walkthrough used the playground for the expert and developer to work together, comparing prompt variants over a dataset. LangSmith's Prompt Hub keeps commits with comments; Phoenix shows a linear version history and can tag a version (for example, for staging) so code fetches it by tag.
+- **Code stays first-class.** Wade and Mikyo both created prompts in code and pushed them to the platform. Phoenix emphasized that you call the model with any SDK you like rather than a vendor wrapper.
+
+If your application fetches its prompt from the platform at runtime, the platform is now in your request path. Keep a fallback in the repo, as the Braintrust homework walkthrough did.
+
+## Online evals and production monitoring
+
+[Lesson 7](/courses/ai-evals/ci-cd-and-monitoring#two-ways-to-run-evals-in-production) covers why async evals run on a sample of traffic. The platforms implement the plumbing:
+
+- **Online scorers with sampling and filters.** LangSmith rules set a sampling rate (0.2 in the demo) and a filter. Braintrust's online scores can target specific spans and conditions, for example run only on traces with a thumbs-down.
+- **Automations.** A LangSmith rule sent any run where a sub-run's groundedness score was 0 to an annotation queue. This is the "alerts route to reviewers" pattern from lesson 8, wired up without code.
+- **Dashboards.** LangSmith builds one per tracing project: trace counts, latency, cost, tokens, per-tool call counts, latency and error rate, and feedback scores over time, grouped by any metadata field. Grouping by response model gave a rough A/B comparison of three providers on latency, cost and helpfulness. Braintrust's monitor view shows cost, latency and scores grouped by metadata.
+- **Querying at scale.** Braintrust stores traces in its own database, Brainstore, queried with a SQL-like language (BTQL) in a sandbox that exports the query as Python, TypeScript or REST. LangSmith offers filters on latency, feedback, metadata and full-text search.
+
+Evaluators also double as **product analytics**. Harrison's "contains a code snippet" judge and a language tagger (mostly English, then Chinese and Russian) are not quality checks; they show how people use the product and give filters for reading traces.
+
+<Callout kind="remember">
+Guardrails do not belong in an eval platform. Asked about running checks in the agent loop, Harrison said he would not do it in LangSmith, which is a logging platform: put the check in your application's hot path (in LangGraph, a node after the agent that either returns or sends feedback back to the agent) and log the result. Only reference-free checks can run there, because there is no ground truth at runtime.
+</Callout>
+
+## AI assistants inside the platform
+
+Each tutorial showed an assistant that reads your eval data:
+
+- **Braintrust's Loop** lives in the playground with access to the prompt, dataset and scores. Wade asked it to improve the dimensions in his tuple-generation prompt; it ran the prompt on the test row and proposed changes as a diff to accept or reject. The models it can use are the provider keys you configured.
+- **Phoenix's MCP server** exposes traces, experiments and prompts as tools to an external assistant (Claude Desktop or Cursor in the demo). Mikyo asked "what is wrong with my Phoenix experiment?" and it found the genre-mismatch failures. A second MCP tool answers questions from Phoenix's documentation.
+- **LangSmith** showed no chat assistant; its AI help was the Align Evals flow above (with prompt optimization named as future work) and AI-generated dataset examples in the homework walkthrough.
+
+Treat these as you would a junior colleague's first draft. Lesson 11 shows Loop deleting a section of a prompt the presenter wanted kept, and lesson 10 shows an AI-written scorer reaching 99% without ever being checked against human labels.
+
+## Side by side
+
+What the tutorials showed, plus deployment facts (check current terms before deciding; pricing and plans change):
+
+| | Braintrust | Arize Phoenix | LangSmith |
+|---|---|---|---|
+| Source | Proprietary platform | Open source: platform, SDKs, instrumentation, MCP server | Proprietary platform; open-source eval libraries (`openevals`, `agentevals`) |
+| Where it runs | Hosted cloud; paid plans can self-host or run hybrid, with "remote evals" keeping data behind your firewall | Anywhere: in a notebook, on a laptop offline with a local model, as a sidecar, a central server, or hosted Phoenix Cloud; Arize AX is the commercial platform for large scale | Hosted cloud (self-hosting is an enterprise option per LangChain's docs; not covered in the tutorial) |
+| Tracing | SDK logger, wrappers and decorators | OpenTelemetry and OpenInference auto-instrumentation | `@traceable`, native LangChain and LangGraph, OTel |
+| Strengths shown | Experiment diffs and regression filtering, metadata grouping, playground with Loop, Brainstore and BTQL for large traces | Fast local start, span queries, multi-annotator labels with hotkeys, MCP access to your data | Annotation queues fed by automation rules, Align Evals, per-project dashboards, pytest integration |
+| Production features shown | Online scores, monitor view | Same tracing reused; eval results logged back | Sampled online evaluators, automations, dashboards, threads |
+
+<EvPlatformNeedsMapper />
+
+## When a platform helps, and when it doesn't
+
+The Braintrust Q&A asked the honest question: much of what was shown (grouping, comparing runs, plotting) is also a few lines of pandas, so why the platform? Wade's answer was that teams often start by using it as a **trace database**, so they don't spend days writing logging for each model provider, storing large PDFs or audio, or querying nested JSON. That is a fair summary of where platforms pay off:
+
+- **A platform helps** when traces are large, multimodal or multi-step; when several people (especially non-engineers) need to read and label them; when production traffic needs sampling, scoring and routing to reviewers; and when you want a durable history of experiments.
+- **A notebook is enough** for a solo developer or a one-off analysis: a few hundred traces, a CSV, and the axial-coding steps from lesson 2. Phoenix blurs the line, since it runs inside the notebook.
+- **A custom review UI wins** when domain experts label a lot, when the right view depends on your domain (show the calendar entry next to the booking, render the email as the client sees it), or when generic layouts slow reviewers down. [Lesson 8](/courses/ai-evals/human-review-interfaces#spreadsheets-observability-tools-or-your-own) recommends trying the platform's annotation view first and building a thin custom UI on top of its API when throughput matters, using the platform as the database. Mikyo said the same of Phoenix: it is meant to have custom annotation tools built on top.
+
+## Avoiding lock-in
+
+You can switch platforms cheaply if the valuable parts of your eval work never depend on one:
+
+- **Labels, datasets and judge prompts are the asset.** Keep an exported copy in your repository (JSONL is fine) and treat the platform as a view onto them.
+- **Scorers as plain functions.** A `def is_correct_triage(output, expected) -> bool` runs in any platform's experiment harness, in pytest and in a notebook.
+- **Instrument with OpenTelemetry where you can**, or keep vendor decorators in one module.
+- **Watch runtime dependencies.** Prompts fetched from a hub at request time, a vendor proxy in the request path, or guardrails inside the platform make an outage or migration a production incident.
+- **Data residency is a constraint, not a feature comparison.** If traces contain personal data that cannot leave your network, the realistic options are self-hosted open source (Phoenix) or a vendor's self-hosted or hybrid plan, and that decision comes before any feature table.
+
+## Cheat sheet
+
+- Eval platforms package the loop (traces, datasets, experiments, scorers, labels, prompts, online evals); they don't supply the method.
+- Same objects, different names: span is a run in LangSmith, session is a thread, score is feedback.
+- Trace every LLM call, tool call and retrieval; auto-instrument the SDKs and add manual spans for your own steps.
+- OpenTelemetry instrumentation is the most portable choice; Phoenix is built on it and LangSmith accepts it.
+- Annotate the root span for end-user quality, span-level for retrieval or tool steps.
+- Put metadata on every dataset row and experiment ("what changed") so you can group, filter and compare.
+- Read failing rows before changing the prompt: Braintrust's 76% to 85% came from fixing wrong labels.
+- Compare runs by regressions, not only by the average.
+- Judges built in a UI (Align Evals) still need a held-out test set before you trust their numbers.
+- LangSmith rules sample traffic, score it and route failures to annotation queues; guardrails stay in your app.
+- AI assistants (Loop, Phoenix MCP) draft; you verify every edit and every scorer.
+- Self-hosting need: Phoenix runs anywhere; Braintrust offers self-hosted and hybrid on paid plans.
+- Keep labels, datasets and scorers exportable and vendor-neutral, and build a custom review UI on the platform's API when reviewer speed matters.

@@ -1,0 +1,203 @@
+import { EvBestOfNSimulator } from "@/components/widgets/EvBestOfNSimulator";
+
+## The problem: pretty and scannable
+
+This guest talk is by **Charles Frye** of Modal, a serverless GPU platform. His project generates artistic QR codes with a diffusion model: a QR code that is also a picture of a coral reef, a graffiti wall or a fireworks show. No LLM is involved, which is the point of the talk. The same eval ideas from this course (operationalize quality, label data, validate the evaluator, then let it drive decisions) worked unchanged on an image model.
+
+Some background on why the task is possible at all:
+
+- A QR code stores bits as dark and light squares. Fixed **finder patterns** (the big squares in three corners) let a scanner locate and align it; everything else is data plus **error-correction bits**, so a code still decodes when some squares are lost or the wrong shade.
+- A text-to-image diffusion model starts from noise and pushes the image toward the prompt. A **ControlNet** is an add-on module that also steers generation toward the structure of an input image, such as its brightness pattern. Feed it a QR code and you get an image whose light and dark regions follow the code. Frye compared it to structured outputs for LLMs: you impose a structure, but you express it as an image instead of a grammar.
+
+The catch is the classic generative one. Sometimes the output is a gorgeous code that scans. Often it is a gorgeous picture that does not scan at all, or a scannable code that is barely more than a black and white grid. Two goals pull against each other: **looks good** and **scans**.
+
+## Three versions of the system
+
+Frye built the system three times, and the versions make a neat before and after:
+
+| Version | How it was built | Result |
+|---|---|---|
+| v1 | Weekend hack, no evals, settings pushed hard toward scanning | Scanned well but under 50% of the time; aesthetics were bad |
+| v2 | New model, prompt and hyperparameter tweaks by eye | Prettier, but scan rate dropped, worst on hard prompts |
+| v3 | Validated evals, a parameter sweep, inference-time scaling | Hit a 95% scan target and looked better than v2 |
+
+The v3 pipeline is short: generate several candidates, keep the ones a validated scan checker says will scan, rank the survivors with an aesthetic predictor, and show the best one first with the rest below it.
+
+## Pick one metric to optimize, one to threshold
+
+With two competing goals you need to decide how they trade off. Frye's rule from experience: pick **one metric you push as high as possible**, and set a **threshold** on the others. (Optimization people call these the optimizing and satisficing metrics.)
+
+Scanning was the obvious one to threshold. A code that doesn't scan is just an ugly picture, and "it scans" is close to binary. The team set a **service level objective (SLO): 95% of generated codes scan.** His reasoning for 95%: a user who gets a dud and tries again has a 5% × 5% = 0.25% chance, 1 in 400, of failing twice. Aesthetics became the thing to improve, within that constraint.
+
+<Callout kind="tip">
+This is the same move as a guardrail plus a quality metric in an LLM app: "the JSON must parse" is a threshold, "the summary is useful" is what you improve. Deciding which is which up front stops you arguing over a single blended score.
+</Callout>
+
+## Operationalize in two steps
+
+"Looks good" and "scans" are vibes. You can't engineer against vibes, so Frye turned each into something measurable, in two stages.
+
+**Stage 1: a slow, manual, human definition.** It is expensive, but at least it pins down what you mean.
+
+- Looks good: humans give it a high score when asked to rate it from 1 to 10.
+- Scans: a person moving a smartphone around can scan it while it is shown on a screen.
+
+Notice how much was already cut. Real use includes printed codes, stickers, odd materials and bad lighting. "On a screen, with a phone" is a deliberate scope reduction, and you should make it knowingly.
+
+**Stage 2: automate it.** Build a machine whose output predicts (or at least correlates with) the human judgment:
+
+- Looks good: a model predicts the score humans would give.
+- Scans: a program predicts whether a person with a phone could scan it.
+
+This is the same path the core lessons take from [defining good](/courses/ai-evals/evals-fundamentals) through human labels to an [automated evaluator](/courses/ai-evals/automated-evaluators), just with images.
+
+## The two evaluators
+
+Neither evaluator was built from scratch.
+
+**Aesthetics.** An open-source aesthetic predictor from the Stable Diffusion community: embed the image with CLIP, then a small model trained on human ratings predicts the score. Someone else had already paid for the human labels.
+
+**Scanning.** The Python package **QReader**: a YOLO detector finds the code in the image, then the pyzbar library decodes it. It also retries with zooming, blurring and color changes, roughly what a phone's camera software does.
+
+In the course's terms, the scan check behaves like a [code-based evaluator](/courses/ai-evals/automated-evaluators): fast, cheap and close to objective. The aesthetic predictor plays the role of a judge: a learned model approximating human taste, useful but less trustworthy. That difference in trust decides how each one is used later.
+
+A minimal scan check looks like this. The careful handling of empty results is not decoration, as the next sections show.
+
+```python
+from qreader import QReader
+
+reader = QReader()
+
+def scans(image_rgb, expected_url: str) -> bool:
+    """True only if a code is found AND it decodes to the right payload."""
+    decoded = reader.detect_and_decode(image=image_rgb)  # tuple, None for failures
+    return any(d == expected_url for d in decoded if d)
+```
+
+Comparing to the expected URL is stricter than "something decoded", which also guards against a code that scans to the wrong data.
+
+Before changing anything, Frye ran both evaluators over the production images he had already logged (in Weights & Biases Weave). That gave a baseline scan rate and a first look at whether aesthetic scores differed between codes that scanned and codes that didn't.
+
+## Play with the system before sweeping
+
+The tempting next step is "sweep the parameters, pick the winner". Frye's warning: you cannot sweep well until you know which knobs matter. He and ML engineer **Will Shannon** spent hours just playing: trying prompts (including ones an LLM suggested), turning knobs, watching what changed.
+
+What they learned:
+
+- **Prompts matter a lot.** Their fix was user education: the app shows sample prompts, generated with an LLM from a few good seeds and picked at random, so users learn what works. Offering an LLM rewrite of the user's prompt would be the stronger fix.
+- **Some settings had never been chosen thoughtfully**, and one surprising knob mattered: **when the ControlNet starts acting.** Frye had assumed it should be on for the whole generation. Varying when it applies turned out to matter.
+
+This is error analysis by another name: look closely at the system before you decide what to measure or tune. See [systematic error analysis](/courses/ai-evals/error-analysis).
+
+## The sweep and the toast plot
+
+Exploration boiled the system down to two parameters:
+
+- **Strength:** how hard the ControlNet pushes the QR pattern.
+- **Duration:** how much of the generation it runs for.
+
+Frye compared the result to the internet's famous toast chart: toast too short or too cool stays bread, too long or too hot burns, and the good toast sits on a diagonal in between. A sweep over strength and duration showed the same shape for a "graffiti-covered wall" prompt:
+
+| Region of the grid | What you get |
+|---|---|
+| Weak and short | A nice graffiti wall, no QR code |
+| Strong and long | A crisp QR code that barely looks like a wall |
+| The diagonal between | A real blend, e.g. recessed bricks forming the dark squares, graffiti on the raised ones |
+
+Running the sweep took about 50 GPUs for a minute or so, then nothing. Bursty experiment compute like this is a good fit for serverless GPUs, which is the plug you would expect from a Modal engineer, but the pattern holds on any platform that scales to zero.
+
+## Label the sweep by hand
+
+The sweep produced images, but no ground truth to check the automated evaluators against. So Will Shannon labeled **1,800 images** by hand, two yes/no questions each: does it look good, and does it scan with a phone? The tool was the barest Jupyter notebook: the arrow keys mapped to the four label combinations. It took about one full working day.
+
+Frye's advice on this grind:
+
+- **Start now, with a crude tool.** Don't build a labeling platform first. (For when a custom interface does pay off, see [interfaces for human review](/courses/ai-evals/human-review-interfaces).)
+- **Don't obsess over label noise.** If your conclusion depends on a 1% or 0.1% margin of error, you are probably solving the wrong problem.
+- **Look at the images, not only the metrics.** The sweep grid was where the team actually saw which settings produced clever blends.
+
+He also separated two parts that people lump together. Annotating is mind-numbing. Exploring the data, framing the problem and finding a system that does well enough is the fun part. Calling the whole thing "doing evals" makes it sound worse than it is.
+
+## The confusion matrix that caught a bug
+
+With human labels in hand, they compared the automated scan check to the human "scans" label in a 2×2 confusion matrix. The first version had a striking pattern: the checker **never** predicted "does not scan". Not once.
+
+That is not a great evaluator; it is a broken one. The evals code mishandled an empty result (a `None` or empty string from the reader) and counted it as a scan. Frye's point about this class of bug: it is silent. Nothing crashes, you just get garbage numbers. He admitted he missed it the first time he looked at the chart.
+
+After the fix, the matrix looked the way a good one should: **a strong diagonal, with small but non-zero counts in every cell.** Most sweep images did not scan, because most settings leaned artistic, and the checker agreed with the human labels on most of them.
+
+<Callout kind="warn">
+An evaluator that never says fail (or never says pass) on a varied dataset is almost always a bug, not a triumph. Check both error rates, as in [trusting your judge](/courses/ai-evals/trusting-your-judge), and treat an empty cell in the confusion matrix as a reason to read the code.
+</Callout>
+
+## Inference-time scaling: best-of-n
+
+Once the scan check was validated and known to run faster than the image model itself, it could go into the production path. Then the fix for a low scan rate is to **throw more GPUs at it**: generate n candidates and keep any that pass.
+
+If each candidate scans independently with probability p, then:
+
+**P(at least one scans) = 1 − (1 − p)^n**
+
+Frye's illustration used a scan rate of about a third:
+
+| Candidates n | P(none scan) | P(at least one scans) |
+|---|---|---|
+| 1 | 66.7% | 33.3% |
+| 2 | 44.4% | 55.6% |
+| 4 | 19.8% | 80.2% |
+| 8 | 3.9% | 96.1% |
+| 16 | 0.15% | 99.85% |
+
+The smallest n that clears a 95% SLO is ln(0.05) / ln(1 − p), rounded up: at p = 1/3 that is 7.4, so **8**. That matches the setting the team shipped, **8 generations per request**, after considering up to 32. The headline result: with the aesthetic-leaning settings alone the scan rate was far below target, especially on hard prompts; adding best-of-n with the scan filter lifted it to the 95% SLO.
+
+The production loop, in sketch form:
+
+```python
+def make_code(prompt: str, url: str, n: int = 8):
+    images = generate_batch(prompt, qr_for(url), n=n)    # one batched GPU call
+    passing = [im for im in images if scans(im, url)]    # trusted check: filter
+    ranked = sorted(passing, key=aesthetic_score, reverse=True)  # softer signal: rank
+    return ranked  # show ranked[0] large, the rest as alternatives
+```
+
+The cost is n times the compute per request. Latency is the other worry, but batching n images on one GPU at this scale added little wall-clock time. This is the quality and cost trade-off from [improving accuracy and cutting cost](/courses/ai-evals/improvement-and-cost), in its most direct form.
+
+<EvBestOfNSimulator />
+
+<Callout kind="warn">
+The formula assumes every request has the same p. Real prompts don't. An average of 1/3 can hide hard prompts at 0.05, where 8 tries succeed only 1 − 0.95^8 ≈ 34% of the time and you would need 59 to reach 95%. Slice the scan rate by prompt type before trusting a single n.
+</Callout>
+
+## Optimize aesthetics, but gently
+
+The aesthetic predictor's scores rose across v1, v2 and v3, matching what the team saw by eye. It ranks the candidates in production. But Frye was explicit that they **did not deeply trust it**, so they did not optimize hard against it: they wanted parameter choices that moved the number up, not choices that maxed it out.
+
+The asymmetry is the lesson. A validated, near-objective check (scans or not) can be a hard filter and the target of an SLO. A learned proxy for taste is good for ranking and for confirming direction, but push on it too hard and you will find images that please the predictor rather than people.
+
+## When to invest in evals
+
+Asked when to start doing evals, Frye said v1 without evals was the right call: a weekend project where evals would have distracted from shipping and from learning what users do. His regret was v2. He came back to the project for a new model and new platform features, and that return visit was when he should have built the evals. It would have guided the work and he would be further along, perhaps training models on the labeled data by now.
+
+His general rule: **when you come back to a project for another round, that is when you formalize it**, the way you would write tests and docs. Evals are the obvious item on that list.
+
+## What carries over to LLM apps
+
+None of this needed an LLM, and all of it maps back:
+
+- **A cheap verifier plus best-of-n** works wherever you can check outputs quickly: generated SQL that must execute, code that must pass tests, JSON that must match a schema.
+- **Trust decides role.** Validated checks gate outputs; judges you trust less rank or monitor.
+- **Validate the evaluator against human labels before letting it drive decisions**, and suspect anything too clean.
+- **Explore before you sweep**, and keep the sweep to the few parameters exploration showed matter.
+
+## Cheat sheet
+
+- Artistic QR codes have two competing goals: looks good and scans. The same eval method works for diffusion models as for LLMs.
+- Optimize one metric, threshold the rest. Here: a 95% scan SLO, then improve aesthetics.
+- Operationalize twice: first a slow human definition (people rate it, a phone scans it), then a machine that predicts it.
+- Scan check: QReader (YOLO detection plus pyzbar decoding). Aesthetics: CLIP embedding plus a small head trained on human ratings.
+- Play with the system before sweeping, so you know which parameters matter (ControlNet strength and duration here).
+- Hand-label the sweep fast and crudely: 1,800 images in about a day. Don't chase 1% label noise.
+- A confusion matrix with an empty column means a bug. Here, `None` was treated as a scan.
+- Best-of-n: P(success) = 1 − (1 − p)^n. At p = 1/3, n = 8 gives 96%.
+- Filter with the evaluator you trust; rank with the one you don't, and don't optimize it hard.
+- Build evals when you return to a project for a second round, not during the first hack.

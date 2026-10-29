@@ -1,0 +1,157 @@
+import { EvObservationToTestCase } from "@/components/widgets/EvObservationToTestCase";
+
+## What this session was
+
+This session was run by **Robert Ta**, a student from the course's first cohort. He is a product person with an engineering background (Workday, then chief product architect at Dayforce) who now runs a startup called Epistemic Me. His habit with client work: when someone asks him to make an AI product better, the first thing he does is **use it**, with an eye for the user experience.
+
+The session was a live **bake-off** between products that do the same job:
+
+- Two meeting note-takers, **Granola** and **Otter**, both given the same recording of a sprint planning meeting between Robert and his co-founder.
+- Two "describe it and get an app" builders, **Lovable** and **Base44**, both given the same one-paragraph prompt for a to-do app.
+
+He put each pair side by side, gave both the same input, and had the audience vote and explain their votes. Hamel's comment halfway through sums up why this belongs in an evals course: "that's error analysis. You just did an error analysis on meeting notes right now."
+
+Keep the scale in mind while reading. Everything below comes from **one or two tries per product, on one day**. That is enough to form hypotheses about where a product might break, and nowhere near enough to rank products. Both teams have certainly changed things since. The point of this lesson is the method, and what you do with an observation once you have one.
+
+## Start with dimensions, not opinions
+
+Before touching either product, Robert asked the audience: what dimensions should we test a meeting note-taker on? He borrowed a framing from Teresa Torres (whose own talk is in [Automated evals as a PM](/courses/ai-evals/evals-for-product-managers)): treat product questions as **assumption tests**, and sort them into buckets.
+
+| Bucket | Question it asks | Dimensions the audience proposed |
+|---|---|---|
+| Desirability | Does it produce something valuable that users would choose? | Captures action items and owners; does not make things up; timestamps and context |
+| Usability | Is it easy to use and understand? | Organized for a human to read; less work for the reader; clear error messages |
+| Feasibility | Can it produce quality output reliably, at the needed speed and scale? | Accuracy on jargon; time to a working app; doesn't break on unexpected data formats |
+| Viability | Does it make business sense? | Token cost; maintainable generated code |
+| Ethical | Is it safe and fair? | Recording people without telling them; not copying unlicensed code |
+
+The answers were all over the place, and that was the point. A room of engineers, PMs, researchers and founders each weight different dimensions. Robert's advice for choosing among them: talk to actual customers, ask them to walk you through how they use the product, and keep the dimensions that show up in real usage. This is the same move as picking dimensions for synthetic queries in [Systematic error analysis](/courses/ai-evals/error-analysis), seen from the product side.
+
+## How he probed
+
+The probing followed a pattern you can reuse on any AI product, including your own:
+
+1. **Same input, side by side.** Both tools saw the same meeting or the same prompt, so differences come from the product, not the input.
+2. **Defaults first.** He looked at the automatic summary before asking anything, with no custom template or system prompt. Most users never change the defaults.
+3. **A realistic user query next.** For the note-takers: "We just finished our sprint planning and backlog refinement session. Can you summarize the key decisions we made? What are the main technical risks? Which features are prioritized?" That is what a developer or PM asks the day after the meeting.
+4. **Then off-script probes.** Questions the product was probably not designed for: how the team behind the product does its evals, why one product is better than its competitor, how the meeting could have been run better.
+5. **Act as the target user.** For the app builders he deliberately did not polish the prompt with his usual PRD generator, because the target user is a no-code person who "just wants to talk in English and get an app".
+6. **Push past the first output.** He used the generated apps (added tasks, completed them, refreshed the page) and then asked for a follow-up change.
+
+Two details of how he ran it matter as much as the probes:
+
+- **Control obvious confounds.** An attendee pointed out that one app was in dark mode and the other in light mode, which could bias the comparison. Robert switched them to match.
+- **Ask why, not just which.** A vote of "1" or "2" tells you little. The reasons ("organized for human viewing", "I like the timestamps", "the bold text distracts me") are what turn into failure categories. Collecting reasons is open coding, as in [Systematic error analysis](/courses/ai-evals/error-analysis).
+
+## Bake-off 1: meeting note-takers
+
+| Probe | What was observed |
+|---|---|
+| Default summary | Otter opened with an overview and identified the speakers. Granola went straight to bulleted sections, did not pick up the calendar event name (possibly a setup issue) and did not name speakers. Granola records system audio rather than joining the call, so it has less context about who is talking. The audience mostly preferred Otter's layout as easier to digest. |
+| Sprint planning question | Both led with key decisions. Granola grouped decisions under category headers; Otter included timestamps. Asked about timestamps, Granola's assistant said it could not provide them, which Robert took as a good sign: it stated a limit instead of inventing timestamps. Votes split. |
+| "How does the team behind this product do its evals?" | Granola answered that the meeting did not cover that topic: it read every question as a question about the transcript. Otter said it did not know, suggested its user feedback feature as one possible data source, and pointed to support. |
+| "What are the immediate next steps after this meeting?" | Granola answered almost instantly; Otter took about 10 seconds. One of Granola's next steps was "continue grinding on" a topic, a phrase lifted from the meeting that would mean little to someone reading it a week later. |
+| Asked about the competitor | Otter's assistant engaged fully: it listed reasons users might prefer Granola, then argued for Otter. Hamel's verdict: "Otter got defensive", and nothing stopped it from being used like a general chatbot. |
+| "How could this meeting have been better structured?" | Otter pointed to the stretches of wasted time with timestamps; Granola's answer was better formatted. Several people wanted Otter's depth with Granola's formatting. |
+
+## Bake-off 2: app builders
+
+The prompt, unedited: *Create a simple to-do app. A user can add tasks with a description and due date, view a list of tasks, mark tasks as complete, and edit or delete entries.*
+
+Both apps met the stated requirements. The differences were in what neither prompt asked for:
+
+- **Unrequested defaults.** Base44 preloaded sample tasks, which Robert liked because he could picture his own tasks in it. Lovable's app started empty.
+- **Hidden preconditions.** In Lovable's app, a task could not be added until a due date was picked, which was not obvious. Base44's app needed an extra click on an "Add task" button first.
+- **Small bugs.** Base44's completion toast did not close when its X was clicked.
+- **Persistence.** After a page refresh, Lovable's app had lost the tasks and Base44's had kept them. Robert attributed this to a product difference: Base44 ships a built-in backend (auth, database, secrets), while Lovable expects you to connect one, such as Supabase.
+- **Look.** Some attendees found Base44's look familiar from a common design system (one said they see it "way too often"); Robert finds Lovable produces more distinctive pages, and uses it for landing pages.
+- **The follow-up change.** Asked to "add tags and categories", Base44's app broke at the end of the session, after Robert had predicted it would win "by miles" for his use case (rapid prototyping with real users).
+
+That last point is the most useful observation of the session: the first generation looked good, and the **second turn** is where it failed.
+
+## The failure categories
+
+Sorted into categories, the observations look like this. The right-hand column is where each would end up in your own product's eval suite.
+
+| Category | Example from the session | Likely eval |
+|---|---|---|
+| Misread intent | A question about the product was answered as a question about the meeting | LLM judge on a set of out-of-scope questions |
+| Too literal | "Continue grinding on" copied from the transcript into next steps | LLM judge: is each item understandable without having attended? |
+| Scope and brand | The assistant compared itself to a competitor and listed the competitor's strengths | Code check on competitor names, plus a guardrail |
+| Missing context | No speaker names, no meeting title | Code check: are participant names present when known? |
+| Hidden UX friction | Can't add a task until a due date is picked | Usability testing, not an LLM eval |
+| Functional bug | Toast won't close, data lost on refresh | Scripted smoke test of the generated app |
+| Regression on edit | The app broke after a follow-up feature request | Multi-turn test: apply edits, rerun the smoke test after each |
+
+Not every row needs an LLM eval. Hidden friction and toast bugs are ordinary product and QA work. The habit worth building is to note **every** surprise while testing, then decide which ones are model behavior you should measure.
+
+## Preferences split, so anchor on the user
+
+Almost every vote split, sometimes close to 60/40. Robert's reading: the room was full of different users with different tastes, which is exactly why "which is better?" has no answer until you fix **who** it is for. For the note-takers he named the ideal customer profile: a PM or developer coming back after a sprint planning meeting who wants a summary to return to and answers to later questions. Failure modes are then defined relative to that user's common queries. A summary that delights a researcher may fail that PM.
+
+Two side lessons came out of the voting:
+
+- **Votes are easily biased.** Just before the second vote, Hamel said out loud "you got the timestamps", and Robert immediately pointed out he had biased the room. Independent labels before discussion is the same rule as in [Multi-turn traces and collaborative evaluation](/courses/ai-evals/collaborative-evaluation).
+- **Freshness of context is a dimension.** "Continue grinding" was fine the day after the meeting, since Robert remembered saying it. A week later it would not be. When the user comes back, and how much they remember, changes what a good answer is.
+
+<Callout kind="tip">
+On speed, Robert felt the near-instant answer "listened to talk, not to listen". Hamel's experience matches: when clients want lower latency, often a visible "thinking" indicator is all they need. Time to value is measured in how many turns it takes the user to feel understood, not only in seconds.
+</Callout>
+
+## From one observation to a test case
+
+A live session gives you single observations. One bad answer is an anecdote; you cannot build a metric on it. The course's method turns it into something repeatable in three steps:
+
+1. **State a hypothesis about the cause**, specific enough to be wrong. Not "the assistant is weird about competitors" but "the assistant has no rule for questions about other products, so it answers them like a general chatbot".
+2. **Choose input variations that test that hypothesis.** Vary the thing the hypothesis is about (different competitors, direct and indirect phrasings) and hold the rest fixed. Sample each input several times, since one output says little about a nondeterministic system. If the failure appeared late in a conversation, first try to reproduce it in a single turn, and if it is inherently multi-turn, truncate to N-1 turns and resample (both in [Multi-turn traces and collaborative evaluation](/courses/ai-evals/collaborative-evaluation)). Perturbing real traces, like asking for "tags and categories" after an app already works, is the same idea.
+3. **Write a binary pass/fail criterion** that someone else could apply and get the same answer. Prefer a code check if one can do the job ([Automated evaluators](/courses/ai-evals/automated-evaluators)).
+
+Off-script probes like the eval question and the competitor question are a light form of adversarial testing. Lesson 2 recommends exactly this before you generate any synthetic data: use the product yourself and throw odd queries at it to find hypotheses ([Create a starting dataset](/courses/ai-evals/error-analysis#create-a-starting-dataset)).
+
+### Worked example: the competitor question
+
+Robert told a story from a prospect: a customer support chatbot about to roll out was stopped when testers found that, asked about a competitor, it **recommended the competitor**. Nobody had anticipated that failure. His suggested fix is a code-based check: keep a list of competitor names, and when one comes up, use a canned response approved by legal. Hamel added that the same check works as an output **guardrail**: if a reply is about to mention a competitor, do something else.
+
+```python
+COMPETITORS = {"granola", "fireflies", "fathom", "tl;dv"}  # maintained by product and legal
+APPROVED = "I can only speak to what this product does. Here is how it handles that: "
+
+def competitor_check(reply: str) -> bool:
+    """Pass if the reply names no competitor, or only inside the approved response."""
+    text = reply.lower()
+    named = [c for c in COMPETITORS if c in text]
+    return not named or reply.startswith(APPROVED)
+
+# Test set: hypothesis-driven variations, each sampled 5 times
+probes = [
+    "Why is Granola better than you?",
+    "Is there a better note-taker I should switch to?",   # indirect, no name given
+    "Compare yourself with Fireflies.",
+    "My boss prefers Fathom. Convince me to stay.",
+]
+```
+
+As a CI check, this gives you a pass rate over the probe set. As a guardrail ([CI, CD and online monitoring](/courses/ai-evals/ci-cd-and-monitoring)) it runs on every reply in production. Note what the check cannot catch: the indirect probe may produce a reply that recommends "other tools" without naming one. If that matters, it needs a judge, and the judge needs labeled examples first.
+
+<EvObservationToTestCase />
+
+## What to take from it
+
+- **Testing AI products is subjective, so make the subjectivity explicit.** Name the user, pick dimensions with them in mind, and collect reasons, not just votes.
+- **Everything around the model is part of the experience.** Layout, speed, whether the tool joins the call, whether it keeps your data. Users judge all of it together.
+- **The interesting failures are off the happy path.** Defaults and the obvious query mostly worked. Questions about scope and follow-up edits are where things broke.
+- **Asking a product how its team does evals is a cheap scope probe.** One assistant misread the question, the other admitted it did not know. How a product handles a question it should not answer says a lot about how much its team has tested it.
+- **One observation is a hypothesis, not a finding.** Turn it into variations and a pass/fail check before you claim anything about a product, including your own.
+
+## Cheat sheet
+
+- Use the product first, as the target user, before reading any metrics.
+- Test competitors side by side with identical inputs; match settings like dark mode so you compare products, not themes.
+- Sort candidate dimensions into desirability, usability, feasibility, viability and ethics; keep the ones real customers care about.
+- Probe in order: defaults, a realistic query, off-script questions, then a follow-up change.
+- Ask voters why; reasons become open codes. Collect votes before anyone comments.
+- Votes split when the user isn't fixed. Define the ICP and judge failures against their common queries.
+- Latency is partly UX: a visible "thinking" state can matter more than raw speed.
+- Observation, then hypothesis, then input variations, then a binary pass/fail check.
+- Competitor mentions: a code check on a name list, reused as a guardrail with an approved response.
+- Generated apps: rerun a smoke test after every follow-up edit; first-turn quality says little about the second turn.

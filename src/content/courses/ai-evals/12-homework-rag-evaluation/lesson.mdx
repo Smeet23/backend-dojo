@@ -1,0 +1,240 @@
+import { EvRecipeBm25Lab } from "@/components/widgets/EvRecipeBm25Lab";
+
+## What the homework asks
+
+Homework 4 gives the Recipe Bot a retrieval step. When a user asks "How long should I roast garlic for a white lasagna with crab?", the bot should first find the few recipes in its collection that hold the answer, then use them (as inspiration or verbatim) to reply. Before wiring that into the bot, you measure whether the retriever actually finds the right recipe.
+
+The pipeline has four parts, and this lesson walks through each with code:
+
+1. **A corpus**: 200 recipes from the Food.com dataset (Majumder et al., 2019).
+2. **A retriever**: BM25 keyword search over those recipes.
+3. **A labeled query set**: synthetic questions, each tied to the one recipe that answers it.
+4. **Metrics and analysis**: Recall@1, @3, @5 and MRR, then a close look at the misses and a few attempted fixes, including LLM query rewriting.
+
+The metrics and the "generate queries from documents" idea come from [Evaluating RAG, tools and agents](/courses/ai-evals/rag-and-agents). This lesson does not re-derive them; it shows what they look like on a real, small project. The code and data live in `homeworks/hw4` of the [course repo](https://github.com/ai-evals-course/recipe-chatbot/tree/main/homeworks/hw4).
+
+The homework offers three starting points: process the raw Kaggle data yourself, start from the provided `processed_recipes.json` (200 recipes), or also start from the provided `synthetic_queries.jsonl` (200 queries) and focus on retrieval. Two tutorial walkthroughs recorded it end to end, one in Braintrust and one in Arize Phoenix. The workflow below is the same in both; the platform section near the end says what each tool made easier.
+
+## Step 1: look at the data
+
+Open the files before writing any retrieval code. Each recipe has a name, description, ingredient list, steps, tags and cooking time. Recipes are long (the median full text is about 480 words; the crab lasagna has 108 steps), which matters for BM25's length normalization later.
+
+Each line of the reference query file looks like this (fields trimmed):
+
+```json
+{
+  "query": "What temperature should I set my oven to and how long do I need to bake this sweet, yeast-based bread for it to turn out fluffy and perfectly cooked?",
+  "salient_fact": "The recipe specifies to \"preheat oven to 325°F\" ... a baking time of \"1 hour\"",
+  "source_recipe_id": 246125,
+  "source_recipe_name": "amish friendship bread"
+}
+```
+
+Three things to notice already. The query never names the dish. It mentions "yeast", which is a common word across bread recipes. And the `source_recipe_id` is the ground truth: without it there is nothing to score. The repo ships a small `query_viewer.html` for paging through the file; the notebook suggests vibe-coding your own viewer for any JSONL file, which takes a minute and pays off every time you look at data.
+
+## Step 2: build the BM25 retriever
+
+BM25 scores a recipe higher when it contains the query's words, especially words that are rare across the corpus, with a mild penalty for very long documents. The score is a ranking signal, not a probability: only the order matters. The homework uses the `rank-bm25` library.
+
+```python
+import re
+from rank_bm25 import BM25Okapi
+
+def tokenize(text):
+    # lowercase, turn punctuation into spaces, split
+    return re.sub(r"[^\w\s]", " ", text.lower()).split()
+
+def recipe_text(r):
+    return " ".join([r["name"], " ".join(r["ingredients"]),
+                     " ".join(r["steps"]), " ".join(r["tags"])])
+
+bm25 = BM25Okapi([tokenize(recipe_text(r)) for r in recipes])
+
+def retrieve(query, k=5):
+    scores = bm25.get_scores(tokenize(query))
+    top = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+    return [(recipes[i]["id"], scores[i]) for i in top]
+```
+
+Two practical touches from the walkthroughs. First, **cache the index**: pickle the BM25 object with the tokenized corpus and its size, and on reload rebuild only if the corpus size changed. Second, **log every retrieval as a trace** with the query, the returned recipe IDs, their scores and the query terms that matched. A quick smoke test ("holiday cake pops") should put the obviously right recipe on top; when it doesn't, the matched terms tell you why.
+
+<Callout kind="warn">
+The walkthrough notebook tokenizes with plain `text.split()`. That leaves punctuation glued to words, so the last word of almost every query ("bread?", "dry?") never matches anything. 188 of the 200 reference queries end in a question mark. Step 6 shows what this costs.
+</Callout>
+
+## Step 3: generate the query set
+
+The query set is generated **from the documents**, as in [Build a retrieval eval dataset](/courses/ai-evals/rag-and-agents#build-a-retrieval-eval-dataset): for each recipe, an LLM picks a specific, useful fact and writes the question a home cook would ask that needs it. The homework steers the facts toward things keyword search must get right:
+
+- **Appliance settings**: air fryer or oven temperature.
+- **Timing**: how long to marinate, rest, simmer.
+- **Temperature precision**: internal temperature for a roast.
+- **Technique details**: how to keep layers distinct, how to get crispy skin.
+
+A compact version of the generator:
+
+```python
+SYSTEM = """You write one conversational cooking question that can only be
+answered with a precise detail from the recipe below (a time, temperature,
+appliance setting or technique). Return JSON: {"query": ..., "salient_fact": ...}"""
+
+def make_query(recipe):
+    context = (f"ID: {recipe['id']}\nTitle: {recipe['name']}\n"
+               f"Ingredients: {', '.join(recipe['ingredients'][:8])}\n"
+               f"Steps: {' '.join(recipe['steps'])[:1500]}")
+    out = llm_json(SYSTEM, context)
+    return {**out, "source_recipe_id": recipe["id"]}
+```
+
+Keep the recipe ID on every row. That ID is what turns a list of questions into a retrieval eval.
+
+### Make queries hard to fake
+
+A question generated from one recipe tends to reuse that recipe's exact words, which flatters keyword search. The Braintrust walkthrough made queries harder by putting the **three most similar recipes** into the prompt next to the target. The prompt asks the model to extract one self-contained fact from the target, then write a question that only the target can answer even though the similar recipes share its vocabulary, and it includes a few example good queries for style. Generation used GPT-5 nano with temperature 0.25.
+
+One query it produced:
+
+> How long should I roast garlic for a white lasagna with crab and veggies?
+
+The target was a five-cheese crab lasagna with roasted garlic. Other lasagnas and roasted-garlic dishes exist in the corpus, but only this one combines them.
+
+### Filter before you trust it
+
+Some generated queries are unrealistic, and the two walkthroughs filtered them in different ways. Both are worth copying:
+
+| Filter | How | What it catches |
+|---|---|---|
+| **Code checks in an output parser** | Must end with "?", must be long enough, the salient fact must contain a concrete cooking signal (a number, a unit, an appliance) | Malformed JSON, vague facts, fragments |
+| **LLM realism score** | A judge rates each query on a five-point scale from very unrealistic to very realistic, with an explanation | Questions no real cook would ask |
+| **Human pass** | Review the low scorers before saving the final dataset | Judge mistakes |
+
+In the Braintrust run, the realism judge flagged one of 200 queries (scored 0.25, "somewhat unrealistic"), which was dropped, leaving 199. The Phoenix run generated about 100 queries and, when a batch produced too few valid items, nudged the temperature up slightly for more variety. As lesson 6 notes, a Likert score is acceptable here because it is a one-time filter, never a reported metric.
+
+## Step 4: score the retriever
+
+For each query, run the retriever, find the rank of the source recipe, and compute the per-query metrics. Save one record per query, not just the averages: the records are what you will read in step 5.
+
+```python
+def evaluate(queries, retrieve, k=5):
+    rows = []
+    for q in queries:
+        ids = [rid for rid, _ in retrieve(q["query"], k)]
+        rank = ids.index(q["source_recipe_id"]) + 1 if q["source_recipe_id"] in ids else None
+        rows.append({"query": q["query"], "target": q["source_recipe_name"], "rank": rank,
+                     "retrieved": ids,
+                     **{f"recall@{n}": float(rank is not None and rank <= n) for n in (1, 3, 5)},
+                     "rr": 1 / rank if rank else 0.0})
+    return rows
+
+rows = evaluate(queries, retrieve)
+summary = {m: sum(r[m] for r in rows) / len(rows) for m in ["recall@1", "recall@3", "recall@5", "rr"]}
+```
+
+Here each query has exactly one relevant recipe, so Recall@k is simply "is the target in the top k", and the mean of `rr` is MRR (counting only the top 5). For the definitions and when to prefer each, see [Retrieval metrics](/courses/ai-evals/rag-and-agents#retrieval-metrics).
+
+The README's expectation for BM25 on well-formed queries is a Recall@5 of 60 to 80 percent and an MRR of 0.4 to 0.7. The walkthrough notebook's baseline on the 200 reference queries lands inside that: **Recall@5 = 0.65, MRR = 0.49**.
+
+## Step 5: read the misses
+
+That baseline means 70 of 200 queries never put their recipe in the top 5. Averages do not tell you why, so read failures the same way you read traces in [error analysis](/courses/ai-evals/error-analysis).
+
+The notebook's first failure: "What's the best way to poach salmon so that it's perfectly cooked and not dry? I heard the timing and temperature are really important..." The target, "4th of july salmon with egg sauce", came nowhere near the top 5, behind ribs, two friendship breads and a turkey. Reading the recipe shows why: it says "poached" and "poaching", never "poach", and the query's remaining words ("timing", "temperature", "cooked") appear in almost every recipe. A Phoenix example failed the same way: "How long should the yeast dough rest before moving on to the next step?" returned three bread recipes, none of them the source.
+
+Patterns that come up when you read through the misses:
+
+- **Generic dish words.** "cake", "bread", "soup" match dozens of recipes equally.
+- **Technique words everywhere.** "temperature", "cook", "minutes" carry little signal, yet the generated queries are full of them.
+- **Word-form mismatches.** "poach" vs "poached", "grilling" vs "grill". BM25 matches exact tokens.
+- **Filler drowning content.** Queries average 32 words; "what", "how", "should", "the" all count as terms.
+- **The question doesn't identify the recipe.** "this sweet, yeast-based bread" could be several loaves. Sometimes the query, not the retriever, is the problem.
+
+Group the misses into categories like these and count them. Each category suggests a different fix, and the counts tell you which fix to try first.
+
+## Step 6: try fixes and compare
+
+Each fix becomes a variant of the retriever, and each variant runs on **the same query set** with the same metrics. Change one thing at a time.
+
+### Tokenization fixes
+
+The table below reruns the reference files (200 queries, `rank-bm25`, metrics counted over the top 5) with three cumulative tokenization changes. The first row reproduces the notebook's numbers exactly.
+
+| Variant | Recall@1 | Recall@3 | Recall@5 | MRR |
+|---|---|---|---|---|
+| Notebook baseline: lowercase, split on whitespace | 40.0% | 55.0% | 65.0% | 0.488 |
+| Strip punctuation before splitting | 47.5% | 62.5% | 69.0% | 0.553 |
+| Also drop question words and stopwords from the query | 66.5% | 80.0% | 85.0% | 0.733 |
+| Also apply Porter stemming to queries and recipes | 65.0% | 79.5% | 85.5% | 0.726 |
+
+The stopword list was 37 words: articles and pronouns plus question words such as "how", "what", "should", "best", "way", "long".
+
+Two lessons here. Boring preprocessing is worth a lot: stripping punctuation and filler raised MRR from 0.49 to 0.73 without touching the algorithm. And **a fix that rescues your favorite failure may not help overall**. Stemming moves the poached-salmon query from rank 9 to rank 1, yet the aggregate is flat because its gains and losses on other queries roughly cancel. Without the eval you would ship it on the strength of one example.
+
+### LLM query rewriting
+
+The optional part of the homework puts an LLM between the user and the retriever. The repo's `QueryRewriteAgent` (in `backend/query_rewrite_agent.py`, using `gpt-4.1-nano`) offers three strategies:
+
+- **keywords**: extract cooking methods, equipment, ingredients and specifics; drop filler.
+- **rewrite**: turn the question into a search-friendly phrase without question words.
+- **expand**: add synonyms and related terms ("poach" plus "simmer", "poached").
+
+```python
+REWRITE = """Rewrite this cooking question as a recipe search query. Use terms
+that appear in recipe titles, ingredients and steps. Remove question words.
+Query: "{query}"
+Search query:"""
+
+def retrieve_with_rewrite(query, k=5):
+    return retrieve(llm(REWRITE.format(query=query)), k)
+```
+
+Then run `evaluate` twice and compare. In the Braintrust walkthrough, on its own adversarial query set, plain BM25 scored an **MRR of about 0.92** (Recall@1 about 0.88), and BM25 with query rewriting scored **about 0.85**. The rewrite made things worse.
+
+That is a legitimate result, not a failed homework. A likely reason: synthetic queries are written from the recipe, so they already share its distinctive words, and a rewrite can paraphrase those exact words away. Real users, who don't phrase things like the recipe does, may benefit more, which is one more reason to re-check on real queries once you have logs. Notice also that 0.92 and 0.49 are not comparable: they come from different query sets with different difficulty. **Only compare variants on the same query set.**
+
+### Try it in miniature
+
+The widget is a toy version of the homework: eight recipe snippets, six synthetic queries with known targets, a real BM25 scorer, and a hand-written rewrite for each query standing in for the LLM.
+
+<EvRecipeBm25Lab />
+
+Things to try. On "Poach fish", the original wording matches nothing distinctive and the target lands at rank 2; the rewrite adds "salmon", "skillet" and "wine" and it jumps to rank 1. On "Turkey done", the rewrite generalizes "turkey" to "poultry chicken" and drops the target from rank 1 to rank 3: a rewrite can lose the one word that mattered. Overall the rewrite raises MRR from 0.72 to 0.81 here, but it helps some queries and hurts others. Then edit a query yourself: delete the filler words from "Sweet bread" and watch what happens: it barely moves (rank 2 or 3), because the query never names anything only that recipe has. Write "sweet cinnamon bread made with a starter" instead and it goes to rank 1: the missing piece was information the user never gave, which no rewrite can invent.
+
+## What each platform made easier
+
+The code above is tool-neutral. Here is what each walkthrough leaned on its platform for.
+
+**Braintrust.** The query generator was iterated in a **playground**: the prompt runs over the whole recipe dataset (with Mustache templating to loop over the similar recipes), a realism scorer runs alongside, and model settings are adjustable per run. The run was saved as an **experiment**, where low-scoring rows can be reviewed and the rest turned into a new dataset in a few clicks. For the retrieval eval, one scorer function returned Recall@1, @3, @5 and MRR together, and tagging each experiment with `query_rewrite: true/false` metadata made the comparison a matter of grouping by that field.
+
+**Phoenix.** The retriever was wrapped in a **retriever-type span**, so each trace shows the query and the ranked documents with scores, which makes failures easy to inspect one by one. Query generation used Phoenix's `llm_generate` helper to fan the prompt out in parallel over a dataframe. The query set was uploaded as a dataset and the eval run as an **experiment** with per-example evaluators, so you can sort by score and click straight from a failing row into its trace.
+
+## Beyond the metrics
+
+Two extensions shown in the walkthroughs.
+
+**LLM-judged relevance.** Recall and MRR only know about the one source recipe. The Phoenix walkthrough added a prebuilt document-relevance judge that labels each retrieved document "relevant" or "unrelated" to the query, with an explanation: 100 queries times 5 documents gave 500 judgments, from which Phoenix shows precision and hit rate for the whole project. This answers a different question ("is what we returned on topic?") and works even without ground truth, for example on production traffic. Like any judge, it needs checking against human labels before you trust its numbers ([Trusting your judge](/courses/ai-evals/trusting-your-judge)).
+
+**Wiring it into the bot.** The Braintrust walkthrough finished by giving the Recipe Bot a `find_matching_recipes` tool backed by this retriever, an optional query-rewrite flag, and a loop that keeps calling the model until it stops requesting tools. Most of the effort went into the tool's description and argument docs, which is where tool-calling quality usually starts (see [Beyond RAG: tool calling](/courses/ai-evals/rag-and-agents#beyond-rag-tool-calling)).
+
+## Common mistakes
+
+- **Generating queries without the source ID.** No ID, no metric.
+- **Comparing numbers across query sets.** 0.92 on one set and 0.49 on another says nothing about the retrievers.
+- **Reporting averages without reading misses.** The fix for "poach vs poached" and the fix for "this sweet bread" are completely different.
+- **Shipping a fix because it rescued one example.** Stemming fixed the salmon query and did nothing for the aggregate.
+- **Assuming an LLM step must help.** Query rewriting lowered MRR in one walkthrough. Measure it.
+- **Tuning only on synthetic queries.** They share vocabulary with the documents and skew easy for keyword search. Validate on real queries when you have them.
+
+## Cheat sheet
+
+- The homework: 200 recipes, BM25 retriever, synthetic (query, salient fact, source recipe ID) set, Recall@1/3/5 and MRR, then analysis and fixes.
+- Look at recipes and queries before coding; a quick JSONL viewer is worth the minute it takes.
+- Index name, ingredients, steps and tags; cache the index; log query, results, scores and matched terms per retrieval.
+- Generate queries from recipes around precise facts (times, temperatures, settings, techniques); keep the recipe ID.
+- Make queries harder by showing the generator the most similar recipes and asking for a question only the target answers.
+- Filter with code checks plus an LLM realism score, and drop the low scorers.
+- Save per-query rows (rank, retrieved IDs), not only averages. Expect Recall@5 of 0.6 to 0.8 and MRR of 0.4 to 0.7 for plain BM25.
+- Read the misses: generic dish words, ubiquitous technique words, word-form mismatches, filler, and queries that don't identify the recipe.
+- Tokenization matters: stripping punctuation and query stopwords took MRR from 0.49 to 0.73 on the reference set.
+- Compare variants one change at a time on the same query set; one rescued example is not evidence.
+- LLM query rewriting can hurt (about 0.92 to 0.85 MRR in one walkthrough), especially on synthetic queries that already share the recipe's words.
+- An LLM document-relevance judge adds precision without ground truth; validate it like any judge.

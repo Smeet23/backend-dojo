@@ -1,0 +1,242 @@
+import { EvRiskWeightedPrioritizer } from "@/components/widgets/EvRiskWeightedPrioritizer";
+
+## The talk in one picture
+
+This guest talk is by **Chris Lovejoy**, who trained and worked as a physician for about eight years, then spent seven years building AI systems for specialized domains, mostly medicine. He now works at **Anterior**, a startup of about 50 people that builds clinical reasoning tools to automate healthcare administration. He also took an earlier cohort of this course, so his framework sits on top of everything you have learned so far.
+
+Every example in the talk comes from healthcare, specifically **prior authorization**: an insurer must decide whether a requested procedure is covered, which means checking a patient's medical record against clinical guidelines. Anterior's AI, called **Florence**, answers the questions that decision depends on. Chris argues the lessons carry over to any field where frontier models lack the expertise and you need specialists to judge the output: law, finance, insurance, and so on. He doesn't give examples from those fields, so this lesson doesn't invent any.
+
+His argument in five steps:
+
+1. Most of the course's principles apply unchanged in specialized fields. Three things get harder.
+2. "Look at your data" becomes "**empower domain experts** to look at your data and turn it into something actionable."
+3. The best way to do that is often a **custom review dashboard**, designed around how experts actually review.
+4. The review data then drives prioritization, fast iteration and even **automated fixes**.
+5. Hire a **principal domain expert** early and give them ownership of the whole system, not just the labeling.
+
+The Q&A added three practical topics that matter in regulated work: data privacy and retention, living with a system that is never 100% accurate, and very long records.
+
+## When is a domain "specialized"?
+
+Some cases are obvious: you need a doctor to judge clinical reasoning and a lawyer to judge legal analysis. Others aren't. Chris's friend writes prompts for a meeting summarization company. She has no formal background in meeting summaries, yet she has clearly developed the taste to judge them.
+
+His heuristic is a question:
+
+> Could a layperson develop top-tier judgment on these outputs after working on them full-time for a couple of months?
+
+- **Meeting summaries:** yes. Two months of full-time reading and you know a good summary when you see one. Your engineers can be the reviewers.
+- **Clinical reasoning:** no. Two months of reading clinical text won't give a non-clinician the judgment needed. You need domain experts in the loop, and the rest of this lesson applies.
+
+## What gets harder
+
+Chris names three things that get harder. They map onto the course's lifecycle.
+
+| What gets harder | Where it bites |
+|---|---|
+| Defining quality and correctness | [Error analysis](/courses/ai-evals/error-analysis), and any labeled data |
+| Defining failure modes | Error analysis, then [automated evaluators](/courses/ai-evals/automated-evaluators) built on those definitions |
+| Writing prompts | The pipeline's own prompts, *and* your LLM-as-judge prompts, *and* fixes during improvement |
+
+**Correctness hides in domain meaning.** Florence was asked: "Does the patient have a prior brain MRI suspicious of multiple sclerosis?" Its answer looked reasonable and was wrong. The patient already *has* a confirmed MS diagnosis, and to a clinician a confirmed finding is no longer "suspicious". A non-clinician reading the trace would almost certainly mark it correct. A pass/fail label is only as good as the person giving it.
+
+**Failure modes need expert vocabulary.** Anterior keeps a failure mode ontology for clinical reasoning. Some of its categories:
+
+- **Retrospective reasoning:** looking at the record from the wrong point in time.
+- **Under-inferring:** failing to draw a conclusion the evidence supports.
+- **Over-inferring:** concluding more than the evidence supports.
+- **Misunderstanding the chronology:** getting the order of events wrong.
+
+Building a taxonomy like this, and then sorting failed cases into it, is the [axial coding](/courses/ai-evals/error-analysis#axial-coding-build-a-failure-taxonomy) step, done by people who can tell under-inferring from a correct cautious answer.
+
+**Prompts need domain knowledge.** That's true of the pipeline's prompts, and it's just as true of the judge prompts you write later. A judge for "misread a clinical term" needs the same precise definitions a human expert would use (see [crafting the judge prompt](/courses/ai-evals/automated-evaluators#crafting-the-judge-prompt)).
+
+## Empower experts to look at the data
+
+"Look at your data" is still the core rule. But when the data is a page of clinical notes, an engineer looking at it learns very little. Chris's updated version of the rule: **empower domain experts to look at the data and translate it into something actionable.** The expert is the translation step between raw traces and engineering work.
+
+He compared three ways to put traces in front of experts. They aren't mutually exclusive.
+
+| Option | Example from the talk | Good | Limits |
+|---|---|---|---|
+| Trace viewer in an observability tool | Langfuse, showing every LLM call's inputs and outputs | Free, complete, no build | Built for engineers; experts must scroll and piece together context |
+| Review view inside your product | A medication-adherence chatbot: the conversation on the left, an annotation panel on the right | Reviewer sees exactly what the user saw | Hard to tailor the review experience inside a customer-facing product |
+| Custom review dashboard | Anterior's own tool | Every part of the flow can be optimized | You have to build and maintain it |
+
+His recommendation: if expert review is central to your product's quality and there is a lot of context to show, **build a custom review interface**. Start with a vibe-coded version (as shown in [building one fast with an AI coding assistant](/courses/ai-evals/human-review-interfaces#building-one-fast-with-an-ai-coding-assistant)) and make it more sophisticated over time.
+
+## Designing the review dashboard
+
+Chris optimizes for three goals at once:
+
+1. **High-quality reviews**, as close to the truth as possible. This matters most. Expert-labeled datasets are small, because expert time is expensive, so every label has to count.
+2. **Speed**, so you get as many good reviews as possible per expert hour.
+3. **Actionable data**, so every review leads to something downstream.
+
+Three design principles serve those goals.
+
+**1. Show all the required context clearly.** Everything the reviewer might need must be reachable, but not all at once. Use nesting, sidebars and tabs. Anterior's layout puts the high-level context (the medical record and the guidelines) on the right, where the reviewer can browse and scroll. The left side holds the item under review: the question, the AI's answer and its reasoning.
+
+**2. Design the review sequence.** Once you know where a reviewer looks and in what order, you can remove scrolling and clicks, limit the choices on screen, show progress, and guide steps with visual cues or enforced order. Anterior didn't guess the order. The team shadowed nurses from several companies, saw a lot of variation, kept what the effective reviews had in common, and settled on this flow:
+
+1. **Case summary:** who the patient is and what procedure is being requested.
+2. **Current decision point:** the question the AI is answering right now.
+3. **Relevant evidence:** step through the parts of the medical record that bear on that question.
+4. **Verdict:** judge the AI's output.
+
+**3. Design the review to capture the data you need.** That's the next section.
+
+<Callout kind="tip">
+"Form an opinion" is the key move. Experts each have their own habits, and an interface that supports every habit supports none of them well. Watch several experts work, decide on the best sequence, and build that.
+</Callout>
+
+## What each review should capture
+
+Each review in Anterior's dashboard produces three things:
+
+| Output | How the reviewer gives it | What it is for |
+|---|---|---|
+| **Performance metric** | Mark the AI's answer correct or incorrect | Accuracy on production traffic, sliced by procedure code or case traits |
+| **Failure mode** | If incorrect, pick from the failure mode taxonomy, or write free text when nothing fits | Which failures cause the errors |
+| **Suggested improvement** | Optionally add a piece of **domain knowledge** | Raw material for fixes |
+
+For the MS case, the domain knowledge might be a short note explaining what "suspicious" means clinically and that a confirmed diagnosis isn't suspicious. Reviewers can also suggest prompt changes for a human to act on.
+
+The taxonomy comes from an earlier round of error analysis. The free-text option keeps it alive: someone regularly reads the free-text entries and decides whether the taxonomy needs a new category. This is the same idea as iterating until [saturation](/courses/ai-evals/error-analysis#iterate-until-saturation), done continuously.
+
+A review record might look like this:
+
+```python
+from dataclasses import dataclass
+from datetime import date
+
+@dataclass
+class ExpertReview:
+    case_id: str
+    customer_id: str          # never mixed across customers (see privacy below)
+    received_on: date         # drives retention
+    question: str
+    ai_answer: str
+    correct: bool             # -> performance metric
+    failure_modes: list[str]  # from the taxonomy; empty if correct
+    other_failure: str = ""   # free text when nothing fits
+    domain_knowledge: str = ""  # candidate fix, as a plain string
+```
+
+## Using the review data
+
+Chris sees three big uses for the data.
+
+**1. Prioritize engineering work.** Because every error carries a failure-mode tag, you can take the metric you care about most and break its errors down by failure mode. The biggest bar is where to spend effort first. (The next section shows why the biggest bar isn't always the most urgent one.)
+
+**2. Iterate quickly on ready-made failure datasets.** Each tagged production error becomes part of a dataset for its failure mode. These datasets are real, recent production data: not synthetic, not stale. You can hand an engineer "here are the 50 cases of this failure mode from last week; the score is 0% because they all failed; iterate until it climbs." Then you track every failure mode's score across pipeline versions. A fix should make its own failure mode's score jump without lowering any of the others. This is the [CI safety net](/courses/ai-evals/ci-cd-and-monitoring#ci-a-safety-net-against-regressions) built from expert-labeled production cases.
+
+**3. Automate some improvements.** If domain knowledge is stored as plain strings that the pipeline injects into its prompts, a reviewer's suggestion can become a candidate fix automatically:
+
+```python
+def try_domain_knowledge(candidate: str, kb: list[str], suites: dict) -> bool:
+    """Ship a reviewer's knowledge snippet only if it helps and breaks nothing."""
+    trial_kb = kb + [candidate]
+    target = suites["failure_mode"]          # the cases this snippet targets
+    if score(target, trial_kb) <= score(target, kb):
+        return False                          # did not fix anything
+    for name in ("regression", "performance"):
+        if score(suites[name], trial_kb) < score(suites[name], kb):
+            return False                      # fixed one thing, broke another
+    kb.append(candidate)                      # goes live
+    return True
+```
+
+The loop is fast. A case comes through production, a reviewer looks at it 20 minutes later and adds a knowledge snippet, the evals run, and the fix is live. In some cases a production failure is fixed **in under an hour**. You can also put a human approval step before going live.
+
+<Callout kind="warn">
+This loop is only as safe as the suites that gate it. If your regression and performance sets are thin, an automatic fix can pass every check and still cause harm. In a high-stakes domain, start with human approval of each candidate and automate only after the gates have proven reliable.
+</Callout>
+
+## Frequency is not the whole risk
+
+The talk's prioritization chart ranks failure modes by **how many errors** each causes. In a high-stakes domain you also need to know **what each error costs**, and that depends on how the system is deployed.
+
+In the Q&A, Chris was asked how to handle the expectation that medical AI can never be wrong. His answer: it will be wrong, so design the deployment around that. Prior authorization traditionally has junior nurses review cases and escalate anything they are unsure about to a senior nurse or a doctor. Florence slots in at the bottom of that hierarchy. If it can find a way to approve the care, the patient gets it much faster than a human could manage. **If it can't, it escalates to a human instead of denying.**
+
+That choice changes the cost of each error:
+
+- An error that pushes toward **"criteria met"** can approve care the guidelines don't support. No human sees it. That's expensive.
+- An error that pushes toward **"criteria not met"** sends the case to a nurse, who catches it. That costs reviewer time, not patient harm.
+
+So the same failure counts can lead to opposite priorities depending on deployment. The widget makes this concrete. Its counts and severities are illustrative, not Anterior's numbers. Weighting by severity is this course's extension of the talk's chart. The idea behind it, that the escalation path determines how bad an error is, comes from the Q&A.
+
+<EvRiskWeightedPrioritizer />
+
+Two habits follow:
+
+- **Tag direction, not just category.** If you can, record which way each error pushes the decision. One failure mode can be harmless in one direction and dangerous in the other.
+- **Report error rates by direction.** "93% accurate" hides whether the 7% are extra escalations or unsupported approvals. Report the two rates separately, and when a judge produces them, correct each one for judge error as in [Trusting your judge](/courses/ai-evals/trusting-your-judge).
+
+## Data privacy and retention
+
+The first Q&A question: health records are regulated, and leadership is often wary of letting anyone look at them. How do you get experts reviewing production data at all? Chris's answers:
+
+- **Settle it in the contract, early.** Customers new to LLM vendors often don't know what to ask for about data. Steer them toward terms that allow evaluation, and do it while negotiating. This is one more reason to have the domain expert on board early.
+- **Frame review as quality assurance.** Anterior's agreements cover keeping data for evaluation as part of quality assurance and quality improvement.
+- **Never mix data between customers.** Datasets and reviews stay separated by customer.
+- **Agree explicit retention windows,** and honor them in your eval datasets.
+
+Retention changes how you build eval sets. If the agreement says three months, a failure-mode dataset from three months ago has to be deleted. You can't keep a frozen golden set forever, so you need continuous production review to keep regenerating fresh datasets. Done that way, regulation and good practice point the same direction: datasets built from recent production traffic are also the most representative.
+
+```python
+from datetime import date, timedelta
+
+def usable_reviews(reviews, customer_id, retention_days, today: date):
+    cutoff = today - timedelta(days=retention_days)
+    return [r for r in reviews
+            if r.customer_id == customer_id and r.received_on >= cutoff]
+```
+
+The host added that putting a disposal timeframe in contracts works well across many high-stakes domains, not only medicine.
+
+## Very long records
+
+Medical records can run to hundreds of pages, sometimes over a thousand. Chris's experience: up to a couple of hundred pages, a long-context model handled the whole record without losing performance. Beyond that, performance degraded, and the problem became a retrieval problem.
+
+Anterior built an explicit **structural map** of each record: a summary of each clinical encounter and what information it contains. It then used retrieval, either semantic similarity or traversing that structure, to find the right context before answering. Evaluate that retrieval stage on its own, as in [Evaluating RAG, tools and agents](/courses/ai-evals/rag-and-agents#evaluate-retrieval-first-then-generation). In a vertical, the retrieval labels ("which encounter answers this question?") need expert input too.
+
+## Hiring the principal domain expert
+
+The final section is about people. Chris strongly endorses the [benevolent dictator](/courses/ai-evals/collaborative-evaluation#the-benevolent-dictator): one **principal domain expert** who acts as the directly responsible individual for what "correct" means. When correctness is uncertain, they decide, they're accountable for the decision, and the team moves on. No decisions by committee.
+
+They are well placed to decide because they build the strongest intuition for how the AI behaves: they review the most outputs, they bring the expertise, and they often tweak prompts themselves. So:
+
+- **Hire them as early as possible.** They shape the system, and the Q&A showed they shape customer contracts too.
+- **Give them ownership.** Don't hire someone only to review. Ask them to help design the system around the data.
+
+As the system scales, the principal expert's job grows well beyond reviewing:
+
+| Responsibility | Helpful background |
+|---|---|
+| Hire and manage a team of reviewers | Management experience; industry network for recruiting |
+| Define the sampling strategy (which cases to review) | Statistics or data science |
+| Analyze review data; check reviewers are aligned and consistent | Statistics or data science (see [measuring agreement](/courses/ai-evals/collaborative-evaluation#measuring-agreement)) |
+| Steer product development and prioritize engineering work | Product or startup experience |
+| Talk to customers and translate their needs | Communication skills |
+| Improve the AI directly via prompts and domain knowledge | The domain expertise itself |
+
+Nobody has all of these. In practice, hire someone with the domain expertise and a few of these skills, then pair them with others: a data scientist for sampling and reviewer monitoring, or someone with a stronger industry network to build the review team.
+
+<Callout kind="remember">
+Your eval quality is capped by your reviewers' judgment, and in a specialized domain that judgment is the scarcest resource you have. The dashboard, the taxonomy and the principal expert are all ways to spend expert time well.
+</Callout>
+
+## Cheat sheet
+
+- **Two-month test:** if a layperson couldn't develop top-tier judgment after a couple of months full-time, you need domain experts reviewing.
+- Three things get harder: **defining correctness**, **defining failure modes**, and **writing prompts** (judge prompts included).
+- Updated maxim: **empower domain experts to look at the data** and turn it into action.
+- Trace viewer, then in-product view, then **custom dashboard** when expert review is central; start vibe-coded.
+- Dashboard goals: **quality first**, then speed, then actionable data. Show context clearly, design the review sequence (shadow experts, form an opinion), capture what you need.
+- Each review yields **correct/incorrect**, a **failure-mode tag** (plus free text), and optional **domain knowledge**.
+- Tagged production errors become **ready-made failure-mode datasets**; track every mode across versions to catch regressions.
+- Domain knowledge stored as strings can be **auto-tested and shipped**: a production failure fixed in under an hour.
+- Weigh failures by **severity as well as frequency**; the escalation design (approve or escalate, never deny) decides which errors are cheap.
+- Privacy: settle data terms **in the contract**, frame review as **QA**, **never mix customers**, honor **retention windows** by regenerating eval sets from recent production.
+- Records past a couple of hundred pages: build a **structural map** and treat it as retrieval.
+- Hire a **principal domain expert** early, give them ownership, and pair them with complementary skills.

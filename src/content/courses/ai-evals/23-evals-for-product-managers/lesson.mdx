@@ -1,0 +1,188 @@
+import { EvEvalDisagreementTriage } from "@/components/widgets/EvEvalDisagreementTriage";
+
+## The talk in one picture
+
+This guest talk is by **Teresa Torres**, a product discovery coach and author of *Continuous Discovery Habits*, who took the first cohort of this course. When the course started she "barely knew what an eval was". By the time of the talk she had several automated evals running against a real AI product, some of them as production guardrails, and was shipping that product to beta customers.
+
+What makes the talk useful is not that she found new techniques. She applied the course's method almost exactly, but as a **product manager with deep domain expertise and modest coding experience**, and she was honest about the detours. The lessons that follow from her story:
+
+- Domain expertise decides what a good eval looks like. Her best evaluator came from knowing which mistakes students make, not from knowing how to prompt.
+- Keep the tooling you have to learn small at every step. She started in Airtable and a single notebook, not an eval platform.
+- Measure a failure before you fix it, then measure again. Her best fix took one failure from 81% of transcripts to 3%.
+- LLMs are the tutor that makes this possible for a non-engineer, as long as you understand every line you run.
+
+She worked on her own project instead of the homework, applying each week's lesson to it the same week. That is the structure of this lesson too.
+
+## The product: an interview coach
+
+Teresa teaches product teams to interview customers. In her course, students interview each other and give feedback using a rubric. The problem: students are not experts, so their feedback isn't either. Her question was whether an LLM could model what expert feedback looks like.
+
+The **interview coach** takes the full transcript of a practice interview and returns detailed feedback on four dimensions from the course rubric:
+
+| Dimension | What a good interviewer does |
+|---|---|
+| Story-based question | Opens by asking for a specific story about past behavior |
+| Setting the scene | Asks the participant to set the scene, which helps memory recall |
+| Building the timeline | Walks the participant step by step through what happened |
+| Redirecting generalizations | Pulls the participant back when they drift into "what I usually do" |
+
+Each dimension gets a score (**keep practicing**, **getting it**, or **great**) and a series of **excerpts** quoted from the transcript, each paired with a **tip**. Some tips suggest a better question the interviewer could have asked. That detail matters: most of her serious failures lived in those suggested questions.
+
+The first prototype was a Claude project with the rubric and course material uploaded and one instruction: here's a transcript, give feedback. By the time of the talk it was a workflow of five to nine LLM calls, depending on the transcript. She built it on AWS Lambda functions orchestrated with Step Functions, because she had never had a dev environment and didn't want to manage servers.
+
+## Step 1: look at traces in a tool you already know
+
+While vibe checking she noticed that every prompt tweak made some outputs better and others worse. As someone who teaches feedback loops for a living, that bothered her: she had no feedback loop of her own.
+
+Her starting dataset was small and real: roughly 15 interviews she had conducted herself, about 10 from her instructors and about 10 that alumni let her use. No synthetic data; she had tried generating transcripts and found it hard to make them realistic.
+
+She stored the traces in **Airtable**, because she already knew it. An Airtable interface became her first annotation tool: the trace, a free-text notes box, a field for failure modes, and a "reviewed" checkbox that hid finished traces. That is the open coding and axial coding loop from [Systematic error analysis](/courses/ai-evals/error-analysis), with no new software.
+
+<Callout kind="remember">
+Her rule for the whole project: **limit how much you have to learn in each step.** Eval platforms looked overwhelming, and she already had plenty to learn. A familiar database was enough to start, and the instructors agreed it is a good default.
+</Callout>
+
+The result of the first pass was humbling. Looking at the list of failure modes, her reaction was that the coach "sucks", even though vibe checks had convinced her it was pretty good. This is the most common first discovery in error analysis, and it only comes from reading traces one by one.
+
+## Step 2: the first two evals
+
+From the failure modes she picked the two that were **catastrophic for a teacher**: cases where the coach reinforced exactly the mistakes students already struggle with.
+
+1. **The coach suggests a leading question.** A leading question implies its answer ("Wasn't that frustrating?"). Recommending one teaches bad technique.
+2. **The coach suggests a general question.** "Tell me about your typical morning routine" invites generalizations, which are unreliable. Her course teaches the specific version: "Tell me about your morning routine *this* morning."
+
+She wrote both on a Sunday evening, in a Jupyter notebook her husband suggested after Apple Notes turned her pseudo-JSON quotes into smart quotes.
+
+### Leading questions: an LLM judge
+
+Spotting a leading question needs interpretation, so this became an [LLM-as-judge](/courses/ai-evals/automated-evaluators). The prompt explains what a leading question is, receives the list of questions the coach suggested, and fails the test if any of them is leading. She iterated on what the judge sees: all questions at once, one question at a time, or the full coach response. She kept whichever version agreed best with her own labels.
+
+### General questions: a keyword check
+
+The general question failure looked like it needed a judge too. Would she have to explain specific stories and the human tendency to generalize? Then she noticed that a small set of words reliably signals a general question, and wrote a **code check** for them. The list below is illustrative; she didn't show hers, only said it grew over time.
+
+```python
+import re
+
+# Illustrative red-flag list; extend it as new misses show up in annotation.
+RED_FLAGS = ["typically", "usually", "normally", "generally", "in general", "tend to"]
+PATTERN = re.compile(r"\b(" + "|".join(RED_FLAGS) + r")\b", re.IGNORECASE)
+
+def suggests_general_question(suggested_questions: list[str]) -> bool:
+    """Fail if any question the coach recommended asks about typical behavior."""
+    return any(PATTERN.search(q) for q in suggested_questions)
+```
+
+This "very elementary" check turned out to have the best alignment of anything she built: in her words it never has false positives and catches almost everything she catches. Both evals were still in production at the time of the talk.
+
+<Callout kind="tip">
+Hamel Husain's comment was that an engineer would almost certainly have built an LLM judge here. Seeing that a word list is enough required years of watching students make this exact mistake. That is the argument for product managers and domain experts being **involved in designing evals**, even if they don't write the code. The engineering rule (prefer code when it can do the job) is in [Automated evaluators](/courses/ai-evals/automated-evaluators#code-based-evaluators); knowing *when* it can do the job is domain knowledge.
+</Callout>
+
+## Step 3: helper functions, extract once and judge many times
+
+Several failure modes concerned the coach's suggested questions, so her evals didn't need the transcript at all. She split the input preparation into **helper functions**:
+
+- A plain-code helper parses the coach's JSON and pulls out every tip.
+- An LLM helper extracts the suggested questions from those tips.
+
+The evals then receive only the questions. This started as ordinary decomposition (two evals needed the same input), and turned out to pay off three ways:
+
+| Benefit | Why |
+|---|---|
+| **Cheaper and faster** | The expensive LLM extraction runs once per transcript and is cached. Changing an eval doesn't change its inputs, so only the small eval calls rerun. |
+| **Better judges** | A judge that sees only what it needs has less to get confused by. The instructors called this context engineering. |
+| **Easy experiments** | Swapping "full output" for "questions only" or "one question at a time" is a one-line change, which is how she found the most aligned variant. |
+
+The one thing to watch: a helper is code too, and it can be wrong. That showed up on the first run.
+
+## Step 4: run everything and read the table
+
+With help from ChatGPT she exported the Airtable traces to CSV, loaded them with pandas, and wrote a cell that ran all five evals over all traces: one row per trace, one column per eval. She did this without knowing Python beforehand, asking the model to explain each line before she ran it.
+
+The first table told her four different things:
+
+1. **The two catastrophic failures were real and frequent**, about 20 to 25% of transcripts each. Now she could size the problem.
+2. **One eval failed almost every trace.** Digging in, the coach was fine: one of her helper functions had a bug and fed the eval bad input.
+3. **Another eval flagged a failure very often, and the eval was right.** This was a "greedy dimension" failure: the setting-the-scene feedback would criticize a good building-the-timeline question as a poor scene-setting question. Writing the eval forced her to define the failure precisely, but her human labeling rubric had never been that precise. The eval was better than her labels, so she changed how she labels.
+4. **Judge agreement with her labels was hit or miss.** She had ChatGPT write a function comparing her labels to each eval's output, the start of the alignment work in [Trusting your judge](/courses/ai-evals/trusting-your-judge).
+
+The second and third points are the ones people miss. When an eval disagrees with you, the eval is not automatically the thing that's wrong. She built notebook cells to put the trace, the helper output, the eval's verdict and reasoning, and her own label side by side, and asked of each disagreement: is it the helper, the eval, my label, or a real failure?
+
+<EvEvalDisagreementTriage />
+
+All of this, from first annotations to a scored first run, took her from Sunday to Thursday of one week.
+
+## The feedback loop she was missing
+
+With evals in place, every change goes through the same loop: model, prompt, temperature, chunking strategy, and later whole workflow changes.
+
+1. Run the evals on the dev set (built from production traces) with the current production version.
+2. Run them again with the change.
+3. Compare the two tables.
+
+Her observation is the important part: **it is never totally better or totally worse.** Some evals improve a little, one gets a little worse, and she makes a judgment call on whether to release. The evals don't make the decision; they make the trade-off visible. Weighing a regression on a catastrophic failure against gains on minor ones is a product decision, which is a natural fit for a PM. The broader version of this loop is in [CI, CD and online monitoring](/courses/ai-evals/ci-cd-and-monitoring).
+
+## Where the setup ended up
+
+About four months in, her setup had grown up but kept the same shape:
+
+- **Evals live in the product repo** as production code, because some run as guardrails and some run on a percentage of live traces. Claude Code wrote an A/B runner that runs every trace through production and through the change. There are evals that cross dimensions and evals for single dimensions.
+- **The notebook is now only an analysis tool.** It imports the production eval code instead of containing it. It runs and caches the helpers for the dev set (rerun only when a helper changes), reruns one eval or all of them, plots results, and has a small picker: choose a transcript and see what each helper extracted and what each eval returned. Another section scores each judge against her annotations.
+- **About half a dozen custom annotation tools**, generated by Claude Code: progress bar, color-coded trace sections, failure mode list, keyboard shortcuts. Some annotate whole traces, some single questions. When an eval needs a new input or output format she asks for a new tool, and gets it in minutes. The principles are the ones in [Interfaces for human review](/courses/ai-evals/human-review-interfaces).
+- **The chat itself as an annotation interface.** For a batch of questions she had Claude show her one at a time and typed back the failure mode: about 100 items in under ten minutes.
+
+She was explicit about one distinction. The **annotation tools she vibe codes**: she doesn't know how they're implemented, she just checks inputs and outputs. **Eval and product code she pair programs**: she discusses approaches with the model, plans before any code changes, and won't run anything she doesn't understand. Whenever she gave the agent a longer leash, "things go horribly wrong". She quoted Andrej Karpathy's preference for four-line diffs over thousand-line diffs, and asked the model to update the notebook's markdown and README files after sessions so she could get back up to speed later.
+
+## Case study: repeated excerpts, 81% to 3%
+
+Running two cohorts in one month brought more traces than ever, and a new failure appeared: **the same excerpt used across dimensions**. The setting-the-scene section would praise an excerpt, and the building-the-timeline section would criticize that same excerpt. That is confusing for a student, and it was her first failure mode that **spanned several LLM calls**.
+
+What happened next follows the analyze, measure, improve loop from [Evals fundamentals](/courses/ai-evals/evals-fundamentals) closely:
+
+1. **Measure first.** The excerpts weren't character-for-character identical, so a plain equality check wouldn't catch them. She first had to design an eval that detects the failure at all. It fired on **81%** of transcripts.
+2. **A dead end.** Her first fix was a question classifier that would send each dimension only its relevant questions. After a day and a half it was still ambiguous and hard, with too few questions to work with.
+3. **Step away.** Over dinner a simpler idea came up: pass each later call the list of excerpts already used, and tell it not to reuse them.
+4. **Test it like a workflow change**, not a prompt change, through the A/B runner. The failure dropped to **3%** of transcripts.
+
+Detect, fix and verify took three days. The general lesson is in [Improving accuracy and cutting cost](/courses/ai-evals/improvement-and-cost): a structural change can beat prompt tinkering, and you only know it worked because you measured the before.
+
+## Whole trace or one dimension?
+
+Her biggest design decision was splitting the original monster prompt. The single prompt kept applying one dimension's criteria to another. Splitting it into four per-dimension calls raised overall quality, and introduced new failures, like the greedy setting-the-scene dimension that judged the whole interview by its own criterion. No change makes everything better.
+
+Then she got stuck on where to do error analysis. Annotating one dimension at a time found plenty of errors, but many weren't critical, and she felt she'd be annotating forever. Her conclusion:
+
+- **Do error analysis and prioritize failure modes on the whole trace**, because the whole response is what the customer receives. Dimension-specific failures still show up, but now ranked against everything else.
+- **Annotate a single dimension only when building an eval for that dimension.**
+
+She estimated she'd spent a lot of time annotating things she didn't need to before settling on this.
+
+## Advice for PMs, and working with engineers
+
+Teresa was open that she doesn't yet know how responsibilities should split on a cross-functional team. Her working ideas:
+
+- **The PM or domain expert must shape the evals.** Not every PM will write code, but the general question check shows what's lost if the design is left to someone without the domain knowledge. Engineers, in turn, need to learn to spot evals where a domain expert would do better. (The [benevolent dictator](/courses/ai-evals/collaborative-evaluation#the-benevolent-dictator) role is the same idea from the labeling side.)
+- **Separate eval code from analysis.** Once the notebook only imports production evals, someone who never reads the code (for her, course instructors who could own their own teaching tools) can run evals, inspect failures and see charts.
+- **Learn the smallest next piece, with an LLM as tutor.** Her method was to take a step, get stuck, ask an LLM, and repeat. Prompt engineering barely matters in a conversation, because you can iterate: paste a line back and ask what it means. LLMs make it painless to ask the questions she was too embarrassed to ask as a student.
+- **Bring customer discovery into evals.** Dimensions for synthetic data should come from real customer needs, not guesses. Thumbs up or down is a start, a written reason is better, and the goal is feedback granular enough to say "this tip on this excerpt is wrong".
+- **Take breaks.** Several of her best fixes came away from the keyboard.
+
+<Callout kind="warn">
+A production surprise that isn't about evals: students began submitting **real customer interviews**, not just practice ones, into a system built on Airtable and not certified for sensitive data. She moved the product into a partner's platform (Vistaly, a product discovery tool) that already stores customer interviews under SOC 2 compliance. Once you collect traces, you are a data custodian; check what users actually send you.
+</Callout>
+
+## Cheat sheet
+
+- Start error analysis in a tool you already know (Airtable, a spreadsheet); learn one new thing per step.
+- Vibe checks hide failures. Reading traces one by one is what showed her the coach was worse than she thought.
+- Automate the **catastrophic** failures first: for a teaching tool, that's feedback that reinforces the mistakes students already make.
+- Domain expertise turns "needs a judge" into "a keyword list works": her general question check has the best alignment of all her evals.
+- Use helper functions to extract just what each eval needs, cache them, and rerun only the cheap eval calls.
+- When an eval disagrees with you, check four suspects: a helper bug, the eval, your own label, or a real failure.
+- Writing an eval sharpens your rubric; update your labeling rules when the code is more precise than you were.
+- A/B every change on a dev set from production; results are mixed, and the release call is a product judgment.
+- Measure before fixing: repeated excerpts went from 81% to 3% with a workflow change, verified in three days.
+- Prioritize failures on the whole trace the customer sees; annotate single components only when building their evals.
+- Vibe code throwaway annotation tools; pair program and understand every line of eval and product code.
+- Separate eval code from analysis so domain experts can run and read evals without touching the code.

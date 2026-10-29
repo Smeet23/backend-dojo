@@ -1,0 +1,196 @@
+import { EvTransitionMatrixBuilder } from "@/components/widgets/EvTransitionMatrixBuilder";
+
+## What the homework asks
+
+Homework 5 takes the transition failure matrix from [Evaluating RAG, tools and agents](/courses/ai-evals/rag-and-agents) and makes you build one by hand. The idea in one line: for every failed agent trace, record the **last state that succeeded** and the **first state that failed**, count each (from, to) pair, and draw the counts as a heatmap. The hot cells tell you where to start reading traces.
+
+The homework hands you the data so you can focus on the analysis. `reference_files/labeled_traces.jsonl` in the [course repo](https://github.com/ai-evals-course/recipe-chatbot/tree/main/homeworks/hw5) holds **96 traces** of a cooking-assistant agent. Every trace contains exactly one failure and is already labeled:
+
+```json
+{
+  "conversation_id": "1373de99-...",
+  "messages": [{"role": "user", "content": "What vegetarian high-protein meal can I cook tonight?"}, "..."],
+  "last_success_state": "ParseRequest",
+  "first_failure_state": "GetCustomerProfile"
+}
+```
+
+No LLM calls are needed. The deliverables are a heatmap PNG and a short write-up answering three questions: which states fail most, whether failures cluster at argument generation or tool execution, and which low-frequency transitions are surprising.
+
+This lesson walks through that workflow once, then covers the harder part the homework skips: producing those labels for your own agent. Two tool walkthroughs (one in Braintrust, one in Arize Phoenix) did exactly that, and their lessons are folded in near the end.
+
+<Callout kind="warn">
+The 96 traces are synthetic: a handful of user requests ("I need a gluten-free dinner idea for four", "Suggest a healthy breakfast using oatmeal") with failures injected at chosen steps. Treat the numbers as practice for the reading skill, not as facts about real recipe agents.
+</Callout>
+
+## The agent's ten states
+
+Before you can label anything you need a fixed list of states. The homework abstracts the agent into ten, in pipeline order:
+
+| # | State | Kind | What happens |
+|---|---|---|---|
+| 1 | `ParseRequest` | LLM | Interpret the user's message |
+| 2 | `PlanToolCalls` | LLM | Decide which tools to call |
+| 3 | `GenCustomerArgs` | LLM | Build arguments for the customer-profile tool |
+| 4 | `GetCustomerProfile` | Tool | Run the customer-profile lookup |
+| 5 | `GenRecipeArgs` | LLM | Build arguments for recipe search |
+| 6 | `GetRecipes` | Tool | Run recipe search |
+| 7 | `GenWebArgs` | LLM | Build arguments for web search |
+| 8 | `GetWebInfo` | Tool | Run web search |
+| 9 | `ComposeResponse` | LLM | Draft the answer |
+| 10 | `DeliverResponse` | Tool | Send it |
+
+Notice the pattern: each tool gets **two** states, one for the LLM generating arguments (`Gen*`) and one for executing the call (`Get*`). That split is the most useful design choice in the list. When a recipe search returns garbage, you want to know whether the model asked for the wrong thing or the search engine botched a good request. Those have different owners and different fixes.
+
+Not every trace visits every state. A request that needs no profile lookup goes straight from planning to recipe arguments. That is why the matrix has rows and columns for all ten states rather than a single funnel: the path branches.
+
+<Callout kind="tip">
+Pick states at the granularity where you would assign a fix. Ten is plenty for a three-tool agent. If you have forty tools, group them by kind (search tools, write tools) before you group by step, or the matrix becomes too sparse to read.
+</Callout>
+
+## Label each failing trace
+
+Labeling is just the "find the first failure" rule from [Systematic error analysis](/courses/ai-evals/error-analysis), applied per step:
+
+1. Read the trace from the start.
+2. Find the **first** step whose output was wrong. Everything after it is usually the agent reacting reasonably to bad input, so it does not count.
+3. The step that ran **just before it** in this trace is the last success. It is often not the previous state in the canonical list, because steps get skipped.
+
+Here are four traces from the homework set and their labels:
+
+| User request | What the trace shows | Last success | First failure |
+|---|---|---|---|
+| Gluten-free dinner for four | Parse and plan look fine; `GenRecipeArgs` logs "unable to generate appropriate recipe search parameters"; the agent asks for more restrictions | `PlanToolCalls` | `GenRecipeArgs` |
+| Vegetarian high-protein meal tonight | Parse fine, then `GetCustomerProfile` errors with "unable to access user profile"; the agent answers from general knowledge | `ParseRequest` | `GetCustomerProfile` |
+| Gluten-free dinner for four | Parse, plan, customer args and profile all succeed; `GetRecipes` returns "no gluten-free dinner recipes found that serve four" | `GetCustomerProfile` | `GetRecipes` |
+| Healthy breakfast with oatmeal | Recipe search succeeds, then `DeliverResponse` fails with a network error | `GetRecipes` | `DeliverResponse` |
+
+Two traps show up quickly.
+
+**The first error message is not always the first failure.** In the Phoenix walkthrough, the request was "suggest a healthy breakfast using oatmeal" and the final answer recommended avocado toast and a yogurt parfait. No step raised an error. Walking forward, parsing and planning were correct, but the arguments for recipe search said "healthy breakfast" and dropped oatmeal entirely. That is the first failure: `GenRecipeArgs`, not the recipe search that dutifully returned non-oatmeal recipes, and not the final response.
+
+**Skipped steps change the edge.** In one homework trace the agent goes `ParseRequest`, `PlanToolCalls`, `GenCustomerArgs`, then calls `GetRecipes` without ever generating recipe arguments. The edge is `GenCustomerArgs → GetRecipes`, an off-diagonal cell, and that oddity is itself a clue.
+
+Try both traps here. The eight traces follow the homework's style; tap the step that first went wrong in each.
+
+<EvTransitionMatrixBuilder />
+
+With only your eight labels, the matrix is too thin to say much. Add the other 88 traces and it becomes the full homework matrix, and the busiest cell and the busiest column disagree. The next sections explain why that matters.
+
+## Build the matrix
+
+Once traces are labeled, the code is a counter and a heatmap. This is essentially the homework's starter script:
+
+```python
+import json
+from collections import Counter
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+STATES = ["ParseRequest", "PlanToolCalls", "GenCustomerArgs", "GetCustomerProfile",
+          "GenRecipeArgs", "GetRecipes", "GenWebArgs", "GetWebInfo",
+          "ComposeResponse", "DeliverResponse"]
+idx = {s: i for i, s in enumerate(STATES)}
+
+traces = [json.loads(line) for line in open("reference_files/labeled_traces.jsonl") if line.strip()]
+counts = Counter((t["last_success_state"], t["first_failure_state"]) for t in traces)
+
+m = np.zeros((len(STATES), len(STATES)), dtype=int)
+for (frm, to), n in counts.items():
+    if frm in idx and to in idx:          # skip malformed labels instead of crashing
+        m[idx[frm], idx[to]] += n
+
+sns.heatmap(m, annot=True, fmt="d", cmap="Reds",
+            xticklabels=STATES, yticklabels=STATES, square=True)
+plt.xlabel("First failure state")
+plt.ylabel("Last success state")
+plt.savefig("results/failure_transition_heatmap.png", dpi=300, bbox_inches="tight")
+```
+
+Two habits worth keeping. Fix the axis order to the pipeline order, never alphabetical or by frequency, so the diagonal means "the next step broke" and anything far from it means steps were skipped. And annotate the cells with counts: a color scale alone hides whether the hot cell is 4 or 40.
+
+## Read the heatmap
+
+Over the 96 traces there are 31 distinct non-zero cells. The five largest:
+
+| Last success | First failure | Count |
+|---|---|---|
+| `PlanToolCalls` | `GenRecipeArgs` | 10 |
+| `GetCustomerProfile` | `GetRecipes` | 9 |
+| `GenCustomerArgs` | `GetRecipes` | 8 |
+| `GenCustomerArgs` | `GetCustomerProfile` | 7 |
+| `GetCustomerProfile` | `GenRecipeArgs` | 7 |
+
+Read it three ways.
+
+**Column sums: which state fails.** `GetRecipes` 32, `GenRecipeArgs` 20, `GetCustomerProfile` 13, `GenWebArgs` 8, `GenCustomerArgs` 7, then `GetWebInfo`, `ComposeResponse` and `DeliverResponse` at 5 each, and `PlanToolCalls` 1. The recipe path alone (`GenRecipeArgs` plus `GetRecipes`) accounts for 52 of 96 failures, more than half.
+
+**Single cells: in which context.** The hottest cell is `PlanToolCalls → GenRecipeArgs` (10), but the hottest column is `GetRecipes`. Both are true and they point at different reading lists. The cell says: when the planner hands off to recipe argument generation, that step breaks, so read the planner's output in those 10 traces and check whether the plan was clear enough to build arguments from. The column says recipe search is the most common failing step overall.
+
+**Distance from the diagonal: skipped steps.** Break the `GetRecipes` column down by row: only 7 of its 32 failures come right after `GenRecipeArgs` succeeded. The other 25 come after `GetCustomerProfile` (9), `GenCustomerArgs` (8), `PlanToolCalls` (6) or `ParseRequest` (2). In other words, most recipe-search failures happen in traces where recipe arguments were never generated (or never logged). That moves the suspicion upstream: maybe the planner is calling search with leftover customer arguments, or the instrumentation is missing a span. Either one is worth knowing, and neither shows up in a plain per-step failure count.
+
+The homework also asks whether failures cluster at argument generation or execution. Counting only the three tool pairs, `Gen*` states fail 35 times (7 + 20 + 8) and `Get*` states 50 times (13 + 32 + 5). The walkthrough notebook puts all LLM states on one side (41) and all execution states including `DeliverResponse` on the other (55). Either way execution looks worse, but given the skip pattern above, be careful before concluding "the tools are broken": a tool fed bad or missing arguments fails at execution time.
+
+<Callout kind="remember">
+The matrix tells you **where to read**, not **why it failed**. A hot cell is a list of trace IDs to open. The root cause can sit in either state of the pair, or further upstream.
+</Callout>
+
+Finally, the rare cells. `DeliverResponse` failures (5) are network errors after a good draft: an infrastructure fix, not a prompt fix. `PlanToolCalls` almost never fails first (1), which is reassuring, but its row is the busiest (31 traces last succeeded there), so its outputs are worth auditing anyway: a plan can "succeed" and still set up the next step to fail.
+
+## From hotspots to fixes
+
+Turn each hotspot into a hypothesis, a set of traces to read, and a candidate fix:
+
+| Hotspot | Hypothesis to check by reading traces | Candidate fix |
+|---|---|---|
+| `PlanToolCalls → GenRecipeArgs` (10) | The plan says "search recipes" without carrying the constraints (gluten-free, serves four), so argument generation has nothing to work with | Make the plan a structured object with the parsed constraints; give the arg-generation prompt the parse output directly |
+| `GetRecipes` column (32), mostly off-diagonal | Search is called without proper recipe arguments, or the arg step is not traced | Enforce `GenRecipeArgs` before `GetRecipes` in code; validate arguments with a schema; add the missing span |
+| `GenCustomerArgs → GetCustomerProfile` (7) | Profile lookup is flaky or the ID argument is malformed | Check error logs for timeouts versus bad IDs; add retries for the former |
+| `DeliverResponse` column (5) | Transport errors after a good draft | Retries and alerting; not an LLM problem |
+
+Then apply the fixes, rerun the same inputs, label again and rebuild the matrix. A fix that worked empties its cell, and often a failure that was hiding behind it appears further down the pipeline, exactly as the funnel widget in [lesson 6](/courses/ai-evals/rag-and-agents) shows. Over a few rounds the matrix should get sparser.
+
+The write-up for the homework can be short. Something like: "52 of 96 failures are on the recipe path. The top cell is planning to recipe arguments (10): plans lack the user's constraints. 25 of 32 search failures follow a state other than `GenRecipeArgs`, so we suspect the agent skips argument generation; next step is to read those 25 traces. Delivery failures (5) are network errors and go to infra."
+
+## Producing the labels on your own agent
+
+The homework gives you labels. On a real agent you have to create them, and that is where the two tool walkthroughs spent most of their time. The workflow is the same in any tracing platform:
+
+1. **Instrument each state as its own span**, tagged with the state name. In Braintrust, the presenter (Wade Gilliam) decorated each step function with the tracing decorator and logged an `agent_step` metadata field on the span (query rewrite, the main LLM call, the recipe-search tool). In Phoenix, the presenter (Priyan) gave each state its own span name, so a query for spans named `GenRecipeArgs` returns exactly that state across all traces.
+2. **Run the agent on a fixed dataset** using the production code path, not a copy of it. The Braintrust walkthrough reused a curated set of 135 user queries and called the real `get_agent_response` function, since a reimplemented agent for testing can drift from what ships.
+3. **Score each state**, plus the final result. Code checks where they suffice (valid JSON in tool calls, errors raised), and narrow LLM judges where they do not. The Phoenix walkthrough wrote one judge per state, because each state has different success criteria: the `GenRecipeArgs` judge checks that every constraint from the parsed request made it into the search filters, which is what caught the missing oatmeal. The usual judge-writing rules from [Automated evaluators](/courses/ai-evals/automated-evaluators) apply: instructions before the data, explanation before the label, and an explicit list of minor discrepancies that are **not** failures, so the judge does not flood you with false positives.
+4. **Derive the two labels per trace.** Pull the spans back out (Braintrust's SQL-like query language, Phoenix's span queries), order them by time, and take the earliest failing state. The state just before it is the last success.
+5. **Build the matrix** exactly as above.
+
+A few decisions you have to make yourself in step 4:
+
+- **What counts as a failure.** The Braintrust walkthrough used "an exception was raised, or any score on the span is below 1". That is a reasonable start, but a judge that is wrong 20% of the time will put 20% noise in your matrix. Validate step judges against human labels before trusting the heatmap, as in [Trusting your judge](/courses/ai-evals/trusting-your-judge).
+- **Multiple failures per trace.** Per-state judges flag every bad step, not just the first. In the Phoenix run, about a third of traces passed every state and most of the rest had **several** failing states. Keep only the earliest one per trace, or you are back to counting cascades.
+- **Trace-level failures with no step to blame.** If only the end-to-end score fails (say, the answer ignores a dietary restriction but every step judge passed), you need a convention. The Braintrust walkthrough put these on the `DeliverResponse → DeliverResponse` diagonal (7 traces in its run). That keeps them visible, but it also says your step judges are missing a failure mode: read those traces and add one.
+
+What each platform made easier, briefly. Braintrust's online scoring rules attach scorers to specific spans (a retrieval scorer on the search span, a JSON validity check on LLM tool calls, final-answer scorers on the root span), a rule can be test-run before saving, and its query sandbox generates the Python snippet to fetch the same data. Phoenix runs locally, its span queries by name make per-state evaluation natural, it logs the judge results back onto the spans and can roll them up to the root trace so all seven verdicts sit in one place, and it batches judge calls concurrently. Neither changes the analysis.
+
+<Callout kind="tip">
+Both walkthroughs then fed the evidence to an LLM: the Braintrust presenter had a coding assistant draft the findings summary from the matrix and logs, and the Phoenix presenter passed every `GetWebInfo` span with its judge explanation to a model and asked for recurring failure patterns, fixes and unit tests. It works well as a first draft. The judge's explanations are what make it possible, which is one more reason to ask judges for them.
+</Callout>
+
+## Common mistakes
+
+- **Labeling the last broken-looking step.** Final responses look wrong in almost every failed trace. Attribute to the first failure.
+- **Taking `last_success` as the previous state in the list.** Use the previous state in **this trace**. Skips are signal.
+- **Reading only column sums.** The column says which state fails; the cell says after what. The top cell and the top column disagree in this very dataset.
+- **Treating the heatmap as the root cause.** It is a pointer to trace IDs. Open them.
+- **Trusting unvalidated step judges.** Judge errors become fake hotspots.
+- **Alphabetical axes.** Keep pipeline order so the diagonal means something.
+
+## Cheat sheet
+
+- Define a fixed list of pipeline states, splitting each tool into argument generation (LLM) and execution.
+- For each failed trace, label the first failing state and the state that ran just before it in that trace.
+- Count (last success, first failure) pairs into a states-by-states matrix and plot it as an annotated heatmap in pipeline order.
+- Column sums show which state fails most; single cells show the context; off-diagonal cells reveal skipped steps.
+- In the homework data the recipe path is 52 of 96 failures, the top cell is `PlanToolCalls → GenRecipeArgs` (10), and 25 of 32 search failures skip argument generation.
+- Every hotspot becomes a list of traces to read, then a hypothesis, then a fix, then a rebuilt matrix.
+- On your own agent: tag each state's span, run production code on a fixed dataset, score each state, keep only the earliest failure per trace.
+- Validate step judges before trusting the heatmap, and give trace-level failures with no blamed step their own visible bucket.

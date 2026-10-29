@@ -1,0 +1,224 @@
+import { EvMaturityStageCheck } from "@/components/widgets/EvMaturityStageCheck";
+
+## The talk in one picture
+
+This guest talk is by David and Dhruv of **Pi Labs**, a company that builds small scoring models for evaluation. David previously worked on Google Search, and much of the talk's framing comes from there. Their stance is close to this course's: evaluation is a **data science question, not a tooling question**, and a spreadsheet is enough tooling to start.
+
+Their main claim is that evaluation does not change shape as a product matures. A team running its very first eval and Google Search, with billions of queries a day, ask the same three things:
+
+1. **What do we mean by good?**
+2. **What inputs do we measure over?**
+3. **How do we turn a response into a number?**
+
+What changes is the quality of the evidence behind each answer. Early on, "good" is a hunch written into a system prompt. Years later it is hundreds of thousands of user ratings. The talk walks through three anonymized client case studies, each at a different point on that curve, plus a look at what becomes possible once you fully trust your scores.
+
+Pi's own product came up throughout. This lesson keeps the transferable method and mentions the product only where it explains a design choice.
+
+## Three artifacts that mature together
+
+The speakers organize everything around three artifacts. Each one gets better as you collect more evidence from real users.
+
+| Artifact | Pre-launch | Early product | Mature product |
+|---|---|---|---|
+| **Definition of good** | PRDs, system prompts, expert-written principles | Examples labeled by your team, experts or a paid labeling vendor | Explicit user feedback, thousands to hundreds of thousands of ratings |
+| **Sample** (test inputs) | Synthetic cases designed to cover behaviors | Real user queries | Meaningful slices of real traffic, chosen on purpose |
+| **Scoring** | Rules extracted from docs, checked on your own labels | Scores that react when the system changes | Scores that predict what users prefer |
+
+Two words in that table carry weight. A **meaningful** sample is not always a random percentage of traffic: if you are chasing a particular behavior, you oversample the slice where it happens (the same idea as stratified trace selection in [Interfaces for human review](/courses/ai-evals/human-review-interfaces)). And a **meaningful** user preference is one you actually want to optimize for, which matters at the end of this lesson.
+
+As the definition of good moves from internal hunches to user feedback, internal people step out of the labeling loop. They do not vanish: the team still keeps a written set of principles that feedback alone can't override.
+
+## Four stages, four questions
+
+Each maturity stage adds one question you should be able to answer "yes" to about your metrics.
+
+| Stage | Question about your scores | How you check it |
+|---|---|---|
+| 1. Pre-launch | **Accurate:** do they tell good from bad, judged by your own labels? | Deliberately degrade good responses and see which scores fall |
+| 2. Post-MVP | **Discerning:** do they change when the responses change? | Score outputs from two models or prompts on real queries |
+| 3. Scale | **Aligned:** do they predict what users say? | Compare scores against thumbs up, meh and thumbs down |
+| 4. In the loop | **Trusted enough to act on automatically** | Use scores for ranking, best-of-n, or as a reward model |
+
+The questions stack. Discerning scores that are inaccurate just move randomly, and aligned scores that never react to changes are useless for comparing versions. You earn each stage on top of the previous one.
+
+## Case 1: an AI wealth manager before launch
+
+The first client had not shipped anything. They were building an AI wealth manager meant to make financial advice accessible to people who can't pay a human one. Their only evidence of "good" was:
+
+- a team of in-house wealth managers who had written down investment principles, and
+- a demo with several long system prompts that encoded the behavior they wanted.
+
+No fancy tooling was involved. The team read those documents (with ChatGPT or Claude helping) and pulled out two kinds of signals:
+
+- **Core constraints**, guardrail-like rules that must never break: never recommend buying or selling a single security; never exceed an 85% US allocation.
+- **Goodness metrics**, qualities that make a response better: professional tone, trustworthy, human-like.
+
+From the same documents they also inferred a **sampling strategy** for a first synthetic test set: requests that ask about a single stock, requests that ask about many, requests with ambiguous or missing data, and users across different tax brackets and demographics. That is the dimensions-and-tuples approach from [Systematic error analysis](/courses/ai-evals/error-analysis), applied before any user exists.
+
+### Break "good" into narrow questions
+
+Ask ten wealth managers whether a response is good and you get ten opinions. "Is this a good wealth-management answer?" has no stable answer, and a generative task has dozens of equally good responses, so a golden reference answer doesn't work either.
+
+The fix is to decompose. "Is it professional?" is still vague, so split it again: *Does the response use professional word choice? Does it use a professional tone? Is it grounded only in the data the user provided?* Each narrow question still involves judgment, but people agree on it far more often. This is the course's advice to use binary, single-criterion checks ([Automated evaluators](/courses/ai-evals/automated-evaluators)), arrived at from a different direction.
+
+### The degradation test
+
+Without user feedback, the best you can aim for is **accuracy against your own labels**. Their exercise for checking it:
+
+1. Take responses the demo produced that the experts consider good.
+2. Make degraded copies at increasing levels of badness, each worse along a known dimension (for example, progressively less professional wording).
+3. Score every version with each candidate signal, plus a broad "is this good?" question for comparison.
+4. Keep the signals whose scores fall in step with the degradation.
+
+In the wealth-manager case, the sharp question about the response's language tracked the high, medium and low quality versions much better than the broad question did.
+
+```python
+import pandas as pd
+
+# One row per (response, degradation level, signal) with the signal's 0-1 score
+df = pd.read_csv("degradation_scores.csv")
+levels = ["original", "mild", "severe"]
+
+means = df.pivot_table(index="signal", columns="level", values="score").reindex(columns=levels)
+means["tracks_quality"] = (means["original"] > means["mild"]) & (means["mild"] > means["severe"])
+print(means.sort_values("tracks_quality"))
+```
+
+A signal that scores the severe version as high as the original is not measuring what you think, and you find that out before a single user sees the product.
+
+<Callout kind="tip">
+The degradation test is cheap synthetic data aimed at the scorer, not the product. It answers "would this metric notice if quality dropped?" which is the minimum you need before trusting a number. It does not replace checking a judge against human labels, covered in [Trusting your judge](/courses/ai-evals/trusting-your-judge).
+</Callout>
+
+## Case 2: a travel assistant choosing a model
+
+The second client was an AI travel-planning assistant that had already launched one feature: a hotel-review summarizer, similar to the review summaries on large shopping sites. They had more evidence than the first client:
+
+- **real user queries**, but no feedback on them (the product had no feedback button yet), and
+- responses to those queries from several candidate models.
+
+Their question was practical: which model should power the feature? A GPT-4-class model or its cheaper mini variant? A Claude model?
+
+### Why discerning matters: the model swap nobody's metrics saw
+
+The speakers told a story from a later client (the presentation generator in case 3), from before they worked together. That company once switched the model behind its product from a GPT model to a Claude model. Users hated the change and negative feedback flooded in. **Not one metric on their dashboard moved.**
+
+Their metrics weren't necessarily wrong. They were blind: whatever they measured didn't change between two models that users could clearly tell apart. A metric that can't see a change can't protect you from one.
+
+So the second exercise is to score the outputs of different models on the same real queries and check that the scores **differ where the responses differ**. You aren't yet claiming to know which model is better. You only need evidence that the metric reacts. For the travel client, the scores did separate the two models' summaries in most cases.
+
+At this stage a metric must pass two tests: accurate (case 1) and discerning (case 2). It is the minimum bar for using evals to compare prompts or models, and for regression tests in CI ([CI, CD and online monitoring](/courses/ai-evals/ci-cd-and-monitoring)).
+
+## Case 3: a presentation generator with millions of users
+
+The third client generated slide decks for tens of millions of users. They had the richest evidence of all:
+
+- real usage logs,
+- user feedback on generated decks (thumbs up, thumbs down, or a middle "meh"), often with a free-text comment, and
+- presentation experts on staff.
+
+The new question: are the metrics **aligned**? Do they predict what users actually prefer?
+
+### Turn feedback into hypothesized signals
+
+The comments were clustered by theme and turned into eleven **hypothesized signals**: things like consistency of layout, smart and varied use of layouts, image appropriateness, hallucinated content, content flow, preserving information the user supplied, and leaving out text the user expected. This is open and axial coding from [Systematic error analysis](/courses/ai-evals/error-analysis), except the "notes" were written by users instead of by your team.
+
+They are only hypotheses. A theme that shows up in many complaints may still not predict which decks users dislike.
+
+### Check each signal against user ratings
+
+About 20,000 decks had an overall user rating. The team scored every one of those decks on every signal, then split them by the user's rating and compared average scores:
+
+| Signal | Mean score, users said bad | meh | good | Verdict |
+|---|---|---|---|---|
+| No hallucinated content | 0.41 | 0.55 | 0.68 | Aligned: rises with rating |
+| Image appropriateness | 0.52 | 0.60 | 0.71 | Aligned |
+| Layout consistency | 0.58 | 0.69 | 0.64 | Suspect: meh beats good |
+
+The numbers above are illustrative (the talk showed a bar chart, not a table), but the pattern is the real one: most signals rose cleanly from bad to meh to good, and **layout consistency did not**, with meh decks scoring slightly higher than good ones. That signal's question needed rework.
+
+Two things people misread on that chart:
+
+- **The overall level doesn't matter, the ordering does.** A signal whose scores are all low can be perfectly aligned if good > meh > bad. A signal with high scores everywhere can be useless.
+- **The ratings are on the whole deck, not per signal.** Users never answered "was the layout consistent?" Each signal is tested on whether it predicts their overall verdict.
+
+```python
+by_rating = df.groupby(["signal", "user_rating"])["score"].mean().unstack()[["bad", "meh", "good"]]
+by_rating["aligned"] = (by_rating["good"] > by_rating["meh"]) & (by_rating["meh"] > by_rating["bad"])
+print(by_rating[~by_rating["aligned"]])  # signals to rework or drop
+```
+
+David's framing: the x-axis is *your product opinion* (what you think makes a good deck), the colors are *user satisfaction*. The worst case is that your idea of a good deck is what users call a bad one. Metrics can be **accurate but not predictive**: you checked them carefully, they measure what they claim, and users simply care about something else. That is, in his words, "almost useless."
+
+### Weighting the signals
+
+Once each narrow signal is reliable on its own, the subjective part moves up a level: **how much does each signal matter?** One person may care 80% about hallucination and 20% about layout; another 60/40. You learn those weights from overall human ratings, for example by fitting a simple model from signal scores to the thumbs.
+
+Because this is a small fitting problem over a handful of reliable inputs, it needs little data. Their rule of thumb was about **10 rated examples per signal**, so roughly 100 rated decks for about ten signals.
+
+```python
+from sklearn.linear_model import LogisticRegression
+
+X = wide[signal_cols]                 # one row per deck, one 0-1 column per signal
+y = wide["user_rating"] == "good"     # or treat bad / meh / good as ordinal
+weights = LogisticRegression().fit(X, y).coef_[0]
+print(dict(zip(signal_cols, weights.round(2))))
+```
+
+Think of the result as a confusion matrix of predicted versus actual user verdict. You care about both errors: calling a deck good when users disliked it, and calling it bad when they liked it (the TPR and TNR idea from [Automated evaluators](/courses/ai-evals/automated-evaluators)).
+
+<Callout kind="warn">
+Don't expect 100% alignment with users. Different users want different things from the same deck, so overall agreement has a ceiling. David put it at roughly **80%**, which is what they reached with this client. If you see 98%, suspect leakage or a trivially easy test set.
+</Callout>
+
+## Stage 4: scores inside the product
+
+At around 80% alignment the scores stop being just a report card. The speakers listed what opens up:
+
+- **Model and prompt comparison** with a score you trust to predict thumbs up and down.
+- **Best-of-n at runtime:** generate several decks and show the one that scores highest.
+- **Ranking:** Google Search scores documents with a tree of narrow signals (is it relevant to the query, is it visually appealing, is it popular, how good is the title, which splits further) and that scoring is part of the product, not an offline report.
+- **Reward models for fine-tuning:** use the score as the reward in reinforcement learning.
+
+### The cautionary tale: a reward model that loved flattery
+
+The speakers used ChatGPT's 2025 sycophancy episode, when the assistant flattered and agreed with users in absurd situations, as a warning. Their account: raw thumbs up and down are too noisy to train on directly, so providers distill feedback into a scoring system (a reward model) and train against that. Users tend to give a thumbs up to polite, agreeable answers, that preference got too much weight in the reward, and the retrained model learned to be agreeable everywhere.
+
+The lesson for everyone else: **aligned with feedback means aligned with whatever the feedback rewards.** Users' thumbs measure what they like in the moment, not everything you want. That is why the definition of good keeps a set of internal principles alongside user feedback, and why guardrail-style constraints from stage 1 never go away. Done carefully, though, a robust scoring system is extremely powerful: DeepSeek's reasoning models were trained largely against verifiable rewards such as correct math answers and passing code.
+
+## Narrow questions at the leaves
+
+One design choice ran through all three cases. Pi's scoring models are small (BERT-sized) models trained for a single interface: you give them a response and a yes/no question about it, and they return a score between 0 and 1. You can threshold the score into pass or fail, or keep it continuous. It is one general model prompted with many different questions, not a separate model per question.
+
+The speakers argued that when each leaf question is narrow and specific, scores have **low variance and high precision**, so the leaves work largely out of the box and you spend your human labels on calibrating the weights at the top. Broad, out-of-distribution questions ("you are a wealth manager, rate this answer") are exactly where such scorers fail.
+
+The transferable part holds for any evaluator, including an LLM judge: the narrower the question, the more consistent the answer. The vendor-specific part (that narrow leaves don't need their own alignment check) is a claim about one product. The course's default still applies: before a score gates a release or trains a model, check it against human labels ([Trusting your judge](/courses/ai-evals/trusting-your-judge)). Case 3 shows why: layout consistency was narrow and still failed to align.
+
+## Find your stage
+
+Answer a few questions about your own team's practice. The widget places you on the curve by the first gate you haven't passed, and gives you the next concrete step.
+
+<EvMaturityStageCheck />
+
+## How this connects to the course
+
+- Extracting constraints and goodness metrics from documents is the "defining good" step from [Evals fundamentals and the lifecycle](/courses/ai-evals/evals-fundamentals), done with the only evidence a pre-launch team has.
+- Clustering user comments into hypothesized signals is error analysis on feedback instead of traces.
+- Discerning metrics are what make CI regression tests and model swaps safe, and aligned metrics are what make production monitoring meaningful ([CI, CD and online monitoring](/courses/ai-evals/ci-cd-and-monitoring)).
+- Best-of-n with a trusted scorer is the same idea as the selection step in [Guest talk: evals for image generation](/courses/ai-evals/evals-for-image-generation).
+
+## Cheat sheet
+
+- Same three artifacts from day 1 to day 1000: a definition of good, a sample of inputs, and a way to score.
+- Each artifact matures from hunches (docs, system prompts) to labels to large-scale user feedback.
+- Pre-launch: split docs into core constraints (guardrails) and goodness metrics, and design a synthetic sample from them.
+- Decompose vague qualities into narrow yes/no questions: people (and models) agree on those far more.
+- Accurate: degrade good responses on purpose; keep signals whose scores fall with quality.
+- Discerning: score two models or prompts on real queries; a metric that doesn't move is blind.
+- A model swap users hated moved zero dashboard metrics. That is the failure discerning metrics prevent.
+- Aligned: split rated outputs into bad, meh, good; each signal should rise in that order. Level doesn't matter, ordering does.
+- Accurate but not predictive of users is almost useless.
+- Calibrate signal weights from overall ratings: about 10 rated examples per signal.
+- Expect around 80% alignment with users at best; people disagree on what good is.
+- Once trusted, scores can rank, pick best-of-n, or act as a reward model.
+- Feedback-trained rewards optimize what users reward (ChatGPT's sycophancy). Keep internal principles and guardrails.

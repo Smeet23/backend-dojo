@@ -1,0 +1,210 @@
+import { EvTrajectoryScorer } from "@/components/widgets/EvTrajectoryScorer";
+
+## The talk in one picture
+
+This guest talk is by **SallyAnn DeLucia**, a product leader at **Arize**, the company behind the open-source **Phoenix** and the commercial **Arize AX** platforms used in several course walkthroughs. Arize also builds its own in-product agent, **Alex**, so the advice comes from a team evaluating an agent in production, not only selling tools for it.
+
+She deliberately skipped the product demo and gave a framework instead, in two halves:
+
+| Half | The question it answers |
+|---|---|
+| **Evaluate at every level** | Which parts of an agent need their own evals: one step, one run, or a whole conversation? |
+| **Turn feedback into fixes** | Once evals tell you what is wrong, how do you use their labels, explanations and human annotations to improve the agent and the evals themselves? |
+
+Tool-call checks, failure funnels and transition matrices are already covered in [Evaluating RAG, tools and agents](/courses/ai-evals/rag-and-agents) and [Homework: agent failure analysis](/courses/ai-evals/homework-agent-failures). This page focuses on what the talk adds: a clear map of **span, trace and session** evals for agents, and a concrete loop for **prompt learning** from eval feedback.
+
+## Why agents break in production
+
+Prototyping an agent in a notebook is the easy part. SallyAnn listed three pains teams hit when they scale it:
+
+1. **Traces are huge.** Even a partial trace of a real agent is a wall of spans that nobody can digest at a glance.
+2. **Failures are hard to locate.** The more complex the agent, the more the bad step is a needle in a haystack.
+3. **Prompt changes have invisible downstream effects.** You test a new router prompt in isolation and it looks better, but you can't see how it changes the rest of the flow.
+
+Two examples of an agent "going off script":
+
+- A widely shared incident in which an AI coding agent from **Replit** deleted a user's production database, then apologized and said nothing could be done.
+- A trip planner asked for **flights to San Francisco** that returns **hotels in Los Angeles**. Each piece may look fine on its own; the path as a whole is wrong, and the user does not come back.
+
+Her starting point: **define success before choosing evals.** An eval is not just an accuracy check on the final answer. For an agent it should also cover decision correctness, tool usage patterns, reasoning coherence and final outcome quality. Error analysis ([Systematic error analysis](/courses/ai-evals/error-analysis)) is how you find which of those actually fail for your product.
+
+## Evaluate every decision point
+
+The core idea is a **systems view**: treat the agent like a program you are debugging. Break its behavior into discrete steps (inputs, the reasoning path, outputs) and ask at each one whether it was the right decision. Evaluating only the final answer tells you *that* a run failed, not *where*.
+
+The talk named four parts of an agent to evaluate, at three granularities:
+
+| What | Granularity | Question | Who cares most |
+|---|---|---|---|
+| **Router / orchestrator** | Span | Did it hand the request to the right agent, tool or flow? | AI engineers |
+| **Tool and MCP invocation** | Span | Did the chosen tool actually do its job correctly? | AI engineers |
+| **Decision path (trajectory)** | Trace | Taken as a whole, was the sequence of steps the right one? | AI engineers |
+| **Session** | Session | Across the whole conversation, was the agent coherent and successful? | Product and UX owners |
+
+The last column is her point about **stakeholders**: engineers live in the span and trace evals, while a product owner first wants to know whether users are having a good experience. Both views are needed, and they connect: a session-level drop sends you down to traces, then to spans. Span, trace and session are defined in [CI, CD and online monitoring](/courses/ai-evals/ci-cd-and-monitoring#cd-observability-first).
+
+The TL;DR she gave: not one span-level eval but **many**, plus evals at the **trace** level, plus evals at the **session** level.
+
+## Span level: router and tools
+
+### The router
+
+The router (or orchestrator, or planner) has one job: pick the next tool, sub-agent or flow. Evaluate it on the **router span**, with the user request and the list of available tools as inputs. You will see this called tool-calling correctness, tool selection or router correctness. Its failure modes (wrong tool, no tool, hallucinated tool, bad arguments) are tabulated in [Beyond RAG: tool calling](/courses/ai-evals/rag-and-agents#beyond-rag-tool-calling).
+
+### The tools
+
+Selecting the right tool is only half the question. The second layer is whether the tool **executed its task correctly**: did the SQL tool write the right query, did the code tool generate working code, did the planning tool produce a sensible plan, did the API call carry the right payload?
+
+SallyAnn's reason for tracking **every tool separately**: an agent is only as strong as its weakest tool. One tool that fails consistently drags down the whole agent, and an aggregate "agent success" number will hide which one it is. So keep a per-tool scoreboard:
+
+```python
+from collections import defaultdict
+
+def per_tool_pass_rate(span_evals):
+    """span_evals: list of dicts like {"tool": "search_flights", "label": "pass"}."""
+    totals, passes = defaultdict(int), defaultdict(int)
+    for e in span_evals:
+        totals[e["tool"]] += 1
+        passes[e["tool"]] += e["label"] == "pass"
+    return {t: passes[t] / totals[t] for t in totals}
+
+# {"search_flights": 0.97, "filter_price": 0.95, "book_flight": 0.62, "send_confirmation": 0.99}
+```
+
+Each tool usually needs its own criteria, so expect one small judge or code check per tool rather than a generic "was the tool call good?" judge.
+
+## Trace level: the decision path
+
+Span evals check single units of work. The **decision path** (or **trajectory**) eval asks whether the whole run, viewed together, took the right route. This is where "flights to SF, hotels in LA" gets caught: the router might pick a reasonable tool at each step and still assemble a wrong journey.
+
+The trace view is also how you connect the levels. If the trajectory eval fails, drill into its spans: "it didn't execute the right plan *because* this tool failed and caused a downstream effect". For counting *where* runs first go wrong across many traces, use the failure funnel and transition matrix from [Homework: agent failure analysis](/courses/ai-evals/homework-agent-failures).
+
+The talk stayed at the level of the idea. In practice, when you can write down an **expected path** for a test query, a handful of simple code-based metrics compare it with the actual tool calls. These are common definitions (Arize ships an off-the-shelf "tool trajectory" evaluator; other libraries have similar ones), not numbers from the talk:
+
+| Metric | Definition | Catches |
+|---|---|---|
+| **Exact match** | Same tools, same order, same count | Any deviation at all (often too strict) |
+| **In-order match** | Expected steps appear in order, extra steps allowed | Missing or out-of-order essential steps |
+| **Any-order match** | Every expected tool called at least once | Missing steps when order doesn't matter |
+| **Tool precision / recall** | Share of actual calls that are expected / share of expected tools that were called | Stray tools / skipped tools |
+| **Path length ratio** | Actual steps ÷ expected steps | Loops, retries, wasted calls |
+| **Redundant steps** | Actual steps not part of the in-order match | Same, as a count |
+
+A second, cross-run metric is **convergence**: run the same query several times, take the **optimal** path length as the shortest run that reached the goal, and average optimal ÷ steps-taken over all runs (a run that never reaches the goal scores 0). A score of 1.0 means the agent takes the shortest successful route every time. It measures both reliability and efficiency, which matters because extra steps cost tokens and latency even when the final answer is right.
+
+```python
+def lcs(a, b):
+    dp = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
+    for i, x in enumerate(a, 1):
+        for j, y in enumerate(b, 1):
+            dp[i][j] = dp[i-1][j-1] + 1 if x == y else max(dp[i-1][j], dp[i][j-1])
+    return dp[-1][-1]
+
+def reached_goal(actual, expected):
+    return lcs(actual, expected) == len(expected)  # in-order match
+
+def convergence(runs, expected):
+    good = [len(r) for r in runs if reached_goal(r, expected)]
+    if not good:
+        return 0.0
+    optimal = min(good)
+    return sum(optimal / len(r) if reached_goal(r, expected) else 0 for r in runs) / len(runs)
+```
+
+<EvTrajectoryScorer />
+
+With the default runs, convergence is (1 + 0.8 + 0.8 + 0 + 0.67) ÷ 5 ≈ 0.65. Run 4 skips the price filter: it is short and books a flight, but the in-order check fails, so it adds nothing. Notice what happens if you lengthen Run 1: the "optimal" length rises and every other run's score improves. Convergence is relative to the best path *you observed*, so pair it with a fixed expected path when you have one.
+
+<Callout kind="warn">
+Don't over-constrain the expected path. Many tasks have several valid routes (search hotels first or flights first). Use exact match only for flows that truly have one right order, prefer in-order or any-order matching otherwise, and keep an LLM judge that reads the whole trace for open-ended agents where no single expected path exists.
+</Callout>
+
+## Session level: the whole conversation
+
+Session evals are increasingly important because agents now hold long, multi-turn conversations. The talk highlighted three things to check:
+
+- **Consistent tone** across turns, because a consistent experience is part of quality.
+- **Repeated questions.** If the agent asks for something the user already answered, it has a context or memory problem. Everyone has felt the frustration of being asked the same question again.
+- **Losing track over length.** An agent can be fine for turns 1 to 5 and start forgetting at turn 6. In domains where long sessions are normal, that is a real failure even if each turn looks fine alone.
+
+A practical way to catch the last one: slice your session-level or memory judge by turn number, and look for the turn where the pass rate falls off. The session-first habit itself (judge the whole conversation pass or fail, then debug turn by turn) is in [Multi-turn conversations](/courses/ai-evals/collaborative-evaluation#multi-turn-conversations).
+
+## Three kinds of feedback
+
+SallyAnn grouped the signals an eval can produce into three types, because they are useful for different things later:
+
+| Type | Looks like | Notes |
+|---|---|---|
+| **Gradient** | A score on a scale, or graded multi-label (very negative, negative, neutral, ...) | Gaining popularity |
+| **Binary** | Yes/no, correct/incorrect, good/bad | The most common and simplest |
+| **Annotations** | A human's note: what was wrong, or what the right answer is | Still essential; LLM judges alone are not enough |
+
+The course recommends binary judges for most criteria ([Automated evaluators](/courses/ai-evals/automated-evaluators)). Her addition is that the **text around the label** (the judge's explanation and the human's annotation) is what makes feedback actionable.
+
+## From evals to better prompts: prompt learning
+
+Knowing what is broken is not useful by itself. Today the most common fix is a better prompt, and Arize's approach to automating that is what it calls **prompt learning**: feed rich eval feedback to an LLM that rewrites the prompt.
+
+The difference from optimizers like **DSPy** (she mentioned its MIPRO optimizer) is the input. DSPy searches over instructions and few-shot examples to maximize a **numeric metric** you define, such as percent correct. A thumbs up or down carries little information, the optimizer doesn't know what the metric *means*, and you need many data points. Prompt learning instead gives the optimizer LLM **text**, the same modality it works in:
+
+| Field | Comes from | Says |
+|---|---|---|
+| Input and output | The trace | What happened |
+| Label | LLM judge | Pass/fail, e.g. hallucinated or not |
+| **Explanation** | LLM judge | *Why* the judge gave that label |
+| **Annotation** | Human (a subject-matter expert or the product owner) | What was wrong, or the correct answer |
+
+You need at least one of explanation or annotation, and ideally both. Explanations are the cheaper minimum because an LLM produces them; annotations add the most value while humans are in the loop. She said the method does not need much data, with details in an Arize blog post on prompt learning.
+
+A meta-prompt for the optimizer might look like this:
+
+```python
+META_PROMPT = """You are improving the system prompt of a travel agent.
+
+Current prompt:
+{current_prompt}
+
+Below are failed examples. For each: the input, the agent's output, the judge's
+label and explanation, and an expert annotation. Treat the annotation as the
+reference output the agent should have produced.
+
+{examples}
+
+Rewrite the prompt so the agent would produce the reference outputs. Keep what
+works. You may add instructions or few-shot examples. Return only the new prompt."""
+```
+
+Then run the new prompt as an experiment against your dataset and evals before shipping it, as in [Improving accuracy and cutting cost](/courses/ai-evals/improvement-and-cost).
+
+## Two co-evolving loops
+
+The workflow she described has two loops that improve together:
+
+1. **Collect traces** from production.
+2. **Run evals** on them, continuously (online) or in batches.
+3. **Collect the failures**, for example every trace labeled "hallucinated", and route them to a human annotation queue.
+4. **Optimize the agent prompt** from the failures, explanations and annotations.
+5. **Optimize the eval prompts** too, using annotations about what the *judge's* label should have been.
+
+Loop 4 only works if the evals are good: an unaligned judge will steer the optimizer toward the wrong target. That is why loop 5 exists, and why "set and forget" evals, or copying someone else's evals unchanged, is a misconception. The annotations play different roles in each loop: for the agent they are the reference answer; for the judge they are the correct label and reasoning. Checking a judge against human labels is [Trusting your judge](/courses/ai-evals/trusting-your-judge).
+
+She compared this to self-driving development, where fleets constantly surface failure cases that feed the next round of training. Her vision is a shift from **static instructions with dynamic variables** to **dynamic instructions** shaped by this feedback loop. For now it is partly manual, with humans in the loop kicking off each optimization.
+
+<Callout kind="remember">
+Where do the evals come from in the first place? From meeting stakeholders, defining success, and turning those criteria into LLM judge templates or code checks: the same path as error analysis followed by building a judge in this course. Platforms offer off-the-shelf evaluators (Arize lists QA correctness, tool trajectory and hallucination among them) and assistants that draft templates, but you still need full coverage of *your* failure modes, which means several evals, not one.
+</Callout>
+
+## Cheat sheet
+
+- Define success first: decision correctness, tool usage, reasoning coherence and final outcome, not just accuracy.
+- Evaluate every decision point, like debugging a program: inputs, reasoning path, outputs.
+- Span level: the router (right tool or handoff?) and each tool (did it do its job?).
+- Track each tool separately; one weak tool caps the whole agent.
+- Trace level: judge the whole decision path; "flights to SF, hotels in LA" passes step checks and fails here.
+- Trajectory metrics: exact, in-order and any-order match; tool precision and recall; path length ratio; redundant steps.
+- Convergence = mean of optimal steps ÷ steps taken over repeated runs; failed runs score 0.
+- Session level: consistent tone, no repeated questions, no forgetting as turns grow.
+- Different levels serve different stakeholders: engineers read spans and traces, product owners read sessions.
+- Feedback comes as gradient, binary or annotations; explanations and annotations make it actionable.
+- Prompt learning: give an optimizer LLM the inputs, outputs, labels, explanations and annotations, not just a score.
+- Run two loops together: improve the agent prompt and improve the eval prompts; bad evals steer optimization wrong.

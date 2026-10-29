@@ -1,0 +1,156 @@
+import { EvMajorityVoteLab } from "@/components/widgets/EvMajorityVoteLab";
+
+## Why a judge is the bottleneck
+
+This guest talk is by **Leonard Tang**, co-founder and CEO of **Haize Labs**. Haize Labs does what it calls *haizing*: simulation or fuzz testing of AI applications, where agents search the space of natural-language inputs for the ones that break your app. A golden dataset of fixed inputs and expected outputs is a fine start, but LLM apps are sensitive to small perturbations, so poking just outside your dataset usually finds new failures.
+
+A fuzzer is only as good as its objective, though. In normal code a crash or a failed assertion tells you the input broke something. For free-text output, *something* has to decide whether each response was good or bad, thousands of times, without a human in the loop. That something is a judge, and Tang's point is that it is the hardest and most valuable part of the stack: generating text is easy, discerning quality is what decides whether the product works. This matters most in **non-verifiable domains**, where there is no unit test or exact answer to check against.
+
+The single prompted judge you built in [Automated evaluators](/courses/ai-evals/automated-evaluators) has well-known problems, which the talk lists: it is brittle and sensitive to wording, often inaccurate, poorly calibrated in the scores it outputs, it can hallucinate, and it raises the question of how you evaluate the evaluator. Tang's answer to all of them is one idea: **spend more compute at judgment time**.
+
+## Two ways to scale judge-time compute
+
+You can add compute in two places:
+
+| | Scale the model | Scale the system |
+|---|---|---|
+| What changes | The judge model itself is trained to reason longer before its verdict | A fixed model is wrapped in a pipeline of several judge calls |
+| How | RL fine-tuning of a reasoning model on human preference labels | Ensembles, debate, self-verification, per-criterion rubrics, stacked in layers |
+| Open-source example | **J1** (tiny judge models) | **Verdict** (a library for judge pipelines) |
+| You need | Labeled preferences and a training setup | Only API access to some model |
+
+Both turn more tokens into a more reliable verdict. They also combine: a pipeline can run on top of a reasoning judge.
+
+## Scaling inside the model: reasoning judges
+
+### Query-specific rubrics
+
+The design goal was a judge that applies **criteria specific to the input it is judging** and writes rationales a subject matter expert would agree with. A general rubric for the whole task ("is the answer helpful and accurate?") is too vague to apply consistently. So the judge is trained to reason in three steps for every example:
+
+1. Write a rubric for *this* query: what a good answer to this particular question must do.
+2. Write a rationale for each rubric item, checking the response against it.
+3. Aggregate the items into the final verdict or score.
+
+For a query like "Can I take ibuprofen with my blood pressure medication?", the generated rubric might ask whether the answer names the interaction risk, avoids a definitive medical ruling and suggests asking a pharmacist. A judge that checks those three things one by one is far less likely to be swayed by a confident, well-formatted answer that misses one of them. This is the same advice as narrow, explicit criteria in [Crafting the judge prompt](/courses/ai-evals/automated-evaluators#crafting-the-judge-prompt), except the model writes them per example.
+
+### Training with RL from preference labels
+
+The model learns this behavior through reinforcement learning with **rule-based rewards**: the reward is a simple function you can compute, not another model. The labels are cheap to collect, because humans don't need to produce numeric scores. Given one query and two responses, a person picks the better one. That pairwise preference is the ground truth.
+
+```python
+def reward(judge_output, human_label):
+    """Rule-based reward for RL-tuning a judge. No reward model involved."""
+    if human_label.kind == "pairwise":          # 2+ responses, human picked the best
+        best_by_judge = max(judge_output.scores, key=judge_output.scores.get)
+        return 1.0 if best_by_judge == human_label.best_id else 0.0
+    if human_label.kind == "pointwise":         # one response, human gave a score
+        return 1.0 if judge_output.score == human_label.score else 0.0
+```
+
+With two or more responses, the judge is rewarded when the response it scores highest is the one the human preferred. With a single response, it is rewarded for matching the human's score exactly. The reasoning (rubric, rationales) is never graded directly. RL rewards whatever reasoning leads to agreeing with humans, and in practice that means longer chains of thought: more tokens spent per verdict.
+
+In the Q&A, Tang was asked whether the gain comes from RL or from the extra reasoning. His answer: RL *is* how you get the model to spend more inference compute. The team also tried RL that only aligned the verdicts without encouraging reasoning, and it did not work well.
+
+### J1: tiny judges that punch up
+
+Haize Labs released two such models, **J1 Micro** (1.7 billion parameters) and **J1 Nano** (0.6 billion), fine-tuned from small Qwen models. Both do pairwise comparison: given a query and two responses, pick the better one.
+
+On **RewardBench**, a standard benchmark for judges and reward models, the talk reported that J1 Micro beats much larger models including Claude 3 Opus and Llama 3 70B, and that J1 Nano, under a billion parameters, is competitive with GPT-3.5 and with open models such as Tulu 13B. Tang's explanation is not the model's size but its training: emitting query-level criteria and criterion-level rationales.
+
+<Callout kind="warn">
+A benchmark like RewardBench measures general preference judgments, not *your* failure modes. A small judge that tops a leaderboard still has to earn your trust the usual way: measure TPR and TNR against your own labeled test set, as in [Trusting your judge](/courses/ai-evals/trusting-your-judge).
+</Callout>
+
+## Scaling around the model: judge agents
+
+The other end of the spectrum keeps the model fixed and builds a system around it: an **evaluation agent**. Haize Labs' open-source library for this is **Verdict**, a declarative framework for composing judge pipelines. It handles the plumbing you'd expect (any model provider, rate limiting, structured schemas passed between steps), and its syntax is modeled on PyTorch: you stack layers, and each layer is made of judge units.
+
+### Primitives from scalable oversight
+
+What makes Verdict different is where its building blocks come from: **scalable oversight**, an AI safety research area about using weaker models (or people) to supervise stronger ones. Several of its patterns are first-class units:
+
+| Primitive | What it does | Why it helps |
+|---|---|---|
+| **Ensemble / panel** | Several judges (different models, prompts or samples) vote | Independent mistakes cancel out |
+| **Debate** | Units argue for opposite verdicts, then a judge rules on the arguments | Judging an argument is easier than judging the raw output |
+| **Self-verification** | A judge gives a verdict and rationale, then a second step critiques whether that rationale is coherent and supports the verdict | Catches verdicts that don't follow from their own reasoning |
+| **Per-criterion rubric** | One unit per rubric item, scores aggregated at the end | Each call has one narrow job |
+
+Because layers compose, a pipeline can quickly grow to four, six or eight nested layers. A sketch of the idea in plain Python (not Verdict's actual API):
+
+```python
+def judge_with_compute(query, response, criteria, n_votes=3):
+    # Layer 1: one narrow judge per criterion, each sampled n_votes times.
+    item_verdicts = []
+    for c in criteria:
+        votes = [judge_criterion(query, response, c, temperature=0.7) for _ in range(n_votes)]
+        verdict = majority(v.passed for v in votes)
+        # Layer 2: self-verification. Does the winning rationale support the verdict?
+        rationale = next(v.rationale for v in votes if v.passed == verdict)
+        if not verify(query, response, c, rationale, verdict):
+            verdict = judge_criterion(query, response, c, model="stronger").passed
+        item_verdicts.append(verdict)
+    # Layer 3: aggregate. Here: fail if any required criterion fails.
+    return all(item_verdicts)
+```
+
+With 4 criteria and 3 votes, that is 16 to 20 model calls per trace (12 votes, 4 verifications, up to 4 retries) instead of one. Hold that thought for the cost section.
+
+### What the numbers showed
+
+- **ExpertQA.** On this expert question-answering evaluation task, Verdict pipelines built on cheaper models sat beyond the cost, latency and accuracy frontier of o1, o3-mini, GPT-4o and Claude 3.5 Sonnet used as judges. The talk claimed roughly 50% better results than o3-mini at the same latency, and better results than o1 at a much lower price. Tang's reason: general reasoning models are tuned for math and code, while oversight primitives fit evaluation specifically.
+- **Vogent**, a voice-agent company for customer support. Calls just end, so there was no signal for which calls succeeded. Heuristics did not match human feedback, and letting their customers write their own criteria into a prompted LLM judge did not align well either. A Verdict pipeline that built granular rubric criteria for each item, scored each criterion separately and ensembled the results (Tang called it "unit tests of ensembled criteria") improved alignment with human judgment by **38%**.
+
+The second case is the transferable recipe: decompose the vague question ("was this call successful?") into several narrow checks, run each one separately, and combine.
+
+## Why voting helps, and where it stops
+
+Ensembles, panels and self-consistency (sampling the same judge several times) all rest on one bet: **the judges' errors are independent**. If a single call is right with probability p and the calls are independent, the majority of n calls is right far more often. At p = 0.75, three votes give 84.4% and five give 89.6%, which removes almost 60% of the single judge's errors for 5x the calls.
+
+Two conditions break this. Try both in the simulator below:
+
+- **Correlated errors.** Five samples from the same model with the same prompt share the same blind spots. If the model always misreads a particular kind of trace, all five votes are wrong together, and voting can't fix it. Set half the items to "all votes err together" and five votes only reach 82.3%, with a hard ceiling of 87.5% no matter how many votes you buy.
+- **A judge worse than chance on some slice.** If p is below 0.5 on some kind of input, the majority locks the mistake in: at p = 0.45, five votes are right only 40.7% of the time.
+
+<EvMajorityVoteLab />
+
+This is why the primitives above use *diversity*: different models in a panel, different roles in a debate, different criteria per unit. Diverse units make different mistakes, which is what lets them cancel. Tang mentioned that you can mix models per unit in Verdict, and that the whole architecture is still sensitive to the underlying model, so re-measure when you swap one.
+
+<Callout kind="remember">
+More compute fixes noise, not bias. If the judge is consistently wrong because the criterion is vague or the model lacks the knowledge, ten votes return the same wrong answer with more confidence. Fix the rubric first.
+</Callout>
+
+## Cost and latency
+
+More compute costs money and time. A student asked how Haize Labs trades that off, and the answer depended on where the judge runs:
+
+- **Offline and async evaluation: optimize for accuracy.** Most customers care about the judge being right more than about its speed. Even "online" evaluation of production traces rarely needs an answer in seconds; processing traces asynchronously within 10 to 30 minutes is fine. This is the async-eval setting from [CI, CD and online monitoring](/courses/ai-evals/ci-cd-and-monitoring#two-ways-to-run-evals-in-production).
+- **Guardrails: distill.** A judge in the request path, for content moderation or triggering a behavior, must be fast. Here they take the behavior of a strong reasoning judge or judge agent and **distill** it into a very small model of 3 to 4 billion parameters that runs as the guardrail.
+- **Model size in practice.** For non-guardrail judges, Tang said 8B to 13B parameter models get them very far and they rarely need more.
+
+The practical rule: spend compute where a wrong verdict is expensive and nobody is waiting, and pay the training cost up front (distillation) where somebody is.
+
+## The rubric is most of the work
+
+Asked about real customer engagements, Tang put **60 to 70% of the challenge in the rubric**: working with subject matter experts to pin down what good and bad mean, often by showing them synthetic examples to react to. Only once the criteria are settled do they train or build the judge, and from there it is close to hands-off, with occasional new labels. Every place a user disagrees with the judge is captured and fed back into it over time.
+
+They support two directions of rubric iteration, which map onto the [refinement loop](/courses/ai-evals/automated-evaluators#the-refinement-loop):
+
+- **Forward:** edit the rubric (the judge prompt) and immediately see how the judge's predictions on your traces change.
+- **Backward:** critique individual predictions you disagree with, and have the system infer what change to the rubric would produce your labels.
+
+None of the compute in this lesson replaces that step. A scaled judge is still a judge: measure its TPR and TNR on a held-out test set, and use those rates to correct its pass rate, exactly as in [Trusting your judge](/courses/ai-evals/trusting-your-judge). When a pipeline disagrees with you, measure each unit too, so you know which layer is wrong.
+
+## Cheat sheet
+
+- Judges are the bottleneck of automated testing: generating outputs is easy, deciding which are good is not.
+- Scale judge-time compute in the model (RL-trained reasoning judges) or around it (judge agents built from several calls).
+- Reasoning judges write a rubric for each query, a rationale per rubric item, then aggregate into a verdict.
+- Train them with rule-based RL rewards from cheap pairwise preferences: reward the judge when it prefers what the human preferred.
+- J1 Micro (1.7B) and J1 Nano (0.6B) rival far larger models on RewardBench; RL without longer reasoning did not work well.
+- Verdict composes judge units in layers using scalable-oversight primitives: ensembles, debate, self-verification, per-criterion rubrics.
+- Reported results: past the cost/latency/accuracy frontier of o1 and o3-mini on ExpertQA, and 38% better human alignment for Vogent.
+- Voting only helps when errors are independent and each judge beats chance; correlated errors set a ceiling, and a judge below 50% gets worse.
+- Use diverse models, roles and criteria so mistakes cancel; more votes fix noise, not a bad rubric.
+- Accuracy first for async evals; distill into a 3 to 4B model for latency-bound guardrails.
+- The rubric is 60 to 70% of the work, and every scaled judge still needs TPR and TNR on a held-out test set.

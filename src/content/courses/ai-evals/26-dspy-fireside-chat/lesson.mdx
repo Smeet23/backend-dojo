@@ -1,0 +1,187 @@
+import { EvDemoOptimizerLab } from "@/components/widgets/EvDemoOptimizerLab";
+
+## The conversation in one picture
+
+This session is a fireside chat with **Omar Khattab**, the creator of **DSPy**, an open-source Python framework for building LLM systems. He did his PhD at Stanford, where he built **ColBERT** (a widely used retrieval model) and DSPy, and has since become an assistant professor in MIT's EECS department. The instructors asked him one question in many forms: DSPy is famous as a "prompt optimizer", so when should you optimize prompts, and how does that fit with evals?
+
+His answer, compressed:
+
+1. DSPy is **not** a prompt optimizer in the way people usually mean. Its motto is "programming, not prompting, language models", and Omar says it should really be "not *just* prompting".
+2. To say what you want from an AI system you need three things: **code** for structure, **natural language** for the fuzzy parts, and **evals** for the long tail of cases the model gets wrong.
+3. Optimizers only address the last of these. They take your program, a metric and some examples, and search for prompts, demos or weights that score better. They cannot tell you what to build.
+4. So the order is the one this course teaches: understand the problem, specify it, build an eval set from what you learn, and only then let an optimizer squeeze out the last mile.
+
+This page organizes the conversation into a lesson. The DSPy-specific ideas are new here; the eval mechanics they depend on (metrics, judges, splits, fixes) are taught in the core lessons and linked rather than repeated.
+
+## Where DSPy comes from
+
+Omar's background explains the design, so it is worth two minutes.
+
+As a kid learning to program, he loved loops and functions but was stuck on one thing: how do you write a function for "is this message spam?" Nothing in his toolbox (loops, regular expressions, SQL) could express a slightly fuzzy intent. His angle on AI has stayed the same since: not robots or agents, but **code that can contain parts you can't specify precisely**.
+
+His research path added three lessons:
+
+- **Search is the original AI engineering.** Retrieval and recommendation systems sit in front of users, success is more than an F1 score, and they are built as systems, not single models.
+- **The model should be a swappable part.** ColBERT is a retrieval architecture in which the underlying encoder can be replaced; a better encoder gives a better ColBERT. Omar compares this to ordinary software, which simply ran faster on each new generation of hardware.
+- **The architecture outlives the paradigm.** His multi-hop question-answering system **Baleen** (break a hard question down, search, summarize, search again: what we now call deep research) needed about six separately trained models, each rewarded end-to-end for finding the right documents. When GPT-3 arrived, the same decomposition, tools and corpus still made sense, but everything had to be rewritten as prompts. That rewrite bothered him enough to start DSPy in early 2022.
+
+The takeaway he draws: the **information flow** of your system (which step sees what, which tools and data it has) is knowledge only you have. It should be written down separately from whichever technique is in fashion (prompting, fine-tuning, reinforcement learning), and the model should be aligned to the system *after* the system is specified.
+
+## Programming, not prompting
+
+Omar's core claim is that, in the general case, a complete description of an AI system needs three ingredients, and you can't drop any of them:
+
+| Ingredient | What it captures | Example |
+|---|---|---|
+| **Code** | Control flow and structure: which tools exist, which step sees which inputs | "The summarizer sees the retrieved passages, not the user's account data" |
+| **Natural language** | The fuzzy parts of the task that are best stated in English | "Summarize in a calm tone for a non-technical customer" |
+| **Evals** | The long tail: inputs where the model doesn't live up to what you asked | 100 labeled tickets, with a metric that says which routes are right |
+
+Two misreadings he pushes back on:
+
+- **"DSPy means I shouldn't write instructions."** Wrong. Fuzzy pieces belong in English, and you should write them. That is the core capability of the paradigm, not something to avoid.
+- **"DSPy turns my bad prompt into a good prompt."** Also wrong (more on this below).
+
+## Signatures, modules and adapters
+
+DSPy's building blocks each pull apart concerns that hand-written prompts tangle together:
+
+- A **signature** declares a task: named, typed inputs and outputs plus instructions. It does *not* say "respond in JSON" or "use XML tags". Your goal is to get objects back, so formatting is not part of the task definition. That also means a product manager could read or write the instructions without wading through formatting rules.
+- A **module** is a function: structured inputs in, structured outputs out. Prompt assembly, the model call and parsing live together inside it, not scattered across string-building code, an API call and a parser.
+- The **language model** is configured separately, as the "processor" that runs the function.
+- An **adapter** turns a signature into an actual prompt and parses the reply. You rarely touch it. Some users write custom adapters to squeeze out a last couple of points, and Omar's point is that this should be one of the *last* things you do, not something baked in from day one.
+
+Because the task is separate from how it is run, general strategies can be applied on top without editing the task. Wrapping a signature in chain of thought, or turning it into a ReAct agent with tools, is a transformation of the module; the signature doesn't know or care. No optimization is involved in that step.
+
+Here is a small sketch for a support-ticket router, in the style of current DSPy releases. Treat it as **conceptual**: check the DSPy docs for exact APIs before you run it.
+
+```python
+from typing import Literal
+import dspy
+
+dspy.configure(lm=dspy.LM("openai/gpt-4o-mini"))  # the model is a separate, swappable piece
+
+# Simplest start: a one-line signature
+route = dspy.ChainOfThought("message -> team")
+
+# Later, once you've learned what matters, a class with documentation and types
+class RouteTicket(dspy.Signature):
+    """Route a customer support message to the team that should handle it.
+    If a message asks for a refund and anything else, route it to refunds."""
+
+    message: str = dspy.InputField()
+    team: Literal["refund", "shipping", "account"] = dspy.OutputField()
+
+route = dspy.ChainOfThought(RouteTicket)
+print(route(message="Box arrived crushed. Refund it, and update my address.").team)
+```
+
+<Callout kind="remember">
+Omar's twist on that docstring: the instructions in a signature are **documentation of your intent addressed to DSPy**, not literally the text the model will see. DSPy reserves the right to deliver that intent differently. His example: if you say "never mention X", repeating X to the model can make it more likely to say it, so a system could instead check the output afterwards and resample. He was clear this is the principle behind the design, not necessarily what the library does today.
+</Callout>
+
+## The three gulfs, DSPy edition
+
+Omar mapped DSPy directly onto the course's [three gulfs](/courses/ai-evals/evals-fundamentals):
+
+| Gulf | The work | Where it lives in DSPy |
+|---|---|---|
+| **Comprehension** | Figure out what you actually want, with stakeholders, by reading data | Outside any framework: error analysis and conversations |
+| **Specification** | Write the intent down where a future maintainer (or you next year) can read it | Your program: signatures, modules, control flow, tools |
+| **Generalization** | Make the model actually do what you specified on all inputs | Optimizers, driven by a metric and examples |
+
+The generalization gulf is where people normally play whack-a-mole: all caps, repeating an instruction, role prompts, switching from JSON to XML because someone said it works better. Omar's surprising position is that **these tricks can genuinely help**. His objection is to keeping them by hand in your source code: they add no new information about the task, they are tied to one model, and nobody documents why they are there. That is the kind of work he wants automated, the way compilers automated hand-tuned assembly.
+
+## What an optimizer actually does
+
+Once you have a working program, a set of examples and a metric, a DSPy **optimizer** runs the program many times and searches for a version that scores better. The menu Omar described:
+
+- **Few-shot demos.** Run the program on training examples, keep traces that pass the metric, and insert the best ones as demonstrations. One variant he described looks for *high-variance* examples (ones the program sometimes gets right and sometimes wrong) and keeps the successful trajectories as demos, so the system sees what it does when it succeeds. He likened it to reinforcement learning, but in prompt space.
+- **Instruction rewriting.** Propose and test new instructions. **GEPA** is a recent DSPy optimizer of this kind.
+- **Weight updates.** Fine-tune the model on successful traces (filtered behavior cloning) or with reinforcement learning (GRPO).
+
+In code, all of these share one shape: a metric function, a training set, and a `compile` step. Again a sketch:
+
+```python
+def exact_team(example, pred, trace=None):
+    # The metric IS the spec the optimizer sees. Make it check what you care about.
+    return example.team == pred.team
+
+trainset = [dspy.Example(message=m, team=t).with_inputs("message") for m, t in train_pairs]
+devset = [dspy.Example(message=m, team=t).with_inputs("message") for m, t in dev_pairs]
+
+optimizer = dspy.BootstrapFewShot(metric=exact_team, max_bootstrapped_demos=3)
+compiled = optimizer.compile(route, trainset=trainset)
+
+dspy.Evaluate(devset=devset, metric=exact_team)(compiled)  # judge it on data it never saw
+```
+
+Omar's practical advice: run several optimizers (overnight, or while you do something else) and compare. Sometimes the result is much better than what you wrote; sometimes the gain is marginal, which is useful to know too, because it tells you there's not much left to get without changing the program.
+
+## The metric is the spec
+
+Look at what the optimizer actually consumes: your program, your examples and your metric. It has no other window into what "good" means. Whatever the metric rewards is, as far as the search is concerned, the specification. This is why the instructors' closing observation landed: everything Omar described (swapping models, trying optimizers, testing a smaller model) silently assumed an **eval set**, and that eval set only existed because error analysis came first.
+
+Three consequences follow, and the core lessons already teach the tools for each:
+
+- **A weak metric gets gamed.** If the metric only checks that the output parses, every candidate scores 100% and the search has nothing to climb. If your judge waves through failures, the optimizer will happily find prompts that produce those failures. Validate any LLM judge you use as a metric first, as in [Automated evaluators](/courses/ai-evals/automated-evaluators) and [Trusting your judge](/courses/ai-evals/trusting-your-judge).
+- **Wrong labels get learned.** An optimizer that picks demos by agreement with gold labels will reward a mislabeled example and may even copy it into the prompt.
+- **Train scores flatter.** Demos come from the training set, so training examples effectively have their answers in the prompt. Always score the compiled program on a held-out dev set, and keep a test set you look at once. The rules are the same train, dev and test discipline you use for [judge prompts](/courses/ai-evals/automated-evaluators#train-dev-and-test-splits).
+
+<EvDemoOptimizerLab />
+
+Things to try in the lab: run the optimizer with the defaults and see how many demo sets tie on train while differing on held-out. Turn the spec on and run it again: it now reaches 100% on train by including the mislabeled T8, and held-out drops to 75%. Fix T8's label and the overfitting disappears. Switch the metric to "valid label only" and every program becomes "perfect".
+
+## Where optimization helps, and where it doesn't
+
+| Situation | Will an optimizer help? | Why |
+|---|---|---|
+| You swapped models and quality dropped | Often, yes | The spec is unchanged; the new model needs a different last mile |
+| You want to try a much smaller, cheaper model | Often, and by more | Smaller models have more headroom, so optimizers tend to give "more bang for the buck" |
+| The task is well specified but fails on a long tail of inputs | Yes, if you have labeled examples | That is the generalization gulf, exactly what optimizers target |
+| The prompt never states a rule your labels depend on | Not reliably | The optimizer may fit the training examples, but the rule stays unwritten and held-out cases keep failing. Write it down |
+| The model needs private or changing knowledge (your emails, today's inventory) | No | That is a missing tool or data source; add it to the program |
+| You have no dataset and no metric yet | No | There is nothing to optimize against; do error analysis first |
+
+Omar was relaxed about the last row. He estimates that around 40% of DSPy users have **never run an optimizer**, because they have no dataset, and they are happy: they use DSPy for the programming model alone. His comparison is a C++ programmer who never thinks about compiler optimization flags because their code is simple. Optimizers are there when you need them.
+
+<Callout kind="warn">
+Fix specification failures first, in the program, before reaching for an optimizer. The [Improving accuracy and cutting cost](/courses/ai-evals/improvement-and-cost) lesson orders fixes the same way: quick spec fixes, then structural changes, then heavier machinery. An optimizer is heavy machinery for the generalization gulf.
+</Callout>
+
+## Why "give me a better string" is the wrong ask
+
+The request Omar refuses most often is: "here is my bad prompt string, give me a better string, and I'll paste it back into my code." DSPy says no, and its optimizers only work on programs written as signatures and modules.
+
+His analogy: imagine handing a C++ compiler a chunk of slow assembly and asking for faster, weirder assembly to paste into your codebase. You would lose readability (nobody knows what the snippet means), portability (it was tuned for one machine) and maintainability (the next engineer can't change it safely). An optimized prompt string is the same: emojis and odd phrasing that may have helped GPT-4 won't necessarily help the next model or an open-weights one. You end up maintaining the artifact instead of the intent.
+
+What you should maintain instead is the source: a readable program that states your intent, plus the eval set and metric that define success. Optimizers then regenerate the model-specific last mile whenever the model changes.
+
+## Omar's outer loop
+
+Asked how he actually builds a system, Omar described a loop that closely tracks this course:
+
+1. **Find out what the stakeholders want.** How much effort this takes depends on the project. On a research benchmark the dataset *is* the ground truth (even if it's wrong), so comprehension is less pressing. With opinionated users, understanding them is most of the work.
+2. **Write the shortest program that could possibly work.** Often one line: inputs, outputs, chain of thought, and the biggest model you can afford. It's a single step, so it's cheap.
+3. **Watch it fall apart.** Missing knowledge, missing specifications. Do error analysis.
+4. **Grow the program only with what you learned.** Turn the one-liner into a signature class with documented instructions, add field descriptions and types, add tools. "Your spec is your code," because the code contains only what you learned the hard way.
+5. **Decompose when needed.** A ReAct agent with tools is often more future-proof than a hand-built pipeline, because the model chooses the structure. If it keeps calling tools in the wrong order and you know the right order, replace it with an explicit workflow. Sometimes the reverse works better.
+6. **Collect a dataset as you go.** Failures and tricky edge cases you hit while iterating become your eval set.
+7. **Then optimize.** With a dataset, running several optimizers is a no-brainer. With the eval set in hand you can also ask "would a much cheaper model work?" and answer it in an afternoon.
+
+He adds complexity in a specific order: first complexity that is **inherent to the problem** (a tool the model couldn't possibly do without), then optimizers, and only then **hand-written hacks** that you accept may be obsolete with the next model generation. That last layer is still your job: there is no guarantee the optimizer closes the gap, which is why you're the engineer.
+
+## Cheat sheet
+
+- DSPy's motto is "programming, not (just) prompting": code for structure, English for fuzzy intent, evals for the long tail.
+- Signatures declare tasks without output formats; modules are functions; the model and the adapter are separate, swappable layers.
+- Chain of thought or a ReAct agent is a transformation applied on top of a signature, not a rewrite of the task.
+- Signature instructions are documentation of intent, not guaranteed literal prompt text.
+- Optimizers need three inputs: a program, examples and a metric. They tune demos, instructions or weights.
+- The metric is the spec the optimizer sees. Validate it first, or it will optimize the wrong thing.
+- Demos come from train, so train scores are inflated. Judge a compiled program on held-out data.
+- Optimizers address the generalization gulf only. They can't add a missing rule, tool or data source.
+- Smaller models usually gain more from optimization; optimizers also make model swaps cheap to test.
+- Many users never optimize and that's fine: start simple, and optimize once a dataset has emerged.
+- Don't ask for "a better string" to paste back. Maintain the intent and the eval set, regenerate the rest.
+- Order of complexity: inherent (tools, knowledge), then optimizers, then hand-tuned hacks.

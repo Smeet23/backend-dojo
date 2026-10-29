@@ -1,0 +1,231 @@
+import { EvQuestionRouter } from "@/components/widgets/EvQuestionRouter";
+
+## How to use this page
+
+In the second half of the course Hamel Husain and Shreya Shankar held four more office hours, including a bonus session in the final week: about three and a half hours of questions. By then students had built judges and review tools, so the questions moved on: retrieval over thousand-page documents, guardrails at run time, where to store labels, LoRA, and how to change a company's habits.
+
+This page groups those answers by theme, merges duplicates and drops logistics. As in [Office hours: questions from the first half](/courses/ai-evals/office-hours-part-1), each answer links to the lesson that teaches the technique, and the space here goes to the rules of thumb, numbers and war stories the lessons don't contain. Where a question repeats one from the first half, it points there.
+
+If you arrived with a question of your own, type it into the router below. It points you to the answer on this page and to the lesson that covers the topic in depth.
+
+<EvQuestionRouter />
+
+## Retrieval and long documents
+
+### What RAG problems show up most in practice?
+
+Hamel described a typical consulting case: an internal customer-service assistant whose answers the support team didn't trust. Nobody knew if the trouble was **retrieval or generation**, because nobody had done error analysis. Once they did, retrieval was the main problem. Digging into it turned up whole knowledge bases that had never been indexed and no decent labeled data, so the team labeled some and generated more synthetically.
+
+The metric also had to fit the system. Their infrastructure could show the LLM only **seven documents**, and many documents could contain the answer, so the right measure was **hit rate**: does at least one of the seven contain the answer? Textbook precision and recall didn't fit that situation. His summary: "Almost all problems stem from not doing error analysis." Retrieval metrics are in [Retrieval metrics](/courses/ai-evals/rag-and-agents#retrieval-metrics); the failure catalog is in [Pitfalls in evaluating RAG](/courses/ai-evals/rag-evaluation-pitfalls).
+
+### How much of the context window should I fill?
+
+Shreya's rule of thumb is to use at most about **70%** of the advertised window. For tasks where the model must attend to every word, such as extracting *every* instance of something from a document, she treats the effective window as about **35%** of the advertised one. In practice she thinks in pages rather than tokens: no more than about **50 PDF pages** in one prompt with GPT-4.1-class models.
+
+### How should I chunk?
+
+Both instructors chunk by **units a domain expert would recognize**, such as pages, sections and standalone parts of a document, not by token counts ("I don't even know what 200 tokens means"). For a large documentation site, a reasonable first pass is one chunk per page in the site map, then check with some data analysis whether that holds up. Hamel's example of what not to do is reaching for a framework's generic splitters (a recursive splitter that breaks on commas) because it feels like pushing a button. See [Evaluating and tuning chunking](/courses/ai-evals/rag-and-agents#evaluating-and-tuning-chunking).
+
+### Chunks lose the context the model needs
+
+A healthcare student searched inpatient charts that average **700 pages** and reach 5,000, looking for evidence supporting diagnosis codes across labs, progress notes and discharge summaries. A single chunk rarely carries what the model needs to interpret it.
+
+Shreya does the same thing in legal work: **extract document-level metadata** (a summary, a table of contents, the document type, case-level facts) with an LLM and **attach it to every chunk**. A public defender's police report and court records all get the same case-level header. For medical charts that could be the discharge summary plus structured fields like allergies and date of birth, even if the header runs to three pages. Start with generous metadata and trim only if evals show it is polluting the context: "It's much easier to remove from metadata than add to the metadata."
+
+### Documents amend or contradict each other
+
+A construction student had contracts of hundreds of pages, change orders and addenda that modify them, and drawings and specifications that may conflict, across terabytes. Should precedence rules live in retrieval or in generation?
+
+Shreya had seen the same shape in medical billing, where documents are linked even when nothing says so. The fix there was to **build a link table**: for every document, record which other documents can affect it. When retrieval returns a document, also fetch everything linked to it. In that setting no case had more than about **10** linked documents, so they fit in a long-context prompt, or an agent can pick the relevant snippets before the final generation. Keeping the table current is a data-processing job of its own, and worth it. Hamel suggested thinking of it as a project ontology that covers both which documents connect and which people ask which questions.
+
+Another student did this at query time instead: one pass to summarize, a second pass asking the LLM for related passages. It worked in spot checks, but it was slow and costly. Shreya's advice was to move whatever you can **offline** (summaries, link computation) and to put an eval on each step. Start with retrieval: generate queries where you know which documents and links hold the answer ([Build a retrieval eval dataset](/courses/ai-evals/rag-and-agents#build-a-retrieval-eval-dataset)). In contract work, one sentence can change the whole answer, so skipping evals is not an option.
+
+### Citations that survive summaries of summaries
+
+A healthcare team needed accurate citations through several layers of summarization. Shreya's approach "sounds really simple, but I've seen it work":
+
+1. Ask the summarizer for **line-number citations** on each sentence.
+2. Use those line ranges to pull the source text back out of the document in code.
+3. Carry the summary *and* the retrieved source lines forward into the next layer, so every level can still point to the original.
+
+If the document has no line numbers, add them: rewrap the text at about 80 characters on word boundaries and prefix each line with its number. For PDFs she runs OCR first (Azure's OCR is good enough for her), which also frees her to try models that don't accept PDFs.
+
+### Scanned documents: missing fields and high cost
+
+A team extracted attributes from 20 to 25 types of niche documents (some scanned, with stamps and handwriting) using AWS Textract followed by an LLM. Fields went missing, numeric totals were often wrong, and the client wanted the cost cut from 3 to 4 rupees per document to about 1. The student wanted to propose fine-tuning a 7B model, but the team resisted.
+
+Hamel's sequence: write the evals, run them on the **current pipeline as a baseline**, then try **simplifying** it, for example a multimodal model that reads the page directly instead of OCR plus text, since every conversion step loses information. The student's own idea fits well: classify the document type first, then give the model a schema listing the required attributes for that type, so it looks for each one instead of silently dropping it. With evals in place, "should we fine-tune a small model?" becomes a comparison you can run and show the team, not an argument.
+
+## Agents, tools and code
+
+### Should tools be described in the system prompt too?
+
+Not by default. Put clear descriptions in the **tool schemas** and leave them out of the system prompt. If evals then show the model choosing the wrong tool, add guidance on *when* to use which tool to the system prompt. The real rule is consistency: never mention a tool in one place and not the other, and never let the two descriptions conflict. Inconsistency is the usual cause of hallucinated tool calls ([Example: hallucinated tool invocation](/courses/ai-evals/automated-evaluators#example-hallucinated-tool-invocation)).
+
+### Generated code gets the logic backwards
+
+A student's agent translated trading strategies from prose into code and sometimes reversed buy and sell conditions. He had real strategy code and proposed running it backwards. Shreya confirmed this is a standard trick: in text-to-SQL work she takes **queries that already exist** (say, in BI tools), has a strong reasoning model write the natural-language question each one answers, and uses those pairs as ground truth. She often tells it to add realistic mess, such as ambiguity or a misspelled column name. The same works for strategies: real code, then a generated description, gives you a test case with a known answer.
+
+### Long outputs that mix code and reasoning
+
+A lab-automation project generated Python for a liquid-handling robot plus pages of reasoning about calibration, all of which a scientist had to audit. Running the code catches crashes, but the risky part was the values and method choices inside it.
+
+Shreya's framing: work out the **minimum** a human must check, and extract it programmatically. Parse the code's syntax tree and pull out the nodes that set temperature, pressure or the method combinations, then show only those in a review screen. Have the model format its reasoning as a list of steps. As a bonus, asking the LLM to produce that reviewable summary *before* the full output often improves the output itself. See [Show the minimum, keep the rest one click away](/courses/ai-evals/human-review-interfaces#show-the-minimum-keep-the-rest-one-click-away).
+
+### What about long-term memory?
+
+Shreya was candid that she hasn't built memory systems and pointed to Letta (formerly MemGPT) from her Berkeley lab. Her product advice: most apps have bigger problems to fix first. If users insist, copy coding tools like Cursor and let users **reference earlier chats explicitly** (an `@` mention). The system then never has to decide what to keep and what to forget, which is where memory bugs come from.
+
+## Guardrails, judges and models
+
+### Errors we can't drive to zero
+
+A student had two run-time failures: the agent mangling one character of a device ID (easy to check in code), and the agent answering without calling any tool first, which in their domain meant it must be making the answer up (hard to check).
+
+- **Any eval can run in the critical path.** The questions are cost and latency. Driving errors to zero has infinite cost, so decide what you can afford.
+- **Retries look like thinking.** When a guardrail fires, the usual pattern is to feed the error back and regenerate while the user sees a "still working" spinner.
+- **Approximate code guardrails are underrated.** For ungrounded answers, Shreya suggested a crude check: does each content word in the answer appear somewhere in the tool outputs? It is only an approximation, so evaluate the guardrail itself against labels; if it catches most failures cheaply, it can cut the rate a lot. She uses "95% approximations" like this all the time.
+- **Fine-tuned classifiers are the heavy option.** A small BERT-style guardrail is fast, but needs thousands of labeled examples. Off-the-shelf LLM judges in the critical path are rare.
+
+### Guardrails versus evaluators
+
+They are the same mechanism (code checks or LLM judges) in different places. Guardrails sit **in the request path**, so they should be fast, simple, explainable, aimed at specific high-impact failures, and low on false positives, because every false positive is a bug the user sees. When one fires, the system redacts, refuses or regenerates. Evaluators run **after** the response, with no such constraints. Hamel's warning: never adopt an off-the-shelf guardrail without reading its prompt. In his blog post "Show me the prompt", a popular guardrails library turned out to issue several hidden prompts and correction calls just to get valid JSON. Compare with [Guardrail or async eval?](/courses/ai-evals/ci-cd-and-monitoring#guardrail-or-async-eval) and the cost discussion in [Guardrail: LLM or separate classifier?](/courses/ai-evals/office-hours-part-1#guardrail-llm-or-separate-classifier).
+
+### Should we run each judge several times?
+
+One student proposed running a binary judge five times and flagging a trace if any run fails. Shreya's experience: a well-defined binary judge usually gives the same answer every time, so repeats add cost without signal. Repeats help more with Likert scales and many-class outputs, which vary between runs, and she rarely sees anyone take majority votes in production. Build the simple judge, align it, and trust it. When voting does help is covered in [Why voting helps, and where it stops](/courses/ai-evals/scaling-judge-compute#why-voting-helps-and-where-it-stops).
+
+### A published rubric uses a 1 to 5 scale
+
+A healthcare startup wanted to reuse a published rubric for grading clinical summaries (PDSQI): 1-to-5 scores per attribute, validated with physician raters, plus a preprint that ran an o3-mini judge seven times and compared median scores with humans using the intraclass correlation (ICC).
+
+Shreya's view: Likert judges aren't wrong, they are just **harder to align**, so start binary and add complexity only when binary fails ([Prefer binary pass/fail](/courses/ai-evals/evals-fundamentals#prefer-binary-passfail-over-1-to-5-scales)). Seven reasoning-model calls per item is too expensive for most teams. Still, this rubric defines every scale point, which is better than most "rate 1 to 5" prompts, and a published rubric is probably in the models' training data. Her verdict: a fine starting point, but validate it on your own labeled data. Most teams don't have this luxury: their criteria come from their own error analysis, and they must invent the rubric while aligning the judge.
+
+### Comparing two models fairly
+
+To compare GPT-4.1 and GPT-5 without either judging itself, the recommendation was **pairwise preference**: run the same inputs through both, show the outputs side by side without model names, and have a human pick one. This is how Chatbot Arena works, and it extends to *k* models at once. It is only valid when the model is the *only* difference. About **100 comparisons** usually gives a solid ranking. An LLM can stand in as judge, but LLMs have odd preferences (often for longer answers), so use human judgment where you can.
+
+### Picking a model without overspending
+
+A billing team, where one claim can be worth $6,000 to $20,000, asked where to start on model cost. Shreya first **splits the task into subtasks** and expects a different model for each. For hard reasoning she starts with a top model and steps down until she finds the cheapest one that still meets the bar. For easy classification she starts with the smallest model and checks it is good enough. Her usual picks at the time: GPT-4.1 nano for classification, GPT-4.1 for extraction, o3 for tool use and reasoning. See [Model cascades](/courses/ai-evals/improvement-and-cost#model-cascades).
+
+### How do you check a new model release?
+
+Public benchmarks are "lossy": you can't draw a straight line from them to your use case. When GPT-5 came out, Hamel ran his application evals on it and went by the numbers. He also vibe-checks every new model in his own work, using an app that sends one prompt to several models side by side. One informal test: extract all the questions from an office-hours transcript; GPT-5 caught noticeably more than the others, "but not a landslide." Some choices are easy: for video plus slides plus transcript, Gemini was simply the best multimodal model. More in [Benchmarks versus application evals](/courses/ai-evals/evals-fundamentals#benchmarks-versus-application-evals).
+
+### LoRA, RL and the fine-tuning question
+
+This builds on [When is fine-tuning worth it?](/courses/ai-evals/office-hours-part-1#when-is-fine-tuning-worth-it). New points from these sessions:
+
+- **LoRA is just a cheaper way to fine-tune.** Its main advantage is cheaper serving, so if you fine-tune an open model, use it.
+- **Count the whole bill.** An efficient supervised fine-tuning run can cost on the order of $50, but you must retrain whenever the base model or your data changes, keep servers up, and pay the people who run them. For moderate traffic, paying an API provider is often cheaper.
+- **RL is rare in production** outside the big labs. Supervised fine-tuning (SFT) is far more common.
+- **Prompting usually gets there.** Shreya finds that a clear specification plus several rounds of error analysis gets a reasoning model like o3 to do her tasks well. Fine-tuning a smaller model would only be about cost.
+- **Error analysis doesn't stop when RL starts.** You need it to design the reward and evals to tell whether training worked. RL is a layer on top of what the course teaches.
+
+## Review tools and data plumbing
+
+### Our output is a report, not a chat
+
+A mystery-shopping company exported reports with 300 to 5,800 columns (multiple-choice answers plus a narrative per area of the venue), and an LLM flagged inconsistencies between them for editors. The student was in "spreadsheet hell." Shreya said it isn't so different from chat: build a custom view of **the report**. Her design rule is to **think about the one cell the reviewer is editing** and show everything needed to fill it in. Here that means one screen per area, with the questions, the narrative and the AI's comment together, and a button to the next area. And to "what about later?" the answer was: solve the problem you have now. See [Principles of effective review interfaces](/courses/ai-evals/human-review-interfaces#principles-of-effective-review-interfaces).
+
+### Should we build our own eval tool?
+
+A student found LangSmith too general and asked whether to build the whole eval stack in-house. Hamel: "Dumb is smart." He often does a whole analysis with logs in a local SQLite file pulled into notebooks with small widgets. When he does use a platform (Braintrust, LangSmith, Phoenix), he treats it mainly as a **database**, with his own vibe-coded apps reading and writing to it, and its UI as an escape hatch for anyone who wants to browse. He has written small converters to get data out of vendor schemas into plain data frames (such as his `langfree` library for LangSmith), and suggests you vibe-code your own rather than adopt his. Online monitoring is the exception: there a platform earns its place. Compare [When a platform helps, and when it doesn't](/courses/ai-evals/eval-platforms#when-a-platform-helps-and-when-it-doesnt).
+
+### Where should traces and labels live?
+
+A team stitching traces together with SQL queries asked whether to trace in Datadog, in Braintrust, or locally. Shreya's answers:
+
+- If you already have an observability tool, **log there too**; all you need is the traces. Otherwise **pick one provider** and don't fragment. She called them all "equally subpar" for annotation, so invest in the export pipeline into your own review app.
+- Run the annotation app locally if you are the only user. For experts or teammates, host it (she deploys a FastAPI and React app on Modal).
+- Her storage is plain Postgres (Supabase, for instance): **one row per trace**, the trace as a JSON blob, and **one column per annotator**, because people annotate whole traces. Multi-call turns live inside the blob.
+
+### Where do prompts live?
+
+The answer was **git**: text, YAML or Python files, templated with Jinja and loaded into code programmatically. A developer's bias, admittedly, but it means prompts get versioning and review like any other code.
+
+### Users want to give more than a thumbs down
+
+Engineers using a troubleshooting assistant wanted to mark which of 15 suggested fixes were relevant. Shreya's suggestion: after a thumbs-down, show a **short form of about three yes/no questions specific to your domain** and see whether people use it. An AI fashion app she knew asked things like "Did we get the weather right?", which gave a lot of lift. Binary answers are also labels you can align judges against straight away. As for "can the AI learn from my feedback?", that is memory, covered above.
+
+## Running the loop
+
+### Can we automate the improvement loop?
+
+A team building eval infrastructure (parallel runs, owners alerted when an eval fails in production) wanted to automate the fix as well. Shreya: automate **one kind of improvement** at a time. Prompt changes are the tractable case: an optimizer proposes an edit, runs your evals, keeps it if the metric improves and repeats. DSPy is the best-known tool ([DSPy and the metric as the spec](/courses/ai-evals/dspy-fireside-chat)), and judge explanations can feed the proposals ([prompt learning](/courses/ai-evals/evaluating-agents#from-evals-to-better-prompts-prompt-learning)). Open-ended fixes, like adding retrieval or decomposing the task, are too loosely defined for agents to automate yet.
+
+### Will eval automation tools stop people looking at data?
+
+A student asked whether "push a button" tools that draft judges could help by giving people something to react to. Hamel admitted he was changing his mind. Clients who bought a tool that promised to do their evals for them got stuck, but automation that **shows you something you didn't know** can motivate people to look at data. LLMs can help draft open codes, cluster axial codes and write judge prompts, as long as a human keeps steering, the way you review an AI coding plan instead of coding with your eyes closed. Keeping the human engaged is the open problem. Criteria drift is why it matters ([EvalGen and criteria drift](/courses/ai-evals/human-review-interfaces#case-study-evalgen-and-criteria-drift)).
+
+### How do we prioritize failure modes?
+
+A student whose product managers prioritized features over accuracy wanted to rank failures by prevalence instead. Hamel agreed, with one caveat: **not all failures are equal**. A catastrophic failure at 5% can outrank an annoying one at 15%. Usually you can just say so; you rarely need elaborate weights. Shreya added that every fix is an experiment like a feature and should be measured and celebrated like one. Many people think whatever an LLM does off the shelf is the ceiling, so show the metric moving. And if you sample traces from negative user feedback, remember that is **the tip of the iceberg**: stay skeptical and follow clues to failures nobody flagged.
+
+### Is my mental model of the process right?
+
+A student drew the whole lifecycle as one flowchart. Shreya's feedback: break "improve" into its options (prompt, decompose and so on) and draw its arrows back to the trace dataset and to measurement. In later rounds you can skip steps, for example applying existing axial codes to new traces instead of open coding from scratch. That takes judgment. Hamel's point was that the value is in drawing the diagram yourself, not in the drawing: as you practice, you'll find your own shortcuts ([The whole course in one picture](/courses/ai-evals/improvement-and-cost#the-whole-course-in-one-picture)).
+
+### Writing assistants and other subjective outputs
+
+A student built a tool to help colleagues write blog posts in a shared voice, and found that open coding long, style-heavy text was hard. Hamel writes with AI all day. He admitted he hasn't formally evaluated his own writing workflow: as its only user, he has a fast enough feedback loop. What he does do:
+
+- Put **3 or 4 of the writer's own finished posts** in context. Per-person examples are a cheaper way to keep individual voices than per-person fine-tunes.
+- Have the model draft an **outline first** and edit it; if you never change the outline, that is a smell.
+- Generate and edit **one section at a time**, so later sections are grounded in your edits.
+- Reduce friction: talk through the topic into a voice app on a walk, and use **transcript and finished-post pairs** as the in-context examples.
+
+## Teams, adoption and careers
+
+### Changing a "prompt and pray" culture
+
+The "sell evals to leadership" question was answered in [How do we sell the time?](/courses/ai-evals/office-hours-part-1#how-do-we-sell-the-time). The new question was how to change habits, and the answer was to **lead by example and with results**:
+
+- **Look at data together.** Hamel doesn't lecture clients. When a problem comes up, he opens the traces with them. After three or four sessions that find the cause every time, "it almost becomes embarrassing to not" look at data.
+- **Make it visible work.** Shreya: engineers get credit for commits, so make error analysis produce trackable artifacts too, such as a repo of open and axial codes.
+- **Publish a narrative.** Hamel: share regular notes on what you fixed, what you caught and what you learned, without using the word "evals."
+- **Copy a small start.** Teresa Torres began in Airtable and a notebook and added tooling over months ([From no evals to five as a PM](/courses/ai-evals/evals-for-product-managers)).
+
+### The team isn't ready
+
+A consultant's client team ran documents through ChatGPT by hand, had no data pipeline and no time to annotate. Hamel: evals aren't needed on day one, and if a pipeline comes first, build it. You can't force a team that feels no pain; sometimes you wait for the "motivating moment" when the product visibly fails, much as developers learn to write tests only after maintaining untested code. A team still making demos without a clear goal may not be ready for evals at all, but should still be reading traces. Shreya's line: she won't take on an organization with no data-savvy person, because she would have to become that person. If you do, tell them to hire your replacement. Onboard people into a habit first ("always look at the AI's outputs"), and the formal process follows when they want to automate it.
+
+### Standardizing across a large organization
+
+For a company building on Azure, AWS Bedrock and low-code tools alike, Shreya said the lifecycle is tool-agnostic. **Centralize** the process (analyze, measure, improve), the training (Hamel's FAQ and a short email course rather than a month-long course) and, if you like, one tracing tool that spans stacks. **Keep local** the domain experts who judge each area. Two things vary by team: privacy and data residency (regulated data may require the whole stack in one region), and **how accurate the application must be**. The student added a hard lesson: agree the acceptable error rate up front, before discovering deep into a project that the client expected 0% from generative AI.
+
+### Showing these skills when everyone talks benchmarks
+
+A student felt the industry cared about leaderboards, not error analysis. Hamel's advice: "Let the results win. Don't let the ideology win." Don't argue for evals; do the work and show it. That means the failure modes you found, the data behind them, a judge that shows the scale, and a fix, every week. People will ask how you do it, and the course gives you the vocabulary to answer. He noted that the people who talk about evals publicly are mostly data scientists who worked in industry, where looking at data was routine.
+
+### Evaluating a vendor's AI product
+
+A student assessing a requirements-to-code platform found the vendor meant "online LLM judges" by evals and nothing about error analysis. Shreya's heuristic as a buyer: **if she could do it in Claude Code, she doesn't buy it.** A product's moat is its data and whether it runs the eval lifecycle to encode taste ("otherwise it will be tasteless"). It is the vendor's job to turn your emailed complaints into fixes, and how they do that tells you a lot.
+
+### Learning the material faster
+
+Tips from instructors and students: put the course reader into a chat model and ask questions at your own level. Point a coding agent at the homework repo, have it explain a piece (say BM25), quiz you, then build a toy version on a few recipes. And write up what you learn, which fixes it in your mind and helps others.
+
+## Cheat sheet
+
+- RAG trouble usually turns out to be retrieval, found only by error analysis; pick the metric that fits the system (hit rate for a fixed top 7).
+- Fill at most about 70% of the context window, about 35% for exhaustive extraction; think in pages, roughly 50 PDF pages per prompt.
+- Chunk by units experts recognize; attach document-level metadata to every chunk, generous at first.
+- Linked or amending documents: precompute a link table, fetch links with each hit, move work offline, eval retrieval first.
+- Citations: ask for line numbers, pull source lines in code, carry them through every summary layer.
+- Extraction pipelines: baseline with evals, then simplify (multimodal input, per-type schemas) before arguing for fine-tuning.
+- Tool descriptions belong in schemas; the sin is inconsistency between schema and prompt.
+- Back-translate known code or SQL into questions to get ground truth.
+- Guardrails are evals in the request path: fast, targeted, low false positives; approximate code checks go a long way; read any vendor guardrail's prompt.
+- Binary judges rarely need repeated runs; start binary even when a published Likert rubric exists.
+- Compare models with blind pairwise preferences on identical inputs; about 100 comparisons ranks them.
+- Pick models per subtask: step down from strong models for reasoning, up from nano for classification.
+- LoRA cuts serving cost; count retraining, servers and people before fine-tuning; RL still needs error analysis.
+- Review UIs for reports: design around the one cell the reviewer edits.
+- Storage can be simple: one row per trace, JSON blob, one column per annotator; prompts in git.
+- After a thumbs-down, ask three domain-specific yes/no questions.
+- Automate one kind of fix (prompt optimization); keep humans steering anything open-ended.
+- Rank failures by prevalence and severity; user-flagged failures are the tip of the iceberg.
+- Change culture by looking at data with people and publishing results, not by preaching evals.
+- Agree the acceptable error rate up front; a product's moat is its data and its eval loop.
