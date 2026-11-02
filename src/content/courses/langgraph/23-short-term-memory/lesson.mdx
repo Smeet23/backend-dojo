@@ -1,0 +1,483 @@
+import { LgTrimBudget } from "@/components/widgets/LgTrimBudget";
+import { LgTrimVsSummary } from "@/components/widgets/LgTrimVsSummary";
+
+## From buffer to LangGraph
+
+The previous lesson built memory from first principles. An LLM is stateless, so to hold a conversation you keep a **conversation buffer** (every message so far) and resend it on each call. That buffer is **short-term memory**, it's **scoped to one thread**, and it has two practical problems: it's **fragile** (it dies with the process) and it **grows without bound** until it overflows the context window.
+
+This lesson does the same thing in LangGraph, in three stages:
+
+1. **Implement** short-term memory with a checkpointer and thread IDs.
+2. **Persist** it in Postgres so it survives restarts.
+3. **Control its size** with three techniques: trimming, deleting and summarizing messages.
+
+Setup for the examples:
+
+```bash
+pip install -U langgraph langchain "langchain[openai]"
+export OPENAI_API_KEY=sk-...
+```
+
+## Checkpointers and threads
+
+In LangGraph you don't manage a `messages` list by hand. The graph's **state** already holds the messages, and a **checkpointer** saves that state for you.
+
+A checkpointer takes a **snapshot of the graph state after every super-step** (each round of node execution) and files it under a **thread ID**. When you invoke the graph again with the same thread ID, LangGraph loads the latest snapshot for that thread, so the new message is appended to the existing history. A different thread ID means a different, independent history.
+
+So short-term memory in LangGraph is two pieces:
+
+| Piece | What it does |
+|---|---|
+| Checkpointer | Saves and loads state snapshots (in RAM, SQLite, Postgres, and so on) |
+| `thread_id` | Says which conversation a call belongs to |
+
+## A chatbot without memory
+
+Start with the simplest chat graph: one node that calls the model.
+
+```python
+from langchain.chat_models import init_chat_model
+from langgraph.graph import StateGraph, MessagesState, START, END
+
+model = init_chat_model("openai:gpt-4.1-mini")
+
+def chat(state: MessagesState):
+    reply = model.invoke(state["messages"])
+    return {"messages": [reply]}
+
+builder = StateGraph(MessagesState)
+builder.add_node("chat", chat)
+builder.add_edge(START, "chat")
+builder.add_edge("chat", END)
+
+graph = builder.compile()  # no checkpointer
+```
+
+`MessagesState` is a prebuilt state with one key, `messages`, whose reducer (`add_messages`) **appends** new messages instead of overwriting the list.
+
+Now talk to it twice:
+
+```python
+graph.invoke({"messages": [{"role": "user", "content": "Hi, I'm Asha."}]})
+out = graph.invoke({"messages": [{"role": "user", "content": "What's my name?"}]})
+print(out["messages"][-1].content)
+# I'm sorry, I don't know your name.
+```
+
+Each `invoke` starts from empty state, so the second run only contains "What's my name?". The reducer appends within one run, but nothing carries over between runs.
+
+## Adding an in-memory checkpointer
+
+Compile the same builder with a checkpointer and pass a thread ID in the config:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+graph = builder.compile(checkpointer=InMemorySaver())
+
+config = {"configurable": {"thread_id": "thread-1"}}
+
+graph.invoke({"messages": [{"role": "user", "content": "Hi, I'm Asha."}]}, config)
+out = graph.invoke({"messages": [{"role": "user", "content": "What's my name?"}]}, config)
+print(out["messages"][-1].content)
+# Your name is Asha.
+```
+
+On the second call LangGraph loaded thread-1's saved state (two messages), the reducer appended the new question, and the node sent all three to the model.
+
+You can inspect what a thread holds at any time:
+
+```python
+state = graph.get_state(config)
+for m in state.values["messages"]:
+    print(f"{m.type}: {m.content}")
+# human: Hi, I'm Asha.
+# ai: Hi Asha! How can I help?
+# human: What's my name?
+# ai: Your name is Asha.
+```
+
+And a new thread ID is a new conversation:
+
+```python
+other = {"configurable": {"thread_id": "thread-2"}}
+out = graph.invoke({"messages": [{"role": "user", "content": "What's my name?"}]}, other)
+# "I don't know your name yet."
+```
+
+<Callout kind="remember">
+No checkpointer means no memory between invocations. A checkpointer **without** a `thread_id` in the config raises a `ValueError`, because LangGraph wouldn't know which conversation to load.
+</Callout>
+
+## Persisting short-term memory in Postgres
+
+`InMemorySaver` keeps snapshots in a Python dict, so it's as fragile as the hand-made buffer: restart the process and every thread is empty. That's fine for notebooks and tests. For anything users depend on, store checkpoints in a database. LangGraph ships SQLite and Postgres checkpointers, and Postgres is the usual production choice.
+
+### Running Postgres with Docker
+
+Installing Postgres natively often brings OS-specific trouble, so run it in a container. With Docker Desktop installed and running (`docker --version` should print a version), create `docker-compose.yml`:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: langgraph
+    ports:
+      - "5442:5432"   # host port 5442 -> container port 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
+```
+
+```bash
+docker compose up -d      # start in the background
+docker ps                 # the postgres container should be listed
+pip install -U langgraph-checkpoint-postgres "psycopg[binary,pool]"
+```
+
+The named volume keeps the data even if the container is recreated.
+
+### Using PostgresSaver
+
+The graph code doesn't change. Only the checkpointer does:
+
+```python
+from langgraph.checkpoint.postgres import PostgresSaver
+
+DB_URI = "postgresql://postgres:postgres@localhost:5442/langgraph?sslmode=disable"
+
+with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    checkpointer.setup()  # creates the checkpoint tables; safe to call again
+
+    graph = builder.compile(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": "thread-1"}}
+
+    graph.invoke({"messages": [{"role": "user", "content": "Hi, I'm Asha."}]}, config)
+    out = graph.invoke({"messages": [{"role": "user", "content": "What's my name?"}]}, config)
+    print(out["messages"][-1].content)  # Your name is Asha.
+```
+
+Two details matter:
+
+- `from_conn_string` is a **context manager**: it opens the database connection and closes it when the block ends. Compile and use the graph **inside** the block (in a web server you'd open it once at startup and keep it for the app's lifetime).
+- Call `setup()` once to create the tables. Calling it again is harmless.
+
+Now prove it persists. Restart the Python process, rebuild the graph, and **only read** the state without invoking anything:
+
+```python
+with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    graph = builder.compile(checkpointer=checkpointer)
+    state = graph.get_state({"configurable": {"thread_id": "thread-1"}})
+    print(state.values["messages"][-1].content)
+# Your name is Asha.
+```
+
+The conversation came back from the database. That's production-grade short-term memory: the same graph, a durable checkpointer, and a thread ID per conversation.
+
+### SQLite for local projects
+
+If you don't need a database server (a desktop tool, a CLI agent, a personal project), SQLite gives you the same durability in a single file:
+
+```python
+# pip install -U langgraph-checkpoint-sqlite
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+with SqliteSaver.from_conn_string("chat_memory.db") as checkpointer:
+    graph = builder.compile(checkpointer=checkpointer)
+    graph.invoke({"messages": [{"role": "user", "content": "Hi, I'm Asha."}]},
+                 {"configurable": {"thread_id": "thread-1"}})
+```
+
+| Checkpointer | Survives restart | Many app servers at once | Setup |
+|---|---|---|---|
+| `InMemorySaver` | No | No | None |
+| `SqliteSaver` | Yes | No (one file, one machine) | `pip install` |
+| `PostgresSaver` | Yes | Yes | A Postgres server |
+
+Whichever you pick, the graph and the `thread_id` logic stay identical. That's the point of the checkpointer abstraction: you swap the storage, not the code.
+
+### What a checkpoint holds
+
+Conceptually, each checkpoint is a snapshot of the whole state at that step, plus metadata such as which step produced it (the database savers avoid re-storing values that didn't change, but you can always load any checkpoint as a complete state). `graph.get_state_history(config)` lists every snapshot for a thread, newest first, which is what makes time travel and debugging possible. It also means storage grows with **both** the number of turns and the size of the state, which leads straight to the next problem.
+
+## The context overflow problem
+
+Persistence fixes fragility but makes the second problem worse: threads now live forever and keep growing. Every call sends the **entire** thread to the model. After hundreds of turns with long replies, the input can exceed the model's context window. Most providers then reject the request with a context-length error, and well before that point you pay for every old token on every call, latency rises, and answers get worse because the model struggles to use details buried in a huge input.
+
+Rule of thumb: keep the input **well below** the context window. There are three tools for this, and they differ in one important way: whether they change what the model **sees** or what the state **stores**.
+
+## Trimming messages
+
+**Trimming** sets a token budget for the input. Before each model call you count the tokens in the history. If it fits the budget, send everything. If not, walk backwards from the newest message and keep as many recent messages as fit; drop the older ones from **this call**.
+
+The bet behind trimming: in a long conversation, what matters right now is mostly in the last few dozen messages.
+
+### Trimming inside the chat node
+
+LangChain provides `trim_messages`, which does the counting and cutting:
+
+```python
+from langchain_core.messages.utils import trim_messages, count_tokens_approximately
+
+MAX_TOKENS = 150
+
+def chat(state: MessagesState):
+    window = trim_messages(
+        state["messages"],
+        strategy="last",                          # keep the most recent messages
+        token_counter=count_tokens_approximately, # fast estimate, no tokenizer needed
+        max_tokens=MAX_TOKENS,
+        start_on="human",                         # first kept message must be a user message
+        end_on=("human", "tool"),                 # last kept message must be a user or tool message
+    )
+    reply = model.invoke(window)
+    return {"messages": [reply]}
+
+builder = StateGraph(MessagesState)
+builder.add_node("chat", chat)
+builder.add_edge(START, "chat")
+builder.add_edge("chat", END)
+graph = builder.compile(checkpointer=InMemorySaver())
+```
+
+The graph shape is identical to before. The only change is one function call between reading the state and calling the model.
+
+### Trimming options
+
+| Option | What it controls |
+|---|---|
+| `max_tokens` | The budget the kept messages must fit within |
+| `strategy` | `"last"` keeps the newest messages (what chat needs); `"first"` keeps the oldest |
+| `token_counter` | How to count: `count_tokens_approximately`, or a chat model for exact counts |
+| `start_on` | Message type the kept window must begin with, usually `"human"` |
+| `end_on` | Message type it must end with |
+| `include_system` | Always keep a leading system message, even when cutting |
+| `allow_partial` | Allow cutting a single message in half (usually leave off) |
+
+`start_on` matters more than it looks. Chat APIs reject a history that begins with an orphaned tool result, or with an AI message that requested tools whose results were cut away. Forcing the window to start on a human message keeps the sequence valid. If you put a system prompt at the front of the list, add `include_system=True` so trimming never removes it.
+
+`count_tokens_approximately` estimates from character counts plus a little overhead per message. It's cheap and good enough for budgeting; its numbers won't exactly match the provider's tokenizer, so leave headroom. If you need precision, pass the chat model itself as `token_counter=model`, which uses the model's own counting (slower, and not every provider supports it).
+
+How big should the budget be? Work backwards from the model's context window: subtract the system prompt, any injected documents or memories, tool definitions, and room for the longest reply you expect. What's left is the most the history may use. In practice, budgets far below the window (a few thousand tokens for a chat app) keep calls fast and cheap and rarely hurt quality, because recent turns carry most of the useful context.
+
+### Watching trimming happen
+
+With a 150-token budget, a conversation in one thread might go like this (approximate counts):
+
+| Turn | User says | History tokens | What the model sees |
+|---|---|---|---|
+| 1 | "Hi, I'm Asha." | ~10 | everything |
+| 2 | "I'm learning LangGraph." | ~40 | everything |
+| 3 | "Explain short-term memory." | ~110 | everything |
+| 4 | "What's my name?" | ~260 (the turn-3 answer was long) | only "What's my name?" |
+
+On turn 4, the previous AI answer alone was over budget, so `trim_messages` walked back from the newest message, couldn't fit that long reply, and kept just the question. The model replies that it doesn't know the user's name. That's trimming working exactly as designed, and it also shows its flaw.
+
+<LgTrimBudget />
+
+### Trimming does not delete
+
+`trim_messages` builds a **new list for this one call**. The state is untouched: the checkpointer still stores every message, and `get_state` still returns the full history. That's useful (you can show the user the whole chat, or change the budget later), but it means storage keeps growing and the dropped messages are simply invisible to the model.
+
+<Callout kind="warn">
+Trimming's inherent flaw: it assumes only recent messages matter. Real conversations break that assumption all the time: a name, a constraint or a decision from early on gets silently dropped, and the model carries on as if it was never said.
+</Callout>
+
+## Deleting messages
+
+Sometimes you want old messages **gone from state**, not just hidden for one call. LangGraph supports this through `RemoveMessage`.
+
+The `add_messages` reducer understands a special message: return `RemoveMessage(id=...)` from a node, and instead of appending, the reducer **removes** the message with that ID from the list. Every message in a `MessagesState` gets an ID automatically, so you can target any of them.
+
+A cleanup node that keeps only the last four messages once the thread passes ten:
+
+```python
+from langchain_core.messages import RemoveMessage
+
+def chat(state: MessagesState):
+    return {"messages": [model.invoke(state["messages"])]}
+
+def cleanup(state: MessagesState):
+    messages = state["messages"]
+    if len(messages) > 10:
+        return {"messages": [RemoveMessage(id=m.id) for m in messages[:-4]]}
+    return {}  # nothing to change
+
+builder = StateGraph(MessagesState)
+builder.add_node("chat", chat)
+builder.add_node("cleanup", cleanup)
+builder.add_edge(START, "chat")
+builder.add_edge("chat", "cleanup")
+builder.add_edge("cleanup", END)
+graph = builder.compile(checkpointer=InMemorySaver())
+```
+
+Send six user messages in one thread. After the sixth turn the state holds twelve messages, so `cleanup` removes the oldest eight and `get_state` shows only the last four. Earlier turns stay below the threshold and nothing is removed.
+
+To wipe a thread's history completely, use the sentinel ID:
+
+```python
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+def reset(state: MessagesState):
+    return {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES)]}
+```
+
+| | Trimming | Deleting |
+|---|---|---|
+| Changes what the model sees | Yes | Yes |
+| Changes stored state | No | Yes, permanently |
+| Storage keeps growing | Yes | No |
+| Old content recoverable | Yes (still in state) | No |
+
+When deleting, keep the history valid. Don't remove an AI message that made tool calls while keeping its tool results (or the reverse), and ideally make the remaining history start with a user message. Deleting on its own still forgets, just like trimming; its real value is as the second half of summarization.
+
+## Summarizing messages
+
+**Summarization** fixes trimming's flaw. You still send only the most recent messages, but the older ones aren't simply thrown away: a model first **condenses them into a summary**, and every call gets the summary plus the recent messages.
+
+It's a **rolling summary**. Say you keep the last 100 messages. At 500 messages, the oldest 400 are summarized; the model sees that summary plus the latest 100. When another 100 arrive, you summarize the newly old ones and **merge** them into the existing summary, so the summary always covers everything before the recent window. However long the chat gets, the input stays roughly constant in size and the important facts survive.
+
+After summarizing, **delete** the summarized messages from state with `RemoveMessage`. If you kept both the old messages and their summary, the state would hold the same information twice, keep growing, and could confuse the model. So deleting and summarizing work as a pair.
+
+We'll build a small version: summarize whenever the thread has **more than 6 messages**, keeping the **last 2**.
+
+### The state
+
+`MessagesState` has only `messages`, so extend it with a place to keep the summary:
+
+```python
+from langgraph.graph import MessagesState
+
+class State(MessagesState):
+    summary: str
+```
+
+`summary` has no reducer, so a node returning `{"summary": ...}` overwrites it, which is what we want for a rolling summary.
+
+### The chat node
+
+If a summary exists, put it in front of the messages as a system message; otherwise send the messages as they are:
+
+```python
+from langchain_core.messages import SystemMessage
+
+def chat(state: State):
+    summary = state.get("summary", "")
+    messages = state["messages"]
+    if summary:
+        messages = [SystemMessage(f"Summary of the conversation so far:\n{summary}")] + messages
+    return {"messages": [model.invoke(messages)]}
+```
+
+The system message is built for this call only. It never enters the stored `messages` list.
+
+### The summarize node
+
+This node does two jobs: produce the new summary, and delete what it summarized.
+
+```python
+from langchain_core.messages import HumanMessage, RemoveMessage
+
+KEEP_LAST = 2
+
+def summarize(state: State):
+    existing = state.get("summary", "")
+    if existing:
+        instruction = (
+            f"Here is the summary so far:\n{existing}\n\n"
+            "Extend it with the new messages above. Keep names, decisions and facts."
+        )
+    else:
+        instruction = "Summarize the conversation above. Keep names, decisions and facts."
+
+    old = state["messages"][:-KEEP_LAST]
+    response = model.invoke(old + [HumanMessage(instruction)])
+
+    return {
+        "summary": response.content,
+        "messages": [RemoveMessage(id=m.id) for m in old],
+    }
+```
+
+The two branches are the **create** case (first summary) and the **extend** case (merge new messages into an existing summary). Either way, the node returns the new summary and a `RemoveMessage` for every message it just folded in. You can use a smaller, cheaper model for summarizing than for chatting.
+
+### Wiring the graph
+
+Summarizing on every turn would waste model calls, so a conditional edge runs it only when the thread is long:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import StateGraph, START, END
+
+MAX_MESSAGES = 6
+
+def should_summarize(state: State) -> str:
+    return "summarize" if len(state["messages"]) > MAX_MESSAGES else END
+
+builder = StateGraph(State)
+builder.add_node("chat", chat)
+builder.add_node("summarize", summarize)
+builder.add_edge(START, "chat")
+builder.add_conditional_edges("chat", should_summarize, ["summarize", END])
+builder.add_edge("summarize", END)
+graph = builder.compile(checkpointer=InMemorySaver())
+```
+
+The flow is `START → chat → (summarize if more than 6 messages) → END`. Summarizing happens **after** the reply is generated, so if you stream the chat node's output the user sees the answer before the summary call runs.
+
+### Running it
+
+```python
+config = {"configurable": {"thread_id": "physics"}}
+
+def ask(text: str):
+    graph.invoke({"messages": [{"role": "user", "content": text}]}, config)
+    s = graph.get_state(config).values
+    print(len(s["messages"]), "messages | summary:", s.get("summary", "")[:60])
+
+ask("Hi, I'm Asha. I'm studying physics.")      # 2 messages | summary:
+ask("How is Einstein related to quantum theory?") # 4 messages | summary:
+ask("What are his most famous papers?")         # 6 messages | summary:
+ask("Explain special relativity simply.")       # 2 messages | summary: Asha is studying physics...
+ask("What's my name?")                          # 4 messages | ... and the reply says "Asha"
+```
+
+On the fourth turn the thread reached 8 messages, so after replying the graph summarized the oldest 6 and deleted them, leaving the last 2. On the fifth turn the model saw the summary (which mentions Asha) plus the recent messages, so it still knows her name, which trimming could not manage.
+
+<LgTrimVsSummary />
+
+## Choosing a strategy
+
+| | Trimming | Deleting | Summarizing |
+|---|---|---|---|
+| Extra model calls | None | None | One per summarization |
+| Keeps old facts | No | No | Yes, in compressed form |
+| State size | Grows forever | Bounded | Bounded |
+| Best for | Simple bots, tool-heavy agents where old turns rarely matter | Resetting, pruning bulky messages (big tool outputs) | Long conversations where early details matter |
+
+In practice they combine well: summarize to keep the gist, and still apply `trim_messages` as a safety net right before the model call so a single huge message can never blow the budget.
+
+You don't have to hand-roll summarization. The `langmem` package provides a prebuilt `SummarizationNode` that tracks a running summary using token budgets, and LangChain agents offer similar summarization middleware. Building it yourself once, as above, is the best way to understand what those helpers do.
+
+<Callout kind="tip">
+Choose thresholds by **tokens**, not message counts, in real apps: ten short messages and ten pages of tool output are very different sizes. The message-count thresholds here keep the demo easy to follow.
+</Callout>
+
+## Cheat sheet
+
+- Short-term memory in LangGraph = **state + checkpointer + `thread_id`**.
+- `MessagesState` appends messages through the `add_messages` reducer.
+- `compile(checkpointer=InMemorySaver())` for experiments; it's lost on restart.
+- Production: `PostgresSaver.from_conn_string(DB_URI)` as a context manager, call `setup()` once.
+- `graph.get_state(config).values["messages"]` shows what a thread holds.
+- Long threads overflow the context window and cost more per call; keep inputs well under the limit.
+- `trim_messages(..., strategy="last", max_tokens=..., start_on="human")` limits what the model **sees**; state is unchanged.
+- `RemoveMessage(id=m.id)` returned from a node **deletes** a message from state; `REMOVE_ALL_MESSAGES` clears it.
+- Summarization = summarize old messages, keep the summary in state, delete the originals with `RemoveMessage`.
+- Extend an existing summary instead of replacing it, and inject it as a system message at call time.
+- Trigger summarization with a conditional edge; combine with trimming as a safety net.

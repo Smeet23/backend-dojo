@@ -1,0 +1,457 @@
+import { LgConditionalRouter } from "@/components/widgets/LgConditionalRouter";
+
+## Branches where only one runs
+
+So far you've built two shapes. **Sequential** graphs run tasks in a line. **Parallel** graphs fan out so several tasks run at once, then fan back in.
+
+A **conditional** graph looks like a parallel one on a diagram (one node, several possible next nodes) but behaves completely differently: **only one branch runs**, and a condition evaluated at run time decides which.
+
+```text
+               ┌─→ task_2 ─┐
+START → task_1 ┤           ├─→ task_4 → END
+               └─→ task_3 ─┘
+
+parallel:     task_1 → (task_2 AND task_3) → task_4
+conditional:  task_1 → (task_2 OR  task_3) → task_4
+```
+
+It's the workflow version of `if / elif / else`, and it's just as fundamental. Almost every non-trivial graph you'll build from here on has at least one conditional edge: routing a query to the right handler, deciding whether a tool call is needed, deciding whether a draft is good enough or needs another pass. There's no limit on the number of branches; two is common, but five or ten is fine.
+
+This lesson builds two conditional workflows: a quadratic-equation solver with no LLM, to nail down the mechanics, and a review responder where an LLM's structured output decides the route.
+
+## A quadratic equation solver
+
+A quadratic equation has the form `ax² + bx + c = 0` with `a` not equal to zero. Solving it starts with the **discriminant**:
+
+```text
+D = b² − 4ac
+```
+
+The sign of `D` decides what kind of roots exist, and therefore which formula to use:
+
+| Discriminant | Roots | Formula |
+|---|---|---|
+| `D > 0` | Two distinct real roots | `(−b + √D) / 2a` and `(−b − √D) / 2a` |
+| `D = 0` | One repeated real root | `−b / 2a` |
+| `D < 0` | No real roots | none |
+
+Exactly one case applies to any equation, which makes this a perfect conditional workflow:
+
+```text
+START → show_equation → calculate_discriminant ─┬─→ real_roots ────┐
+                                                ├─→ repeated_root ─┼─→ END
+                                                └─→ no_real_roots ─┘
+```
+
+### State and the straight part
+
+The state carries the coefficients, a printable equation, the discriminant and a result message:
+
+```python
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class QuadState(TypedDict):
+    a: float
+    b: float
+    c: float
+    equation: str
+    discriminant: float
+    result: str
+```
+
+The first two nodes form an ordinary sequence:
+
+```python
+def show_equation(state: QuadState) -> dict:
+    a, b, c = state["a"], state["b"], state["c"]
+    return {"equation": f"{a}x² {b:+}x {c:+} = 0"}
+
+
+def calculate_discriminant(state: QuadState) -> dict:
+    a, b, c = state["a"], state["b"], state["c"]
+    return {"discriminant": b**2 - 4 * a * c}
+```
+
+The `:+` format spec always prints a sign, so `a=4, b=-5, c=-4` displays as `4x² -5x -4 = 0` rather than the confusing `4x² + -5x + -4` you get from naive string concatenation.
+
+It's a good habit to build a conditional graph in two passes: first wire and run the straight part (`START → show_equation → calculate_discriminant → END`) and check the discriminant is right. For `4, -5, -4` it's `25 + 64 = 89`. Then add the branching.
+
+### The three branch nodes
+
+Each branch is a normal node that writes `result`:
+
+```python
+def real_roots(state: QuadState) -> dict:
+    a, b, d = state["a"], state["b"], state["discriminant"]
+    root1 = (-b + d**0.5) / (2 * a)
+    root2 = (-b - d**0.5) / (2 * a)
+    return {"result": f"Two real roots: {root1:.3f} and {root2:.3f}"}
+
+
+def repeated_root(state: QuadState) -> dict:
+    root = -state["b"] / (2 * state["a"])
+    return {"result": f"One repeated root: {root}"}
+
+
+def no_real_roots(state: QuadState) -> dict:
+    return {"result": "No real roots"}
+```
+
+All three write the same key, `result`, and that's fine with no reducer. Only one of them will ever run in a given invocation, so there's never more than one write per super-step.
+
+## The router function
+
+The decision lives in a **router function** (also called a routing or path function). It's not a node: it isn't registered with `add_node`, it doesn't appear as a box in the graph, and it doesn't update the state. It takes the state and **returns the name of the node to run next**:
+
+```python
+from typing import Literal
+
+def route_by_discriminant(
+    state: QuadState,
+) -> Literal["real_roots", "repeated_root", "no_real_roots"]:
+    if state["discriminant"] > 0:
+        return "real_roots"
+    elif state["discriminant"] == 0:
+        return "repeated_root"
+    return "no_real_roots"
+```
+
+The `Literal[...]` return annotation lists every possible destination. It's not decoration; LangGraph reads it to know which edges exist (for drawing the graph and for validation). More on why that matters in a moment.
+
+### Wiring conditional edges
+
+Replace the plain edge out of `calculate_discriminant` with a **conditional edge**:
+
+```python
+builder = StateGraph(QuadState)
+builder.add_node("show_equation", show_equation)
+builder.add_node("calculate_discriminant", calculate_discriminant)
+builder.add_node("real_roots", real_roots)
+builder.add_node("repeated_root", repeated_root)
+builder.add_node("no_real_roots", no_real_roots)
+
+builder.add_edge(START, "show_equation")
+builder.add_edge("show_equation", "calculate_discriminant")
+
+builder.add_conditional_edges("calculate_discriminant", route_by_discriminant)
+
+builder.add_edge("real_roots", END)
+builder.add_edge("repeated_root", END)
+builder.add_edge("no_real_roots", END)
+
+solver = builder.compile()
+```
+
+`add_conditional_edges(source, router)` means: after `source` finishes, call `router` with the updated state and go wherever it says. When you draw this graph, the three edges leaving `calculate_discriminant` are **dotted**; dotted means conditional, only one will be taken.
+
+```python
+for coeffs in [(4, -5, -4), (1, 2, 1), (2, 3, 5)]:
+    out = solver.invoke(dict(zip("abc", coeffs)))
+    print(out["equation"], "→", out["result"])
+
+# 4x² -5x -4 = 0 → Two real roots: 1.804 and -0.554
+# 1x² +2x +1 = 0 → One repeated root: -1.0
+# 2x² +3x +5 = 0 → No real roots
+```
+
+### Tracing the run
+
+It helps to know exactly when the router runs. Stream the updates for the first equation:
+
+```python
+for update in solver.stream({"a": 4, "b": -5, "c": -4}, stream_mode="updates"):
+    print(update)
+
+# {'show_equation': {'equation': '4x² -5x -4 = 0'}}
+# {'calculate_discriminant': {'discriminant': 89}}
+# {'real_roots': {'result': 'Two real roots: 1.804 and -0.554'}}
+```
+
+Three super-steps, three updates, and no entry for the router. The router runs at the end of `calculate_discriminant`'s super-step, **after** its update has been applied, so it sees `discriminant = 89`. It doesn't show up as a step because it isn't a node and writes nothing; its only effect is deciding which node is activated next. The two branches that weren't chosen never run, never cost anything and leave no trace.
+
+Notice that the discriminant was computed by a **node** and stored in state, and the router only **reads** it. Keep that division of labour: nodes do the work and write results; routers make a cheap decision from what's already in state. A router's return value is never merged into the state, so if a decision is worth recording, compute it in a node.
+
+### The path map
+
+Sometimes it's cleaner for the router to return a short label and map it to node names separately. Pass a dict as the third argument:
+
+```python
+def discriminant_sign(state: QuadState) -> str:
+    d = state["discriminant"]
+    return "positive" if d > 0 else "zero" if d == 0 else "negative"
+
+builder.add_conditional_edges(
+    "calculate_discriminant",
+    discriminant_sign,
+    {"positive": "real_roots", "zero": "repeated_root", "negative": "no_real_roots"},
+)
+```
+
+The map decouples your decision logic from node names (rename a node and only the map changes) and, like `Literal`, tells LangGraph every possible destination. You can also pass a plain list of node names when the router already returns node names.
+
+### Why declaring destinations matters
+
+Suppose the router has a typo and returns `"real_root"` instead of `"real_roots"`.
+
+- **With** a `Literal` annotation or a path map, the run fails immediately with `KeyError: 'real_root'`. Annoying, and you find the bug in seconds.
+- **Without** either, LangGraph only logs a warning that it "wrote to unknown channel ... ignoring it". **No branch runs**, no exception is raised, and `invoke` returns a state with no `result`. That's the kind of bug that slips through testing and shows up as a blank screen for users.
+
+Always declare the destinations, one way or the other. Try both in the widget below, and change the inputs to watch each branch get picked.
+
+<LgConditionalRouter />
+
+### More things a router can return
+
+- **`END`**: route straight to the end, for example `return END if state["discriminant"] < 0 else "real_roots"`. Include `END` in the `Literal` (it's the string `"__end__"`) or in the path map.
+- **A list of node names**: all of them run in parallel in the next super-step. That's how you get a *dynamic* fan-out, where the condition decides how many branches run, not just which one.
+- **From `START`**: `add_conditional_edges(START, router)` picks the very first node based on the input.
+
+<Callout kind="warn">
+Don't give one node both a conditional edge and a plain `add_edge` to another node. Both fire: the plain edge always runs **in addition to** whichever branch the router picks, which usually means two nodes racing to write the same key.
+</Callout>
+
+LangGraph has a second way to route, where a node returns a `Command` object that both updates state and names the next node. It's handy when the routing decision and the state update are naturally the same step; later lessons use it. Conditional edges are the standard tool and the one you'll see most.
+
+## Routing patterns you'll reuse
+
+Three small shapes cover most real uses of conditional edges.
+
+### A gate in a chain
+
+Recall the prompt-chaining idea of checking work between calls. A conditional edge turns the check into a decision. In the blog chain, stop early if the outline is too thin instead of paying for the long writing call:
+
+```python
+def outline_gate(state: BlogState) -> Literal["write_blog", "__end__"]:
+    sections = [line for line in state["outline"].splitlines() if line.strip()[:1].isdigit()]
+    return "write_blog" if len(sections) >= 4 else END
+
+builder.add_conditional_edges("create_outline", outline_gate)
+```
+
+The gate is pure Python, so it's free and instant. When the check itself needs judgement ("is this outline on-topic?"), put an LLM call in a node that writes a verdict to state, and gate on the verdict.
+
+### Choosing the first node
+
+A conditional edge from `START` routes on the raw input before any node runs. A support system might send messages that already carry a ticket number straight to `lookup_ticket`, and everything else to `classify`:
+
+```python
+def entry_router(state: SupportState) -> Literal["lookup_ticket", "classify"]:
+    return "lookup_ticket" if state.get("ticket_id") else "classify"
+
+builder.add_conditional_edges(START, entry_router)
+```
+
+### Choosing several branches
+
+Return a list and every named node runs, in parallel, in the next super-step. A moderation graph might always check policy but only run the expensive misinformation check when the text makes factual claims:
+
+```python
+def pick_checks(state: ModerationState) -> list[str]:
+    checks = ["policy_check"]
+    if state["has_claims"]:
+        checks.append("fact_check")
+    return checks
+
+builder.add_conditional_edges("analyse_text", pick_checks, ["policy_check", "fact_check"])
+```
+
+Everything from the parallel-workflows lesson applies to these branches: return partial updates, use a reducer if they write a shared key, and use `defer=True` on the join node because the number of incoming branches varies.
+
+## Testing routers
+
+Because a router is a plain function of state, it's the easiest part of a graph to test, and the part most worth testing: a wrong route sends the whole run down the wrong path. Test it directly, with hand-made states, and cover every branch plus the boundaries:
+
+```python
+def test_route_by_discriminant():
+    assert route_by_discriminant({"discriminant": 89}) == "real_roots"
+    assert route_by_discriminant({"discriminant": 0}) == "repeated_root"
+    assert route_by_discriminant({"discriminant": -0.5}) == "no_real_roots"
+```
+
+Boundaries are where conditional logic breaks: `> 0` versus `>= 0`, an exact `== 0` on a float that came out as `1e-16`, an empty string that's falsy. For floating-point values computed from real data, compare against a small tolerance (`abs(d) < 1e-9`) rather than exact zero. And always end a router with a **default** return, so an unexpected value still goes somewhere sensible rather than falling off the end and returning `None`.
+
+## A review responder
+
+Now let an LLM make the decision. An app store receives a review and must reply to it. A positive review deserves a warm thank-you. A negative one deserves something more careful: first understand what went wrong, then write an empathetic, specific reply.
+
+```text
+START → find_sentiment ─┬─→ positive_reply ──────────────────┐
+                        └─→ run_diagnosis → negative_reply ──┴─→ END
+```
+
+- `find_sentiment`: an LLM classifies the review as `positive` or `negative`.
+- `positive_reply`: an LLM writes a thank-you and invites the user to rate the app publicly.
+- `run_diagnosis`: an LLM extracts the **issue type** (UX, performance, bug, support, other), the user's **tone**, and the **urgency**.
+- `negative_reply`: an LLM writes a reply informed by that diagnosis, so a furious user with an urgent login bug gets a different message from a mildly annoyed user who dislikes a menu.
+
+Both the routing decision and the diagnosis must come back as exact, machine-readable values, so both use **structured output**.
+
+### Schemas
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+
+load_dotenv()
+model = init_chat_model("openai:gpt-4.1-mini")
+
+
+class SentimentSchema(BaseModel):
+    sentiment: Literal["positive", "negative"] = Field(description="Overall sentiment of the review")
+
+
+class DiagnosisSchema(BaseModel):
+    issue_type: Literal["UX", "Performance", "Bug", "Support", "Other"] = Field(
+        description="The category of issue the review describes"
+    )
+    tone: Literal["angry", "frustrated", "disappointed", "calm"] = Field(
+        description="The emotional tone of the user"
+    )
+    urgency: Literal["low", "medium", "high"] = Field(
+        description="How urgent or critical the issue appears to be"
+    )
+
+
+sentiment_model = model.with_structured_output(SentimentSchema)
+diagnosis_model = model.with_structured_output(DiagnosisSchema)
+```
+
+Using `Literal` inside the schema is what makes routing on an LLM safe. The model **must** choose `"positive"` or `"negative"`; it can't reply "mostly positive, with some concerns", which no router could handle.
+
+### State
+
+```python
+from typing import TypedDict
+
+class ReviewState(TypedDict):
+    review: str
+    sentiment: Literal["positive", "negative"]
+    diagnosis: dict
+    response: str
+```
+
+`diagnosis` is stored as a plain dict. The structured model returns a Pydantic object, and `.model_dump()` converts it to a dict that's easy to read later and serialises cleanly (which matters once you add persistence).
+
+### Nodes
+
+```python
+def find_sentiment(state: ReviewState) -> dict:
+    prompt = f"What is the sentiment of this app review?\n\n{state['review']}"
+    return {"sentiment": sentiment_model.invoke(prompt).sentiment}
+
+
+def positive_reply(state: ReviewState) -> dict:
+    prompt = (
+        "Write a short, warm thank-you reply to this app review. "
+        "Kindly invite the user to rate us on the app store.\n\n"
+        f"Review: {state['review']}"
+    )
+    return {"response": model.invoke(prompt).content}
+
+
+def run_diagnosis(state: ReviewState) -> dict:
+    prompt = f"Diagnose this negative app review.\n\n{state['review']}"
+    return {"diagnosis": diagnosis_model.invoke(prompt).model_dump()}
+
+
+def negative_reply(state: ReviewState) -> dict:
+    d = state["diagnosis"]
+    prompt = (
+        "You are a support assistant. "
+        f"The user reported a {d['issue_type']} issue, sounded {d['tone']}, "
+        f"and the urgency is {d['urgency']}. "
+        "Write an empathetic, helpful reply that acknowledges the problem and gives a next step.\n\n"
+        f"Review: {state['review']}"
+    )
+    return {"response": model.invoke(prompt).content}
+```
+
+Two models, used deliberately: the structured ones where code needs exact fields (`sentiment`, the diagnosis), the plain one where you want prose (the replies).
+
+### Router and edges
+
+The LLM's classification is already in state, so the router is plain Python:
+
+```python
+def route_by_sentiment(state: ReviewState) -> Literal["positive_reply", "run_diagnosis"]:
+    if state["sentiment"] == "positive":
+        return "positive_reply"
+    return "run_diagnosis"
+
+
+builder = StateGraph(ReviewState)
+builder.add_node("find_sentiment", find_sentiment)
+builder.add_node("positive_reply", positive_reply)
+builder.add_node("run_diagnosis", run_diagnosis)
+builder.add_node("negative_reply", negative_reply)
+
+builder.add_edge(START, "find_sentiment")
+builder.add_conditional_edges("find_sentiment", route_by_sentiment)
+builder.add_edge("positive_reply", END)
+builder.add_edge("run_diagnosis", "negative_reply")
+builder.add_edge("negative_reply", END)
+
+responder = builder.compile()
+```
+
+Notice that a branch can be more than one node: the negative path is `run_diagnosis → negative_reply`, an ordinary sequential edge inside the branch.
+
+Why classify in a node and route on the stored value, rather than calling the LLM inside the router? Three reasons. The sentiment ends up **in the state**, where you can log it, show it on a dashboard or test it. The router stays **deterministic** and trivial to unit-test with a hand-made state. And the decision is made **once**, not re-made (and re-billed) every time the router is evaluated.
+
+### Running it
+
+```python
+happy = responder.invoke({
+    "review": "Been using this for a month. The interface is clean and everything "
+              "is exactly where I expect it. Great job to the design team!"
+})
+print(happy["sentiment"])   # positive
+print(happy["response"])    # Thank you so much for the kind words! ...
+
+angry = responder.invoke({
+    "review": "I've been trying to log in for over an hour. The app freezes on the "
+              "sign-in screen every time, even after reinstalling. Unacceptable."
+})
+print(angry["sentiment"])   # negative
+print(angry["diagnosis"])   # {'issue_type': 'Bug', 'tone': 'frustrated', 'urgency': 'high'}
+print(angry["response"])    # I'm really sorry you've been locked out...
+```
+
+In the happy run, `diagnosis` never appears in the final state at all, because `run_diagnosis` never ran. That's a quick way to confirm which branch was taken; `stream(..., stream_mode="updates")` shows it node by node.
+
+A practical consequence: code that reads the final state must allow for keys from untaken branches being **absent**. Use `result.get("diagnosis")` rather than `result["diagnosis"]` when you display it. Note too that the negative path costs **three** model calls (classify, diagnose, reply) and the positive path **two**. Conditional workflows let you spend effort where the input needs it, which is the routing pattern's main economic argument: cheap paths for easy cases, careful paths for hard ones.
+
+## From branches to loops
+
+A conditional edge can point **backwards** to a node that already ran. That's all a loop is in LangGraph: a router that sometimes returns an earlier node's name.
+
+```python
+def after_review(state: DraftState) -> Literal["write_draft", "__end__"]:
+    if state["approved"] or state["attempts"] >= 5:
+        return END
+    return "write_draft"
+
+builder.add_edge(START, "write_draft")
+builder.add_edge("write_draft", "review_draft")
+builder.add_conditional_edges("review_draft", after_review)
+```
+
+Here `write_draft` increments an `attempts` counter in state and `review_draft` sets `approved`. The router either finishes or sends control back for another draft. This is the skeleton of the **evaluator-optimizer** pattern, and the next lesson builds it properly with an LLM generator and evaluator.
+
+Every loop needs a way out that doesn't depend on the model behaving. The `attempts >= 5` check is that guarantee: even if the reviewer never approves, the run ends. Without it you'd be relying on LangGraph's recursion limit, which stops a runaway graph with a `GraphRecursionError` rather than a useful result.
+
+## Cheat sheet
+
+- **Conditional** edges run **one** of several branches; **parallel** edges run all of them.
+- A **router function** takes state and returns the **name of the next node**; it's not a node and doesn't update state.
+- Wire it with `builder.add_conditional_edges(source, router)`; conditional edges draw as **dotted** lines.
+- Declare destinations with a **`Literal[...]` return type** or a **path map** dict; without either, a typo silently stops the run.
+- Compute in **nodes**, decide in **routers**: store the thing you route on (discriminant, sentiment) in state.
+- Branches that never run together may write the **same key** without a reducer.
+- Routers can return **`END`**, or a **list** of nodes for dynamic parallel fan-out.
+- Don't mix a plain edge and a conditional edge out of the same node; both fire.
+- For LLM routing, use **structured output with a `Literal` field** so the model must pick a valid label.
+- `.model_dump()` turns a Pydantic result into a plain dict for state.

@@ -1,0 +1,482 @@
+import { LgCrashResume } from "@/components/widgets/LgCrashResume";
+import { LgTimeTravel } from "@/components/widgets/LgTimeTravel";
+
+## What persistence means
+
+**Persistence** is the ability to **save the state of a workflow and restore it later**. In LangGraph it's the foundation for many other features: chat memory, resuming after crashes, pausing for a human, and rewinding a run to try something different. Most of the advanced topics later in this course are built on what you learn here.
+
+To see why it's needed, recall the two ideas every LangGraph program is built on:
+
+1. **The graph.** A goal is broken into tasks; each task is a node, and edges decide which node runs next.
+2. **The state.** A typed dictionary holding the data the workflow needs. Every node can read it, and every node can update it by returning a partial dict.
+
+When you call `graph.invoke(input)`, the input becomes the initial state, flows from `START` through the nodes, gets updated at each step, and you receive the final state back. Then, by default, **the state is thrown away**. It lived in memory for that one execution. If you need it next week, or even on the next `invoke` call, it's gone.
+
+Persistence changes that default. You attach a component that **writes the state somewhere** as the graph runs, so you can look at it, continue from it, or rerun from it later.
+
+## Every step is saved, not just the end
+
+The key detail: persistence doesn't only save the **final** state. It saves the state **at every step of the run**.
+
+Take a tiny graph with one state key, `name`:
+
+```
+START → node_1 → node_2 → END
+input: name = "a"     node_1 sets "b"     node_2 sets "c"
+```
+
+Without persistence you get back `{"name": "c"}` and nothing else. With persistence you have a record of the whole journey: before anything ran (`name` empty), after the input was applied (`"a"`), after `node_1` (`"b"`), and after `node_2` (`"c"`). Each record also notes **which node runs next**.
+
+That timeline is what makes the powerful features possible:
+
+- If the process crashes in `node_2`, the last saved point says "`name` is `b`, run `node_2` next". You can continue from there instead of from scratch.
+- If you want to know what `node_1` produced on a run three days ago, it's on record.
+- If you want to rerun from just after `node_1` with a different value, you have the exact starting point.
+
+## Checkpointers and checkpoints
+
+LangGraph implements persistence with a **checkpointer**. A checkpointer splits a run into **checkpoints** and saves a snapshot of the state at each one.
+
+Where do checkpoints fall? At **super-step** boundaries. A super-step is one "tick" of the graph: every node scheduled to run at that moment runs (in parallel if there are several), their updates are merged into the state, and then the next set of nodes is chosen. A checkpoint is written after each super-step.
+
+Consider a graph with a fan-out:
+
+```
+START → node_1 ─┬→ node_2 ─┐
+                ├→ node_3 ─┼→ END
+                └→ node_4 ─┘
+```
+
+Say the state is `numbers: Annotated[list[int], operator.add]`, the input is `[1]`, `node_1` returns `[2]`, and nodes 2, 3 and 4 return `[3]`, `[4]` and `[5]`. The checkpoints are:
+
+| Checkpoint | When | `numbers` | Next |
+|---|---|---|---|
+| step −1 | Input received, nothing applied yet | (empty) | `__start__` |
+| step 0 | Input applied | `[1]` | `node_1` |
+| step 1 | After `node_1` | `[1, 2]` | `node_2`, `node_3`, `node_4` |
+| step 2 | After the parallel super-step | `[1, 2, 3, 4, 5]` | (nothing) |
+
+Nodes 2, 3 and 4 share **one** checkpoint, because they run in the same super-step. That's four snapshots for one run, and all four are kept.
+
+<Callout kind="remember">
+A **checkpointer** is the component (InMemorySaver, SqliteSaver, PostgresSaver). A **checkpoint** is one saved snapshot of the state, taken at a super-step boundary, together with metadata like which nodes run next.
+</Callout>
+
+## Threads
+
+If you run the same graph twice, you get two separate timelines of checkpoints. Run it with `numbers=[1]` and later with `numbers=[6]`, and the store now holds snapshots from both runs. When you ask "show me the state", which run do you mean?
+
+That's what **threads** solve. Every execution that uses persistence is tagged with a `thread_id`, and its checkpoints are saved under that id. To load state, you name the thread.
+
+```
+thread "1": [ ] → [1] → [1,2] → [1,2,3,4,5]
+thread "2": [ ] → [6] → [6,7] → [6,7,8,9,10]
+```
+
+The thread id is your handle for a whole history. In a chatbot, one thread equals one conversation. "New chat" creates a new thread id; reopening an old chat means loading its thread. Invoking again on the **same** thread continues that thread's history, which is exactly how chat memory works.
+
+## Persistence in code
+
+Here's a two-step workflow: generate a joke on a topic, then explain it.
+
+```python
+from typing import TypedDict
+from langchain.chat_models import init_chat_model
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+llm = init_chat_model("openai:gpt-4.1-mini")
+
+class JokeState(TypedDict):
+    topic: str
+    joke: str
+    explanation: str
+
+def generate_joke(state: JokeState) -> dict:
+    joke = llm.invoke(f"Write a one-line joke about {state['topic']}.").content
+    return {"joke": joke}
+
+def generate_explanation(state: JokeState) -> dict:
+    text = llm.invoke(f"Explain why this joke is funny, in two sentences: {state['joke']}").content
+    return {"explanation": text}
+```
+
+The graph is built as usual. The only new part is the `checkpointer` argument to `compile`:
+
+```python
+builder = StateGraph(JokeState)
+builder.add_node("generate_joke", generate_joke)
+builder.add_node("generate_explanation", generate_explanation)
+builder.add_edge(START, "generate_joke")
+builder.add_edge("generate_joke", "generate_explanation")
+builder.add_edge("generate_explanation", END)
+
+checkpointer = InMemorySaver()
+graph = builder.compile(checkpointer=checkpointer)
+```
+
+`InMemorySaver` keeps checkpoints in a Python dictionary. It's for learning and tests; everything is lost when the process exits. Production uses a database-backed checkpointer (covered at the end). The concepts are identical.
+
+Once a checkpointer is attached, every call needs a thread id:
+
+```python
+config1 = {"configurable": {"thread_id": "1"}}
+result = graph.invoke({"topic": "pizza"}, config=config1)
+print(result["joke"])
+# Why did the pizza see a doctor? It was feeling a little cheesy.
+```
+
+### Reading the latest state
+
+`get_state` returns the **latest** checkpoint of a thread as a `StateSnapshot`:
+
+```python
+snap = graph.get_state(config1)
+print(snap.values)   # {'topic': 'pizza', 'joke': '...', 'explanation': '...'}
+print(snap.next)     # ()  -> nothing left to run
+```
+
+A `StateSnapshot` has these fields:
+
+| Field | Meaning |
+|---|---|
+| `values` | The state at this checkpoint |
+| `next` | Tuple of node names that would run next; empty when the run is finished |
+| `config` | The thread id and this checkpoint's `checkpoint_id` (use it to go back here) |
+| `metadata` | `step` number, `source` (`"input"`, `"loop"` or `"update"`), and which node wrote what |
+| `created_at` | Timestamp |
+| `parent_config` | Config of the previous checkpoint, so you can walk the timeline |
+| `tasks` | Pending tasks, plus any errors or interrupts they hit |
+
+With a database checkpointer, you could restart the program a week later, call `graph.get_state(config1)`, and get the same pizza joke back, without calling the model again.
+
+### Reading the whole history
+
+`get_state_history` returns every checkpoint of a thread, **newest first**:
+
+```python
+for snap in graph.get_state_history(config1):
+    print(snap.metadata["step"], snap.next, snap.values)
+```
+
+```
+2  ()                           {'topic': 'pizza', 'joke': '...', 'explanation': '...'}
+1  ('generate_explanation',)    {'topic': 'pizza', 'joke': '...'}
+0  ('generate_joke',)           {'topic': 'pizza'}
+-1 ('__start__',)               {}
+```
+
+Four checkpoints for a two-node graph: the raw input, the input applied, after `generate_joke`, and after `generate_explanation`. Read bottom to top and you replay the run in slow motion. Each row tells you what the state was **and what was about to happen next**.
+
+### Walking the chain
+
+Each snapshot points at its parent through `parent_config`, so the history is a linked chain. You can tell where each checkpoint came from with its metadata:
+
+```python
+for snap in graph.get_state_history(config1):
+    meta = snap.metadata
+    print(
+        meta["step"],
+        meta["source"],                                  # 'input', 'loop' or 'update'
+        snap.config["configurable"]["checkpoint_id"][:8],
+        "parent:", (snap.parent_config or {}).get("configurable", {}).get("checkpoint_id", "")[:8],
+    )
+```
+
+`source` is `"input"` for the checkpoint created from your input, `"loop"` for checkpoints written as the graph runs, and `"update"` for ones you created by editing state by hand (you'll do that in time travel). The checkpoint ids are sortable by creation time, and the parent links matter once a thread **branches**: two checkpoints can share the same parent, which is how forks are represented.
+
+### A second thread
+
+Run the graph again on a different thread:
+
+```python
+config2 = {"configurable": {"thread_id": "2"}}
+graph.invoke({"topic": "pasta"}, config=config2)
+
+graph.get_state(config1).values["topic"]   # 'pizza'
+graph.get_state(config2).values["topic"]   # 'pasta'
+```
+
+Both timelines live side by side in the same checkpointer, and each is retrieved by its thread id, final state and full history alike.
+
+## What persistence unlocks
+
+Saving every step of every thread gives you four capabilities:
+
+| Capability | What it gives you | Why persistence is required |
+|---|---|---|
+| Short-term memory | Chats that remember earlier turns | The thread's saved messages are loaded on the next invoke |
+| Fault tolerance | Resume a crashed run where it stopped | The last checkpoint says what's done and what's next |
+| Human in the loop | Pause for approval, resume hours later | The paused state must be stored while nobody is waiting on it |
+| Time travel | Inspect, replay or fork from any past step | Every intermediate checkpoint is kept |
+
+### Short-term memory
+
+You saw this in the chatbot lecture. With a checkpointer, each turn's `invoke` on the same thread loads the saved `messages`, `add_messages` appends the new one, and the model sees the whole conversation. "Resume a chat from last Tuesday" is simply "load that thread". Without persistence there's nothing to load.
+
+## Fault tolerance
+
+Long workflows fail midway. An API times out, a server restarts, a rate limit hits on step 7 of 10. Without persistence your only option is to start over, re-paying for every LLM call that already succeeded. With persistence the graph knows exactly how far it got.
+
+Here's a three-step pipeline where the middle step calls a flaky service. To simulate it, the step fails the first time and succeeds after that:
+
+```python
+from typing import TypedDict
+
+class PipelineState(TypedDict):
+    input: str
+    step_1: str
+    step_2: str
+    step_3: str
+
+calls = {"step_2": 0}
+
+def step_1(state):
+    print("step_1 ran")
+    return {"step_1": "done"}
+
+def step_2(state):
+    calls["step_2"] += 1
+    print("step_2 attempt", calls["step_2"])
+    if calls["step_2"] == 1:
+        raise ConnectionError("upstream service timed out")
+    return {"step_2": "done"}
+
+def step_3(state):
+    print("step_3 ran")
+    return {"step_3": "done"}
+```
+
+Build `START → step_1 → step_2 → step_3 → END`, compile with a checkpointer, and run it:
+
+```python
+graph = builder.compile(checkpointer=InMemorySaver())
+config = {"configurable": {"thread_id": "pipeline-1"}}
+
+try:
+    graph.invoke({"input": "start"}, config)
+except ConnectionError as e:
+    print("crashed:", e)
+
+snap = graph.get_state(config)
+print(snap.values)   # {'input': 'start', 'step_1': 'done'}
+print(snap.next)     # ('step_2',)
+```
+
+```
+step_1 ran
+step_2 attempt 1
+crashed: upstream service timed out
+```
+
+The thread's latest checkpoint records that `step_1` finished and `step_2` is next. To resume, invoke with **`None` as the input** on the same thread:
+
+```python
+result = graph.invoke(None, config)
+print(result)
+```
+
+```
+step_2 attempt 2
+step_3 ran
+{'input': 'start', 'step_1': 'done', 'step_2': 'done', 'step_3': 'done'}
+```
+
+`step_1` did **not** run again. `None` means "no new input, continue this thread from its latest checkpoint". Passing a fresh input instead, `{"input": "start"}`, would start a brand-new run on the thread from `START`.
+
+You can simulate a hard stop the same way by putting a long `time.sleep` in `step_2` and pressing Ctrl+C (or interrupting the notebook kernel) while it sleeps. Resume works identically.
+
+<LgCrashResume />
+
+### What survives which crash
+
+Notice the trap in the notebook demo: when you interrupt a cell, the Python process keeps running, so `InMemorySaver`'s dictionary survives. A **real** crash kills the process: out of memory, a redeploy, a machine failure. That takes RAM with it.
+
+| Failure | InMemorySaver | SqliteSaver / PostgresSaver |
+|---|---|---|
+| Node raises an exception, process lives | Resume works | Resume works |
+| Process is killed and restarted | Checkpoints lost; start over | Resume works |
+
+Fault tolerance in production therefore means a database-backed checkpointer.
+
+### Details that matter in real systems
+
+- **The failed node reruns from its beginning.** Checkpoints sit between super-steps, so anything a node did before it crashed (sent an email, charged a card) can happen again on resume. Make side-effecting nodes **idempotent**, or split the side effect into its own small node.
+- **Pending writes.** If several nodes run in parallel in one super-step and only one fails, LangGraph stores the writes of the ones that succeeded. On resume, only the failed node reruns.
+- **Durability modes.** You can choose how eagerly checkpoints are written with the `durability` argument to `invoke` or `stream`: `"sync"` writes each checkpoint before the next step starts (safest), `"async"` writes in the background while the next step runs (faster, tiny risk on a crash), and `"exit"` writes only when the run ends (fastest, but a mid-run crash can't be resumed).
+
+## Human in the loop
+
+Some steps shouldn't run without a person's say-so: publishing a post, sending money, deleting data. Suppose a workflow drafts a LinkedIn post and must ask "Publish this?" before calling the API.
+
+The awkward part is time. The human might answer in two seconds or two days. Keeping a Python process alive and waiting for days is fragile and wasteful. Instead, LangGraph **interrupts** the run: it saves the state at that point and returns control to you. When the answer arrives, possibly in a different process, it **resumes** from the saved point.
+
+That's fault tolerance done on purpose. A crash stops you unexpectedly; an interrupt stops you deliberately. Both rely on the same saved checkpoints, so both require a checkpointer. The shape of the code:
+
+```python
+from langgraph.types import interrupt, Command
+
+def ask_human(state):
+    decision = interrupt({"draft": state["post"], "question": "Publish this post?"})
+    return {"approved": decision == "yes"}
+
+# First call runs until the interrupt, then returns with the pending question.
+graph.invoke({"topic": "our new API"}, config)
+
+# Later (minutes or days), resume the same thread with the human's answer.
+graph.invoke(Command(resume="yes"), config)
+```
+
+The human-in-the-loop lecture builds this properly. For now, the point is that without persistence there would be nothing to resume.
+
+## Time travel
+
+Because every checkpoint is kept, you can go **back** to any of them and run the graph forward again. This is called time travel, and it comes in two forms:
+
+- **Replay**: rerun from a past checkpoint exactly as it was.
+- **Fork**: change the state at a past checkpoint, then run forward from the changed version.
+
+Both are mostly debugging tools. In a long workflow where step 6 of 9 misbehaves, you don't want to rerun steps 1 to 5 (and pay for them) each time you try a fix. You jump to the checkpoint just before step 6 and run from there. Forking also lets you ask "what if": what if the retriever had returned different documents, or the user had chosen differently?
+
+### Replay
+
+Find the checkpoint you want in the history. Searching by `next` is clearer than hard-coding an index:
+
+```python
+history = list(graph.get_state_history(config1))
+before_joke = next(s for s in history if s.next == ("generate_joke",))
+print(before_joke.values)   # {'topic': 'pizza'}
+```
+
+Its `config` carries the `checkpoint_id`. Invoke from it with `None` as input:
+
+```python
+replayed = graph.invoke(None, before_joke.config)
+print(replayed["joke"])
+# Why did the pizza go to the party? It wanted to get a little saucy.
+```
+
+What happened:
+
+- Nodes **before** that checkpoint were not rerun; their results are already saved.
+- Nodes **after** it ran again for real: `generate_joke` called the model again, so you got a different joke, then `generate_explanation` explained the new joke.
+- The new checkpoints form a **branch** off `before_joke`. The original run is untouched. `get_state_history` now returns 6 snapshots: the original 4 plus 2 from the replay.
+
+You can also address a checkpoint by id directly, which is handy when you've copied an id from a log:
+
+```python
+config = {"configurable": {"thread_id": "1", "checkpoint_id": "1f0a7c3e-..."}}
+graph.get_state(config)       # the state at that checkpoint
+graph.invoke(None, config)    # replay from it
+```
+
+<Callout kind="warn">
+Replay **re-executes** everything after the checkpoint: LLM calls, API calls, tool calls and interrupts. It's not a cache lookup. Replaying a node that sends an email sends another email. Replaying from the final checkpoint (empty `next`) does nothing, because there's nothing left to run.
+</Callout>
+
+### Fork by updating state
+
+To change the past, call `update_state` on a checkpoint's config with the values you want. It does **not** edit the old checkpoint. It creates a **new** checkpoint branching from that point, and **returns that new checkpoint's config**:
+
+```python
+fork_config = graph.update_state(before_joke.config, {"topic": "samosa"})
+forked = graph.invoke(None, fork_config)
+
+print(forked["topic"])   # samosa
+print(forked["joke"])    # Why was the samosa so calm? It had everything folded in.
+```
+
+Two rules to remember:
+
+1. **Invoke from the config that `update_state` returned**, not from the checkpoint you forked. If you call `graph.invoke(None, before_joke.config)` after the update, you replay the original pizza checkpoint and get another pizza joke. The update lives on the new branch only. This is the most common time-travel mistake.
+2. **Updates go through reducers**, exactly like a node's return value. Updating a key annotated with `operator.add` *appends* to it rather than replacing it.
+
+The new checkpoint's metadata has `source: "update"`, so you can tell edits apart from normal steps in the history. `update_state` also accepts `as_node="..."` to make the update count as if a particular node wrote it, which affects which node runs next. You'll use that with human-in-the-loop edits.
+
+After a replay and a fork, the thread's history looks like a tree:
+
+```
+[-1] → [0 pizza] → [1 joke A] → [2 explained A]          original run
+           ├──→ [1 joke B] → [2 explained B]              replay
+           └──→ [update: samosa] → [joke C] → [explained C]   fork
+```
+
+`get_state(config1)` without a checkpoint id returns the **most recent** checkpoint on the thread, which is now the end of the fork.
+
+<LgTimeTravel />
+
+<Callout kind="tip">
+Time travel is a debugging tool first. Many apps never use it in production. It's worth knowing because it makes a misbehaving long workflow cheap to investigate, and because the same mechanics (checkpoint configs, `update_state`, `invoke(None, ...)`) come back in human-in-the-loop.
+</Callout>
+
+## Choosing a checkpointer
+
+All checkpointers share one interface, so swapping them doesn't change your graph code: only the object you pass to `compile` changes.
+
+| Checkpointer | Package | Storage | Use for |
+|---|---|---|---|
+| `InMemorySaver` | built into `langgraph` | Python dict in RAM | Learning, notebooks, unit tests |
+| `SqliteSaver` | `langgraph-checkpoint-sqlite` | A local `.db` file | Local apps, single-machine prototypes |
+| `PostgresSaver` | `langgraph-checkpoint-postgres` | Postgres | Production, multiple workers |
+
+```bash
+pip install langgraph-checkpoint-sqlite
+```
+
+```python
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+conn = sqlite3.connect("checkpoints.db", check_same_thread=False)
+graph = builder.compile(checkpointer=SqliteSaver(conn))
+```
+
+`check_same_thread=False` lets the connection be used from the worker threads LangGraph and web frameworks run on. The SQLite lecture uses this to make the chatbot's conversations survive restarts.
+
+<Callout kind="remember">
+Persistence is **per thread** and **per checkpoint**: `thread_id` picks the timeline, `checkpoint_id` picks a point on it. Leave out the checkpoint id and you get the latest point.
+</Callout>
+
+## Persistence is not long-term memory
+
+It's easy to blur two kinds of saved data. A checkpointer saves the state of **one thread**: this conversation, this run. Start a new thread and it's empty. A user who told your bot "I'm vegetarian" in Monday's chat won't be remembered in Tuesday's new chat, however good your checkpointer is.
+
+Remembering facts **across** threads (user preferences, past decisions) is a different feature called long-term memory. LangGraph handles it with a **store**, passed via `compile(store=...)` and organised by namespaces such as a user id. The two work side by side:
+
+| | Checkpointer | Store |
+|---|---|---|
+| Scope | One thread | Across threads (e.g. per user) |
+| Holds | Full graph state at every step | Facts or documents you choose to save |
+| Written | Automatically, every super-step | Explicitly, by your nodes |
+| Powers | Chat history, resume, interrupts, time travel | "Remembers me" features |
+
+Later lectures build long-term memory on a store. Everything in this lecture is per-thread persistence.
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Error asking for a thread id | Graph has a checkpointer, call has no `configurable.thread_id` | Pass the config on every `invoke`, `stream`, `get_state` |
+| Resume starts from scratch | Called `invoke(original_input, config)` instead of `invoke(None, config)` | Pass `None` to continue the thread |
+| Fork ignores your edit | Invoked the old checkpoint's config after `update_state` | Invoke the config that `update_state` returned |
+| History disappears after deploy | `InMemorySaver` in production | Use SQLite or Postgres checkpointers |
+| Side effect happened twice after resume | The failed node did work before crashing | Make side effects idempotent or isolate them in their own node |
+| Database grows without bound | Every step of every thread is kept forever | Delete old threads on a schedule (checkpointers offer `delete_thread`) |
+
+<Callout kind="tip">
+Checkpoints store the whole state at every step, so state size matters. Keep large blobs (PDFs, images, huge tool outputs) out of the state. Store them elsewhere and keep a reference (a path, an id) in the state instead.
+</Callout>
+
+## Cheat sheet
+
+- Persistence saves and restores workflow state over time; without it, state is discarded when `invoke` returns.
+- Attach it with `builder.compile(checkpointer=InMemorySaver())`; every call then needs `{"configurable": {"thread_id": ...}}`.
+- A checkpoint is written at each super-step boundary; parallel nodes in one super-step share one checkpoint.
+- A two-node sequential graph produces 4 checkpoints: input (step −1), input applied (0), after node 1 (1), after node 2 (2).
+- `get_state(config)` gives the latest `StateSnapshot`; `get_state_history(config)` lists all, newest first.
+- `snapshot.next` shows what runs next; `snapshot.config` holds the `checkpoint_id` for going back.
+- Resume after a failure with `graph.invoke(None, config)`; completed nodes are not rerun, the failed one reruns from its start.
+- Real crash recovery needs a database checkpointer; `InMemorySaver` dies with the process.
+- Replay: `graph.invoke(None, past_snapshot.config)` re-executes everything after that point, as a new branch.
+- Fork: `new_cfg = graph.update_state(past.config, {...})`, then `graph.invoke(None, new_cfg)`; invoking the old config ignores your edit.
+- Interrupts (human in the loop) need a checkpointer because the paused state must be stored.

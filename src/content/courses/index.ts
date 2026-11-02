@@ -7,6 +7,8 @@ import { course as backendCourse, lectures as backendLectures } from "./backend/
 import { lessons as backendLessons } from "./backend/registry";
 import { course as hldCourse, lectures as hldLectures } from "./hld/lectures";
 import { lessons as hldLessons } from "./hld/registry";
+import { course as langgraphCourse, lectures as langgraphLectures } from "./langgraph/lectures";
+import { lessons as langgraphLessons } from "./langgraph/registry";
 import { course as system_designCourse, lectures as system_designLectures } from "./system-design/lectures";
 import { lessons as system_designLessons } from "./system-design/registry";
 
@@ -21,5 +23,6 @@ export const courses: CourseContent[] = [
   { course: ai_evalsCourse, lectures: ai_evalsLectures, lessons: ai_evalsLessons },
   { course: backendCourse, lectures: backendLectures, lessons: backendLessons },
   { course: hldCourse, lectures: hldLectures, lessons: hldLessons },
+  { course: langgraphCourse, lectures: langgraphLectures, lessons: langgraphLessons },
   { course: system_designCourse, lectures: system_designLectures, lessons: system_designLessons },
 ];

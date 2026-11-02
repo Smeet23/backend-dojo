@@ -1,0 +1,252 @@
+import { LgGraphStepper } from "@/components/widgets/LgGraphStepper";
+
+## LangGraph in one paragraph
+
+LangGraph is an **orchestration framework** for LLM applications. You describe your application as a **graph**: every **node** is one task (call a model, call a tool, make a decision, do some plain Python), and every **edge** says which task runs next. You hand the graph an input, and LangGraph runs the nodes in the right order, carrying a shared bundle of data called the **state** from node to node until the work is done.
+
+Drawing the workflow as a graph is only the start. The same structure also gives you:
+
+- **Parallel branches.** After one node finishes, several nodes can run at once.
+- **Branching.** A condition decides which of several nodes runs next, like an `if/else` for workflows.
+- **Loops.** A node can send control back to an earlier node, so you can retry or refine until something is good enough.
+- **Memory.** The state and the conversation can be recorded as the run progresses.
+- **Resumability.** If a run crashes halfway, it can pick up from the last completed step instead of starting over.
+
+Together these make LangGraph a strong fit for **stateful, multi-step** applications, which is what agents and production AI systems are. This lesson builds the vocabulary you'll use in every later lesson: LLM workflows, graphs, nodes, edges, state, reducers and the execution model. The next lesson turns it into code.
+
+## LLM workflows
+
+A **workflow** is a series of tasks, executed in a sensible order, to reach a goal. Hiring someone is a workflow: write a job description, post it, shortlist candidates, interview, make an offer, onboard. Skip a step or do them out of order and the goal isn't met.
+
+An **LLM workflow** is a workflow where some of those steps rely on a language model. In an automated hiring pipeline, drafting the job description, screening resumes and summarising interview notes might all be LLM calls, while posting to a job board is a plain API call. Each step does one distinct thing: prompting, reasoning, calling a tool, reading or writing memory, or making a decision.
+
+Workflows come in four shapes, and real applications mix them:
+
+| Shape | What happens | Example |
+|---|---|---|
+| Linear | Steps run one after another | Outline, then draft, then proofread |
+| Parallel | Independent steps run at the same time | Check a video for policy, misinformation and adult content simultaneously |
+| Branched | A condition picks one path | Refund question goes to billing, bug report goes to engineering |
+| Looped | A step repeats until a condition is met | Rewrite a draft until a reviewer approves it |
+
+Every application has its own workflow, but a handful of patterns appear again and again. Knowing them by name helps you recognise what you're building.
+
+## Five common workflow patterns
+
+### Prompt chaining
+
+Call the model several times **in sequence**, feeding each call's output into the next. Instead of asking for a 3,000-word report on a topic in one shot, you first ask for an **outline**, then ask for the report **from the outline**.
+
+Why bother? A big task split into smaller ones gives the model a narrower job at each step, which usually improves quality. It also gives you places to **check the work** between calls. After the outline step you could verify it has at least four sections; after the report step you could reject anything over 5,000 words. A failed check can stop the run or send it down a different path.
+
+### Routing
+
+A first step **classifies** the input and sends it to the handler best suited for it. A customer-support bot receives a message; an LLM decides whether it's about a refund, a technical problem or a sales enquiry; the message goes to a specialised prompt (or model, or team) for that category.
+
+The classifying call acts as a **router**. Routing lets each downstream handler be simpler and better at its one job, and lets you spend money wisely, for example sending easy questions to a cheap model and hard ones to a strong one.
+
+### Parallelization
+
+Split a task into **independent subtasks**, run them **at the same time**, then **aggregate** the results.
+
+Picture a video platform's moderation check. Before a video goes live it must pass three checks: community guidelines, misinformation, and adult content. None of these needs the others' answers, so three LLM calls can examine the transcript simultaneously. An aggregator then combines the three verdicts: publish only if all three pass, otherwise flag for review. Running them in parallel takes roughly as long as the slowest check instead of the sum of all three.
+
+### Orchestrator and workers
+
+This also splits work into parallel subtasks, with one crucial difference: **the subtasks aren't known in advance**. An **orchestrator** LLM looks at the input and decides what the subtasks are, then hands each to a **worker**.
+
+A research assistant is the classic case. For a question about a new battery chemistry, the orchestrator might dispatch one worker to search academic papers and another to search patents. For a question about a local election, it might dispatch workers to news sites and official results pages instead. In plain parallelization the three branches are fixed when you write the code; here the orchestrator invents them at run time.
+
+### Evaluator and optimizer
+
+Some tasks rarely come out right on the first try: a cold email, a blog post, a poem. Writers handle this by drafting, critiquing and redrafting. This pattern does the same with two roles:
+
+1. A **generator** produces a solution.
+2. An **evaluator**, given explicit criteria, either **accepts** it or **rejects** it with **feedback**.
+3. On rejection, the generator produces a new version using the feedback, and the loop repeats until the evaluator accepts (or you hit a maximum number of attempts).
+
+This is a **loop**, which is exactly what plain chains can't express and graphs can.
+
+<Callout kind="remember">
+Prompt chaining is **sequential**, parallelization and orchestrator-workers are **parallel**, routing is **branched**, and evaluator-optimizer is **looped**. The following lessons build each one.
+</Callout>
+
+## Graphs, nodes and edges
+
+To see how LangGraph represents a workflow, take a concrete product: an **essay-practice website** for exam candidates.
+
+1. The site generates an essay **topic**.
+2. The student writes and submits an essay.
+3. The essay is evaluated from three angles: **clarity of thought**, **depth of analysis** (including fact-checking), and **language** (vocabulary, grammar, tone). Each angle gets a score out of 5.
+4. The three scores are **aggregated** into a total out of 15.
+5. If the total is at least 10, the student is congratulated and the run ends.
+6. Otherwise the student gets **feedback** on each angle and is asked whether they want to try again. "No" ends the run; "yes" sends them back to write a new essay, and everything after step 2 runs again.
+
+The first job is always the same: turn a vague goal ("an essay-practice site") into **actionable steps** like these, on paper. Once you have the steps, drawing them as a graph is mechanical:
+
+- **Nodes** are the steps: `generate_topic`, `collect_essay`, `evaluate_clarity`, `evaluate_depth`, `evaluate_language`, `aggregate`, `congratulate`, `give_feedback`, `ask_retry`.
+- **Edges** connect them: `collect_essay` fans out to the three evaluators, which fan back in to `aggregate`; `aggregate` branches to `congratulate` or `give_feedback`; `ask_retry` loops back to `collect_essay` or goes to the end.
+
+### Nodes are Python functions
+
+In LangGraph, every node is **just a Python function**. It receives the current state, does its work and returns an update. There's no special node class to learn; if you can write a function, you can write a node. A compiled graph is essentially a set of Python functions wired together by edges.
+
+### Edges decide what runs next
+
+Nodes say **what** to do; edges say **when** to do it. After a node finishes, its outgoing edges determine which node or nodes run next. One graph can mix several kinds of edges:
+
+| Edge kind | Behaviour | In the essay graph |
+|---|---|---|
+| Sequential | A then B, always | `generate_topic` → `collect_essay` |
+| Parallel (fan-out) | A then B, C and D together | `collect_essay` → three evaluators |
+| Conditional | A then B **or** C, decided by the state | `aggregate` → `congratulate` or `give_feedback` |
+| Loop | A conditional edge pointing backwards | `ask_retry` → `collect_essay` |
+
+This is the payoff of the graph representation: sequences, parallel branches, decisions and loops are all just different arrangements of nodes and edges, so one model covers every workflow shape from the previous section.
+
+## State
+
+Every workflow needs **data to work on**. In the essay site, the evaluators need the essay text; `aggregate` needs the three scores; the branch after it needs the total. That data has two properties:
+
+1. It's **required throughout** the run, by many different nodes.
+2. It **evolves**. When the student rewrites their essay, the essay text changes. When it's re-evaluated, the scores change.
+
+That evolving, shared data is the **state**. In LangGraph's words, state is the shared memory that flows through your workflow, holding everything the nodes pass between them.
+
+For the essay site, the state might hold:
+
+| Key | Type | Written by |
+|---|---|---|
+| `topic` | `str` | `generate_topic` |
+| `essay` | `str` | `collect_essay` |
+| `clarity_score`, `depth_score`, `language_score` | `int` | the three evaluators |
+| `total_score` | `int` | `aggregate` |
+| `feedback` | `str` | `give_feedback` |
+
+### How nodes use the state
+
+When a node runs it receives the **entire current state** as its input, so any node can read any key. It then returns an **update**: a dictionary of just the keys it wants to change. LangGraph merges that update into the state and passes the result along the outgoing edges to the next node, which does the same.
+
+So the state is **shared** (every node sees all of it) and **mutable** (any node can change it), and it grows richer as the run proceeds.
+
+### Defining state in code
+
+You declare the state's shape before building the graph. The usual choice is a `TypedDict`, a normal dictionary with declared key names and types:
+
+```python
+from typing import TypedDict
+
+class EssayState(TypedDict):
+    topic: str
+    essay: str
+    clarity_score: int
+    depth_score: int
+    language_score: int
+    total_score: int
+    feedback: str
+```
+
+You can also use a `dataclass` (handy for default values) or a Pydantic `BaseModel` (which validates the data at run time, at some cost in speed). Most LangGraph code uses `TypedDict`, and so will this course.
+
+<Callout kind="tip">
+A good habit when designing any graph: list the nodes, then ask of each one "what does it need to read, and what does it produce?" The union of those answers is your state.
+</Callout>
+
+## Reducers
+
+State is shared and mutable, so the obvious next question is: **when a node writes to a key that already has a value, what happens?**
+
+By default, the new value **replaces** the old one. Usually that's exactly right. Take a tiny workflow that receives two numbers, adds them, then doubles the sum. The state has `a`, `b` and `result`. Given 5 and 6, the add node writes `result = 11`; the double node reads 11 and writes `result = 22`, replacing it. Nobody wants 11 kept around.
+
+Now consider a chatbot whose state has a single key, `message`:
+
+1. The user says "Hi, I'm Priya." The human node writes that into `message`.
+2. The model node reads it and replies "Hi Priya, how can I help?", which **replaces** `message`.
+3. The user asks "What's my name?", which replaces it again.
+4. The model node now sees only "What's my name?". The message where Priya introduced herself is gone, so the model can't answer.
+
+Replacement destroyed the information the model needed. For a conversation you want every new message **appended** to a list, not swapped in.
+
+The essay site has the same problem in a quieter form. If `essay` is overwritten on every retry, the student can't look back at their first, second and third drafts to see how they improved. Keep a list of drafts and append to it instead.
+
+That is what a **reducer** is: the rule for **how an update to a key is combined with its existing value**. Each key can have its own reducer:
+
+| Reducer | Effect | Good for |
+|---|---|---|
+| None (default) | New value replaces old | Totals, flags, latest answer |
+| Add / append | Old list + new items | Chat messages, drafts, scores from several branches |
+| Merge | Combine two dicts | Per-aspect feedback collected from several nodes |
+| Custom | Any two-argument function you write | Keep the max, de-duplicate, cap a list's length |
+
+In code, you attach a reducer to a key with `Annotated`:
+
+```python
+import operator
+from typing import Annotated, TypedDict
+
+class EssayState(TypedDict):
+    topic: str
+    drafts: Annotated[list[str], operator.add]  # appended, never replaced
+    total_score: int                            # replaced (default)
+```
+
+A node that returns `{"drafts": ["second attempt..."]}` now adds one item to the list rather than wiping it.
+
+Reducers matter most in **parallel** workflows. When three evaluator nodes run at the same moment and all write to the same key, LangGraph needs to know how to combine three updates arriving together. The parallel-workflows lesson covers that in detail.
+
+<Callout kind="remember">
+State says **what** data the workflow carries. Reducers say **how** each piece of it changes when a node writes to it.
+</Callout>
+
+## The execution model
+
+You never call nodes yourself. You build the graph, start it, and LangGraph decides what runs when. Knowing how it decides will make error messages and debugging much easier later.
+
+LangGraph's runtime is inspired by **Pregel**, a system Google built for processing very large graphs. A run has three phases.
+
+### Graph definition
+
+You declare the state schema, add the nodes (name plus function) and add the edges. Nothing runs yet; you're writing a blueprint.
+
+### Compilation
+
+You call `.compile()` on the builder. Compilation checks the structure and produces a runnable graph. It catches mistakes such as a graph with **no entry point** (no edge from `START`) or an edge that points to a node name that doesn't exist. It does **not** reject every oddity: a node that nothing connects to compiles fine and simply never runs. Treat compile errors as "this blueprint is broken", not as "this blueprint is sensible".
+
+### Execution
+
+You **invoke** the compiled graph with an initial state. From there:
+
+1. The initial state is delivered along the edge from `START`, which **activates** the first node.
+2. An active node runs its function with the current state and returns a **partial update**.
+3. The update is applied to the state (through each key's reducer).
+4. The updated state is sent along the node's outgoing edges, activating the next node or nodes. Sending state along edges is called **message passing**.
+5. This repeats until **no node is active and no messages are in transit**. Then the run halts and you get the final state back.
+
+### Super-steps
+
+Execution happens in rounds called **super-steps**. In one super-step, every node that was activated runs, then all their updates are applied together, then the next round begins.
+
+Why "super" step rather than just "step"? Because a single round can contain **several nodes running in parallel**. In the essay graph, the round after `collect_essay` runs all three evaluators at once. Calling that one "step" would be misleading, so a super-step is a round that may contain one step or many. Sequential nodes each take their own super-step; parallel nodes share one.
+
+This is also why reducers matter so much in parallel graphs: all updates from a super-step are applied together, and for a key written by more than one node, the reducer is what combines them.
+
+Step through three small graphs below. The sequential ones use one super-step per node; the batting-stats graph runs three nodes in a single super-step before the summary.
+
+<LgGraphStepper initial="batting" />
+
+<Callout kind="tip">
+Super-steps also explain the **recursion limit** you'll meet with loops. LangGraph caps how many super-steps one run may take (set your own cap with `recursion_limit` in the run config), so a loop that never exits stops with a `GraphRecursionError` instead of running forever.
+</Callout>
+
+## Cheat sheet
+
+- LangGraph runs **LLM workflows as graphs**: nodes are tasks, edges decide what runs next.
+- Workflows are **linear, parallel, branched or looped**, and real ones mix all four.
+- The five patterns: **prompt chaining, routing, parallelization, orchestrator-workers, evaluator-optimizer**.
+- A **node is a plain Python function**: state in, partial update out.
+- **Edges** can be sequential, fan-out, conditional, or loop back.
+- **State** is the shared, evolving data every node can read; define it as a `TypedDict`.
+- A **reducer** decides how an update combines with the existing value; the default is **replace**.
+- Use an **append reducer** (`Annotated[list, operator.add]`) for messages, drafts or results from parallel branches.
+- Build in three phases: **define**, **compile** (structural checks), **invoke**.
+- Execution runs in **super-steps**; parallel nodes share one, and the run halts when nothing is active.

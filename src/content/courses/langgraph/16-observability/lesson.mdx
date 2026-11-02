@@ -1,0 +1,139 @@
+import { LgTraceExplorer } from "@/components/widgets/LgTraceExplorer";
+
+## Why a chatbot needs observability
+
+By now the chatbot has a UI, streaming, multiple conversations and SQLite persistence. It works, but it is a black box. When a user complains that "the bot gave a weird answer yesterday", you have no way to see what they asked, what the model received, how long it took, or how many tokens it burned.
+
+**Observability** means recording every execution end to end so you can answer those questions later, without reproducing the bug. For an LLM app the useful facts per run are:
+
+- the **input and output** of every node and every model call
+- **latency**: total time, and time to the first token (what the user feels while streaming)
+- **token usage**: input tokens and output tokens, which is what you pay for
+- the **status**: did it succeed or raise
+- the **path**: which nodes ran, in what order
+
+This matters more for agents than for plain code. Once tools, retrieval and MCP servers enter the graph (the next few lessons), a single user message can trigger several model calls and tool runs. Without a trace you are guessing which step went wrong.
+
+The tool used here is **LangSmith**, the tracing and evaluation platform from the LangChain team. The previous lesson covered it in depth; this one wires it into the chatbot.
+
+## Setting up LangSmith
+
+Create an account on the LangSmith site, open **Settings, API keys**, and create a key. Then add these variables to the project's `.env` file:
+
+```bash
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_pt_...          # the key you just created
+LANGSMITH_PROJECT=chatbot-project      # traces are grouped under this name
+# Only needed for non-default regions or self-hosted instances:
+# LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+```
+
+That's the whole integration. LangChain and LangGraph check these variables at runtime: if tracing is on and a key is present, every `invoke` or `stream` is sent to LangSmith in the background. **No change to the graph code is needed.** As long as the backend calls `load_dotenv()` before building the graph (it already does, for the model key), tracing starts the next time you run the app.
+
+<Callout kind="warn">
+The API key is a secret, like the model provider key. Keep it in `.env`, keep `.env` in `.gitignore`, and never paste it into code or a notebook you share.
+</Callout>
+
+If the project named in `LANGSMITH_PROJECT` doesn't exist yet, LangSmith creates it on the first trace. Leave the variable out and traces land in a project called `default`.
+
+## How LangSmith organises traces
+
+LangSmith uses a three-level hierarchy:
+
+| Level | What it is | In the chatbot |
+|---|---|---|
+| **Project** | A bucket for one application or environment | `chatbot-project` |
+| **Trace** | One top-level execution, from input to final output | One call to `chatbot.stream(...)`, i.e. one user message and its reply |
+| **Run** | One step inside a trace; runs nest into a tree | The graph run, the `chat_node` run, the chat model run inside it |
+
+So every **turn** of the conversation becomes one trace. Open a trace and you see the tree: the graph at the top, `chat_node` under it, and the model call under that. Click the model run and LangSmith shows the exact messages sent (including the whole history the checkpointer loaded), the reply, start and end times, time to first token, input and output token counts, and the estimated cost.
+
+That last point is easy to miss and very useful. Because the chatbot sends the full history on every turn, the input token count grows turn after turn. A trace makes that visible long before the bill does.
+
+## The problem with a flat list
+
+Run the chatbot, chat in one conversation, then start a second conversation about something unrelated. In the project view you get one flat list of traces, newest first, with turns from both conversations interleaved. Switch back to the first conversation and its next turn lands on top of the pile again.
+
+Each trace is correct on its own, but you lose the conversation. To review what happened in one chat you would have to pick its turns out of the list by hand. The chatbot already knows which conversation each message belongs to (that's what `thread_id` is for), so the traces should be grouped the same way.
+
+## Grouping traces into threads
+
+LangSmith has a **Threads** view for exactly this. It groups traces that share a conversation identifier stored in their **metadata**. The keys it recognises are `thread_id` and `session_id`.
+
+The chatbot already builds a config for the checkpointer:
+
+```python
+CONFIG = {"configurable": {"thread_id": st.session_state["thread_id"]}}
+```
+
+`configurable` is read by LangGraph (the checkpointer uses it to load the right conversation). LangSmith reads `metadata`. Add the same id there, and give the run a readable name while you're at it:
+
+```python
+thread_id = st.session_state["thread_id"]
+
+CONFIG = {
+    "configurable": {"thread_id": thread_id},   # for the checkpointer
+    "metadata": {"thread_id": thread_id},       # for LangSmith's Threads view
+    "run_name": "chat_turn",                     # trace name instead of "LangGraph"
+}
+
+for chunk, meta in chatbot.stream(
+    {"messages": [HumanMessage(content=user_input)]},
+    config=CONFIG,
+    stream_mode="messages",
+):
+    ...
+```
+
+Three keys, three jobs:
+
+- `configurable.thread_id`: LangGraph loads and saves checkpoints for this conversation.
+- `metadata.thread_id`: LangSmith files the trace under this conversation. Metadata set on the top-level config is inherited by every child run, so the node and model runs are tagged too, which keeps the thread's token and cost totals complete.
+- `run_name`: the top-level trace is called `chat_turn` instead of the generic `LangGraph`, so the list reads like what it is.
+
+<Callout kind="remember">
+`configurable` is for your graph, `metadata` is for your tracing. Putting the thread id in one does not mean the other will use it reliably, so set both.
+</Callout>
+
+Now the Threads tab lists one row per conversation. Open a thread and LangSmith renders it like a chat transcript, turn by turn; click any turn to jump into its full trace with latency and tokens. Start a new conversation in the app and a new thread appears.
+
+<LgTraceExplorer />
+
+## Other useful config for tracing
+
+The same config dict accepts a few more fields that make traces easier to search later:
+
+```python
+CONFIG = {
+    "configurable": {"thread_id": thread_id},
+    "metadata": {"thread_id": thread_id, "user_id": user.id, "app_version": "0.4.0"},
+    "tags": ["streamlit", "prod"],
+    "run_name": "chat_turn",
+}
+```
+
+Tags and metadata become filters in the LangSmith UI ("show me every failed trace from `prod` for this user"). You can also switch tracing on or off, or send runs to a different project, for one block of code:
+
+```python
+import langsmith as ls
+
+with ls.tracing_context(project_name="chatbot-experiments", enabled=True):
+    chatbot.invoke({"messages": [HumanMessage("hi")]}, config=CONFIG)
+```
+
+Beyond tracing, LangSmith offers monitoring dashboards (latency and error rate over time), datasets and experiments for evaluation, a prompt hub and a playground for replaying a model call with edits. The earlier LangSmith lesson covers those.
+
+## What you gain
+
+From here on, every feature added to the chatbot shows up in its traces. When the next lesson adds tools, a trace will show the model deciding to call a tool, the tool's raw output, and the model's second call that turns it into an answer. Later, retrieval traces show exactly which chunks came back from the vector store. Reading those trees is the fastest way to understand, and debug, what an agent actually did.
+
+## Cheat sheet
+
+- Observability = recording inputs, outputs, latency, tokens, status and path for every run, so you can debug after the fact.
+- Enable LangSmith with `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY`; set `LANGSMITH_PROJECT` to name the project. No graph code changes.
+- Hierarchy: project, then one trace per top-level invoke (one chat turn), then nested runs per node and model call.
+- Traces show time to first token, total latency, input/output tokens and cost per model call.
+- A flat trace list mixes conversations; the Threads view groups traces by `thread_id` or `session_id` in **metadata**.
+- `configurable.thread_id` drives the checkpointer; `metadata.thread_id` drives LangSmith threads. Set both.
+- `run_name` renames the top-level trace (e.g. `chat_turn`); `tags` and extra metadata make traces filterable.
+- `ls.tracing_context(...)` toggles tracing or changes the project for a block of code.

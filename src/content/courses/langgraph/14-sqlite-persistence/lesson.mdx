@@ -1,0 +1,316 @@
+import { LgCheckpointStore } from "@/components/widgets/LgCheckpointStore";
+
+## Why memory in RAM is not enough
+
+The chatbot so far has real conversations, streaming replies and a sidebar of threads you can switch between. It also has one embarrassing flaw: restart the server, or sometimes just refresh the page, and every conversation is gone.
+
+The reason is the checkpointer. `InMemorySaver` keeps every checkpoint in a Python dictionary inside the running process. That's perfect for experiments and tests: zero setup, very fast, nothing to clean up. But a process's memory dies with the process. Deploy a new version, hit a crash, or let the host recycle the container, and all your users' history evaporates.
+
+What we want instead:
+
+- Every message the user sends and every reply the model gives is written to **durable storage** as it happens.
+- When the app starts again, hours or days later, the old threads are still listed and can be resumed from the exact point they stopped.
+
+LangGraph makes this almost a one-line change, because a checkpointer is a pluggable component. The graph doesn't care where checkpoints go; it only calls the checkpointer's save and load methods. Swap the implementation and the same graph becomes persistent.
+
+## Checkpointer options
+
+Each checkpointer implements the same interface (save a checkpoint, load the latest, list checkpoints, store pending writes, delete a thread), so they're interchangeable:
+
+| Checkpointer | Package | Stores data in | Good for |
+|---|---|---|---|
+| `InMemorySaver` | `langgraph` (built in) | The process's RAM | Notebooks, tests, quick demos |
+| `SqliteSaver` / `AsyncSqliteSaver` | `langgraph-checkpoint-sqlite` | A local SQLite file | Local apps, prototypes, single-machine tools |
+| `PostgresSaver` / `AsyncPostgresSaver` | `langgraph-checkpoint-postgres` | A PostgreSQL database | Production, many users, several app servers |
+
+SQLite is a full SQL database that lives in a single file and needs no server. That makes it ideal for learning: install a package, point it at a filename, done. Its limit is concurrency. SQLite handles one writer at a time on one machine, so it doesn't suit an app with many simultaneous users or several server instances. For that you switch to Postgres, and because the interface is the same, the switch touches only the lines that create the checkpointer.
+
+## Install the SQLite checkpointer
+
+The SQLite saver ships as its own package, separate from `langgraph`, so that apps which don't need it don't pull it in:
+
+```bash
+pip install langgraph-checkpoint-sqlite
+```
+
+Python's standard library already includes the `sqlite3` driver, so nothing else is needed.
+
+## Swapping the checkpointer
+
+Here's the backend from the previous lesson with only the persistence lines changed:
+
+```python
+# chatbot_backend.py
+import sqlite3
+from typing import Annotated, TypedDict
+
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AnyMessage
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+
+llm = init_chat_model("openai:gpt-4.1-mini")
+
+
+class ChatState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+
+def chat_node(state: ChatState):
+    return {"messages": [llm.invoke(state["messages"])]}
+
+
+builder = StateGraph(ChatState)
+builder.add_node("chat_node", chat_node)
+builder.add_edge(START, "chat_node")
+builder.add_edge("chat_node", END)
+
+conn = sqlite3.connect("chatbot.db", check_same_thread=False)
+checkpointer = SqliteSaver(conn)
+chatbot = builder.compile(checkpointer=checkpointer)
+```
+
+Two lines do the work:
+
+1. `sqlite3.connect("chatbot.db", ...)` opens the database file, **creating it** in the working directory if it doesn't exist yet.
+2. `SqliteSaver(conn)` wraps that connection. On first use it creates the tables it needs, then every checkpoint the graph produces is written there.
+
+Nothing else changes: not the state, not the nodes, not `invoke` or `stream`, and not the front end's calls to `get_state`.
+
+### Why the same-thread check is off
+
+By default, Python's `sqlite3` refuses to let a connection be used from any thread other than the one that created it, and raises `ProgrammingError` if you try. That's a safety net for code that shares a connection carelessly.
+
+Our app does share it, on purpose. The backend module is imported once per process, so there's exactly one connection. Streamlit then runs your script on worker threads, and a web server would handle requests on different threads too. With the default check, the first message from a thread other than the one that imported the backend would crash.
+
+Passing `check_same_thread=False` turns that check off. It's safe here because `SqliteSaver` serialises its own access to the connection with a lock, so two threads never use it at the same moment. If you open other connections for your own queries, the same care applies.
+
+### Using a context manager instead
+
+`SqliteSaver` can also open and close the connection for you:
+
+```python
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+with SqliteSaver.from_conn_string("chatbot.db") as checkpointer:
+    chatbot = builder.compile(checkpointer=checkpointer)
+    chatbot.invoke({"messages": [("user", "hi")]}, {"configurable": {"thread_id": "t1"}})
+# connection closed here
+```
+
+That's ideal for scripts and tests that run, finish and exit. A long-lived app like a Streamlit server wants the connection to stay open for the life of the process, which is why the backend above opens it explicitly. For `async` graphs, use `AsyncSqliteSaver` from `langgraph.checkpoint.sqlite.aio`, which needs the `aiosqlite` package.
+
+## Proving it survives a restart
+
+Test the backend on its own before touching the UI. This script sends one message and prints the whole thread:
+
+```python
+# try_persistence.py
+from langchain_core.messages import HumanMessage
+from chatbot_backend import chatbot
+
+config = {"configurable": {"thread_id": "thread-1"}}
+result = chatbot.invoke({"messages": [HumanMessage(content="Hi, my name is Asha")]}, config=config)
+
+for msg in result["messages"]:
+    print(f"{msg.type:>5}: {msg.content}")
+```
+
+```text
+human: Hi, my name is Asha
+   ai: Hello Asha! How can I help you today?
+```
+
+A `chatbot.db` file has appeared next to your code. Now change the message to `"What is my name?"` and run the script **again**. This is a brand-new Python process; with `InMemorySaver` it would know nothing.
+
+```text
+human: Hi, my name is Asha
+   ai: Hello Asha! How can I help you today?
+human: What is my name?
+   ai: Your name is Asha.
+```
+
+Four messages, not two. The first two came from the database: the checkpointer loaded the latest checkpoint of `thread-1`, the reducer appended the new question, and the model saw the full history.
+
+Threads stay isolated on disk exactly as they did in memory. Switch to `"thread-2"`, introduce yourself as Rahul, and ask for your name: Rahul. Go back to `thread-1` and ask "What's the capital of India? Use my name in the answer": "New Delhi, Asha." Each thread id selects its own chain of checkpoints in the same file.
+
+<Callout kind="remember">
+Persistence changed the **storage**, not the **model of threads**. The same `thread_id` config, the same `get_state`, the same `stream`: only the checkpointer object is different.
+</Callout>
+
+## Inside the database file
+
+It's worth opening `chatbot.db` once to see what's actually stored. Any SQLite browser works: a VS Code extension such as SQLite Viewer, the free DB Browser for SQLite, or the `sqlite3` command-line tool:
+
+```bash
+sqlite3 chatbot.db "SELECT thread_id, checkpoint_id FROM checkpoints ORDER BY checkpoint_id;"
+```
+
+`SqliteSaver` creates two tables:
+
+| Table | One row per | Key columns |
+|---|---|---|
+| `checkpoints` | Saved snapshot of a thread's state | `thread_id`, `checkpoint_ns`, `checkpoint_id`, `parent_checkpoint_id`, `checkpoint` (the serialised state), `metadata` |
+| `writes` | Pending write made by a task during a step | `thread_id`, `checkpoint_id`, `task_id`, `channel`, `value` |
+
+The `checkpoint` and `metadata` columns are serialised blobs, so a viewer shows them as binary or semi-readable data. Squint at a checkpoint and you'll still spot the conversation text inside. The point to take away is that the full state of every step is stored, not just the final messages, and that's exactly what makes time travel and resuming after failures possible.
+
+### Why three checkpoints per message
+
+After two turns on each of two threads you'll count twelve rows in `checkpoints`, not four. Our graph is `START → chat_node → END`, and one `invoke` produces three checkpoints. For the first message in a thread they are:
+
+1. **Step -1, source "input"**: the input you passed has been received but not applied yet.
+2. **Step 0, source "loop"**: the input is applied, so the new human message is now in `messages`.
+3. **Step 1, source "loop"**: `chat_node` has run, so the AI reply is in `messages`.
+
+The step counter keeps running within a thread, so the second message writes steps 2 (input), 3 and 4, the third writes 5, 6 and 7, and so on. Each checkpoint points at the one before it through `parent_checkpoint_id`, forming a chain per thread. So many rows, but only as many **distinct** `thread_id` values as there are conversations. That distinction matters for the next step.
+
+The widget simulates both checkpointers. Send messages on a couple of threads, watch three rows appear per message, then restart the app with each saver.
+
+<LgCheckpointStore />
+
+## Listing every thread
+
+The front end still starts with an empty `chat_threads` list, so after a restart the sidebar is blank even though the database is full. The fix: at startup, ask the backend which threads exist.
+
+Every checkpointer has a `list` method. Give it a config to list one thread's checkpoints, or `None` to list **all** checkpoints in the store. It returns a generator of `CheckpointTuple` objects; each one's `.config` holds the thread id:
+
+```python
+for cp in checkpointer.list(None):
+    print(cp.config["configurable"]["thread_id"], cp.metadata.get("step"))
+```
+
+```text
+thread-2 4
+thread-2 3
+thread-2 2
+thread-2 1
+...
+```
+
+It's a generator because a real store can hold thousands of checkpoints; you iterate rather than load them all at once. Every thread appears once per checkpoint, so deduplicate. A `set` would do it, but it throws away order, and order is useful: `SqliteSaver` lists checkpoints newest first. A dictionary deduplicates **and** keeps the first-seen order:
+
+```python
+def retrieve_all_threads() -> list[str]:
+    """Every thread id in the database, oldest conversation first."""
+    newest_first = dict.fromkeys(
+        cp.config["configurable"]["thread_id"] for cp in checkpointer.list(None)
+    )
+    return list(reversed(newest_first))
+```
+
+It returns oldest first because that matches how the front end already behaves: new chats are appended to the end of `chat_threads`, and the sidebar draws the list reversed so the newest sits on top.
+
+### When listing gets expensive
+
+`checkpointer.list(None)` reads and deserialises every checkpoint of every thread just to collect ids. With a few dozen chats that's instant. With thousands of users and long conversations, it means loading far more data than you need on every startup.
+
+The usual fix is to keep your own small table of conversations alongside the checkpoints, written when a thread is created:
+
+```python
+conn.execute(
+    """CREATE TABLE IF NOT EXISTS threads (
+           thread_id TEXT PRIMARY KEY,
+           user_id   TEXT,
+           title     TEXT,
+           created_at TEXT DEFAULT CURRENT_TIMESTAMP)"""
+)
+
+def register_thread(thread_id: str, user_id: str, title: str = "New chat"):
+    conn.execute(
+        "INSERT OR IGNORE INTO threads (thread_id, user_id, title) VALUES (?, ?, ?)",
+        (thread_id, user_id, title),
+    )
+    conn.commit()
+```
+
+Now listing a user's chats is one indexed query, and you get a natural home for titles and ownership. Querying the checkpointer's own tables directly also works, but those tables are an internal format that can change between versions, so prefer your own table or the public `list` method.
+
+## Wiring the front end
+
+The front end from the previous lesson needs exactly one real change: initialise the thread list from the database instead of an empty list. Import the new function alongside the graph:
+
+```python
+from chatbot_backend import chatbot, retrieve_all_threads
+```
+
+Then in the session setup:
+
+```python
+if "chat_threads" not in st.session_state:
+    st.session_state["chat_threads"] = retrieve_all_threads()  # was: []
+```
+
+Everything else already works with persisted threads:
+
+- The sidebar loops over `chat_threads`, so the old threads appear immediately.
+- Clicking one calls `get_state`, which now reads from SQLite.
+- New chats are appended by `add_thread` as before. The thread exists in the database once its first message runs through the graph.
+- Sending a message streams through the graph, and the checkpointer writes it to disk.
+
+Start the app: `thread-1` and `thread-2` from the test script are already in the sidebar, with their full histories. Chat about biryani in a new thread, stop the server with Ctrl+C, start it again, and all three are still there.
+
+## Time travel survives restarts too
+
+Because the database holds every checkpoint, not just the latest, everything the persistence lesson showed with `InMemorySaver` now works across restarts. Inspect a thread's full history days later:
+
+```python
+config = {"configurable": {"thread_id": "thread-1"}}
+for snapshot in chatbot.get_state_history(config):  # newest first
+    print(snapshot.metadata["step"], len(snapshot.values.get("messages", [])), snapshot.next)
+```
+
+Each snapshot's `config` carries its own `checkpoint_id`. Invoke the graph with that config to resume from that exact point, or call `update_state` on it to fork an alternative branch of the conversation. The fork is written to the same file, so it persists too.
+
+This also gives you **fault tolerance**. If the process dies halfway through a multi-node graph (a crash, a deploy, a machine restart), the checkpoints of the steps that finished are already on disk. Invoke the same thread with `None` as input and the graph continues from the last completed step instead of starting over:
+
+```python
+chatbot.invoke(None, config={"configurable": {"thread_id": "long-job-42"}})
+```
+
+For a one-node chatbot that matters little. For an agent that has already spent two minutes and a dozen tool calls, it's the difference between resuming and paying for everything again. Human-in-the-loop interrupts, covered later, rely on the same mechanism: a graph pauses, its state sits in the database, and it can be resumed hours later by a different process.
+
+## What persistence does not solve
+
+A database-backed checkpointer fixes durability. It doesn't make the app production-ready on its own:
+
+- **Ownership.** `retrieve_all_threads` returns **everyone's** threads. In a multi-user app, every visitor would see every conversation. Store a `user_id` per thread (as in the `threads` table above) and filter by the logged-in user, and check ownership before any `get_state` call.
+- **Growth.** Checkpoints accumulate forever: three rows per message here, more for bigger graphs. Plan a retention policy. To remove one conversation completely, call `checkpointer.delete_thread(thread_id)`, which deletes its checkpoints and writes. A "Delete chat" button is a nice exercise.
+- **Context length.** Persisted threads grow without limit, and the whole history is sent to the model each turn. Trimming and summarising messages comes in a later lesson.
+- **Concurrency.** SQLite is one file on one machine with one writer at a time. Two app servers can't share it safely.
+
+## Moving to Postgres later
+
+When the app outgrows SQLite, the change is again confined to checkpointer setup:
+
+```python
+# pip install langgraph-checkpoint-postgres
+from langgraph.checkpoint.postgres import PostgresSaver
+
+DB_URI = "postgresql://user:password@localhost:5432/chatbot"
+
+with PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    checkpointer.setup()  # create tables once, e.g. in a migration step
+    chatbot = builder.compile(checkpointer=checkpointer)
+```
+
+Unlike the SQLite saver, the Postgres saver expects you to call `setup()` once to create its tables. In a long-running server you'd typically create a connection pool at startup and pass it to `PostgresSaver` rather than using the context manager. The graph, the thread configs and the front end stay the same.
+
+<Callout kind="tip">
+Develop on `InMemorySaver` or SQLite, deploy on Postgres. Because all checkpointers share one interface, this is a configuration change, not a rewrite.
+</Callout>
+
+## Cheat sheet
+
+- `InMemorySaver` loses everything when the process stops; a database checkpointer survives restarts.
+- Install with `pip install langgraph-checkpoint-sqlite`; import `SqliteSaver` from `langgraph.checkpoint.sqlite`.
+- `SqliteSaver(sqlite3.connect("chatbot.db", check_same_thread=False))` for a long-lived app; `SqliteSaver.from_conn_string(...)` as a context manager for scripts.
+- `check_same_thread=False` lets Streamlit's worker threads share the one connection; the saver locks access itself.
+- Graph, `thread_id` configs, `get_state` and `stream` are unchanged by the swap.
+- Each `invoke` of a START → node → END graph writes three checkpoints; steps keep counting up within a thread.
+- `checkpointer.list(None)` yields every `CheckpointTuple`; read `cp.config["configurable"]["thread_id"]`.
+- Deduplicate with `dict.fromkeys` to keep recency order, then initialise `chat_threads` from it.
+- For many users, keep your own `threads` table with `user_id` and title, and filter by owner.
+- `checkpointer.delete_thread(thread_id)` removes a conversation; plan retention for growing tables.
+- Move to `PostgresSaver` (call `setup()` once) when you need concurrency or several servers.

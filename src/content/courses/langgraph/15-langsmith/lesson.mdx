@@ -1,0 +1,710 @@
+import { LgTraceDiagnosis } from "@/components/widgets/LgTraceDiagnosis";
+import { LgPromptExperiment } from "@/components/widgets/LgPromptExperiment";
+
+## Why LLM apps are hard to debug
+
+Building an LLM application that works in a demo is the easy half. The hard half starts when real users arrive and something quietly goes wrong. Three stories show the shape of the problem.
+
+**The slow cover-letter tool.** A startup builds a tool for job seekers. You paste a job description; the app reads it, pulls your résumé and projects from your cloud drive, matches your skills to the role, drafts a cover letter, then proofreads it for tone. Four or five stages, most of them calling an LLM. A request normally takes about two minutes. One morning support is flooded: it now takes seven to ten. Users are leaving. You can see the input, the output and the total time, but not **which stage** is eating the extra eight minutes. The culprit might be a small change in last week's release that makes the document fetcher scan the user's **entire** drive instead of one folder, but nothing in your logs points there.
+
+**The expensive research agent.** Another team runs a research assistant. Give it a topic and it searches academic sites, reads papers, extracts key points, writes a report and lets you ask follow-up questions. A report costs about ₹0.50 in model calls, and pricing is built on that. Suddenly the provider's bill climbs: most reports still cost ₹0.50, but some cost ₹2. The cause is one innocent sentence added to the prompt in the last release: "keep improving the report until it is excellent." For most topics the agent is satisfied after one pass. For some it decides the report isn't good enough and loops, fetching and re-reading papers again and again. Nothing crashes, so there's no error to find. The behaviour changes only for certain inputs, and you can't see which step is repeating.
+
+**The hallucinating HR bot.** A large company builds a retrieval-augmented (RAG) chatbot over its HR policies so new joiners stop asking HR the same questions. It works, until it starts making things up: asked about leave policy, it cheerfully says there's no limit. Misinformation spreads. A RAG answer can go wrong in two places. The **retriever** might fetch the wrong passages (someone set it to return one chunk instead of four), or the **generator** might ignore good context (someone softened the "answer only from the context" instruction). From the outside you only see a bad answer. Which half failed?
+
+### What the stories have in common
+
+All three systems are **multi-step pipelines built on LLMs**, and that combination is what makes them hard to debug:
+
+- **Non-determinism.** A calculator returns 8 for 2 × 4 every time. An LLM can give different outputs for the same input, so a bug may appear for some inputs and not others, and may not reproduce on your laptop.
+- **No stack trace.** Slowness, overspending and hallucination aren't exceptions. The code runs "successfully" and produces a worse result.
+- **A black box with many parts.** Without help you see only the first input and the final output. The interesting facts (what the retriever returned, the exact prompt the model saw, how many times the loop ran, which call was slow) are inside.
+
+What you need is a way to open the box after the fact and see, step by step, what each component received, produced, cost and how long it took.
+
+## Observability
+
+**Observability** is the ability to understand a system's internal state from the data it emits (logs, metrics and traces) so you can explain **why** something happened, even for problems you didn't anticipate.
+
+For an LLM app, the most useful form of that data is a **trace**: a complete, structured recording of one execution, end to end, with every intermediate step nested inside it. Record a trace for every request, store them, and when a complaint comes in you can open the exact execution that went wrong and walk through it component by component.
+
+<Callout kind="remember">
+Logging tells you something happened. A trace tells you the whole story of one request: every step, its inputs and outputs, its timing and its cost, in the order they happened.
+</Callout>
+
+## What LangSmith is
+
+**LangSmith** is a platform for observability and evaluation of LLM applications, built by the team behind LangChain and LangGraph. Teams use it to debug, test and monitor AI apps. It integrates tightly with LangChain and LangGraph (tracing switches on with environment variables), but it also works with plain Python through a decorator, and with other frameworks.
+
+Most of this lesson is about tracing, because that's where you'll spend most of your time. Then we'll cover the rest of what LangSmith does: monitoring and alerts, evaluation, prompt experiments, datasets and annotation, user feedback and collaboration.
+
+### What a trace records
+
+For every traced execution, LangSmith captures:
+
+| What | Why it matters |
+|---|---|
+| Inputs and outputs of the whole run | See exactly what the user sent and got back |
+| Every intermediate step | The retrieved documents, the formatted prompt, raw model output, parser output, tool calls |
+| Latency, per step and overall | Find the slow stage |
+| Token usage and estimated cost, per model call | Find the expensive stage, input vs output tokens |
+| Errors | Which step raised, with the exception |
+| Tags and metadata | Filter and search: model name, app version, user tier |
+| Feedback | User thumbs up or down and evaluator scores attached to the run |
+
+Some of this is automatic. Model calls are tagged with the model name, and runtime details like library versions are recorded. You can add your own tags and metadata on top.
+
+## Projects, traces and runs
+
+Three terms organise everything in LangSmith. Picture a tiny app: the user's question goes into a prompt template, the prompt goes to a model, and the model's reply goes through an output parser.
+
+- A **project** is a named bucket of traces, usually one per application or environment, such as "support-bot-prod" or "rag-experiments".
+- A **trace** is **one execution** of the application: one user question flowing through the whole pipeline. Run the app 500 times and the project holds 500 traces.
+- A **run** is **one component's execution** inside a trace. Our tiny app produces three runs per trace: the prompt template, the model and the parser. Runs nest: a chain is a run that contains child runs, and the trace is the tree rooted at the top-level run.
+
+| Concept | Granularity | Example |
+|---|---|---|
+| Project | The whole app | `rag-chatbot` |
+| Trace | One request, end to end | "Who wrote this book?" asked at 10:42 |
+| Run | One step within a request | The retriever call inside that request |
+
+The UI mirrors this hierarchy. You open a project to see its list of traces, then open a trace to see its tree of runs, and click any run to see its inputs, outputs, timing and tokens.
+
+## Setting up
+
+You need a LangSmith account and an API key:
+
+1. Sign up at smith.langchain.com.
+2. Open **Settings → API Keys**, create a key (a personal access token is fine for your own projects), and copy it.
+
+Then put these in a `.env` file at the root of your project. Never hard-code keys in source files.
+
+```bash
+# .env
+OPENAI_API_KEY=sk-...
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_...
+LANGSMITH_PROJECT=langsmith-demo
+# Only needed for a non-default region or a self-hosted install:
+# LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
+```
+
+- `LANGSMITH_TRACING=true` turns tracing on. Set it to `false` to switch tracing off without touching code.
+- `LANGSMITH_API_KEY` authenticates your app.
+- `LANGSMITH_PROJECT` names the project traces go to. It's created automatically on first use; without it, traces land in a project called "default".
+
+You'll still see older tutorials use `LANGCHAIN_TRACING_V2`, `LANGCHAIN_API_KEY` and `LANGCHAIN_PROJECT`. Those legacy names still work, but the `LANGSMITH_` names are current.
+
+Install the packages used in this lesson:
+
+```bash
+pip install langsmith langchain langchain-openai langchain-community langgraph python-dotenv pypdf faiss-cpu
+```
+
+## Your first trace
+
+Here's the simplest possible LangChain app: prompt, model, parser.
+
+```python
+# 1_simple_llm_call.py
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+
+load_dotenv()  # loads OPENAI_API_KEY and the LANGSMITH_* variables
+
+prompt = PromptTemplate.from_template("{question}")
+model = init_chat_model("openai:gpt-4.1-mini")
+parser = StrOutputParser()
+
+chain = prompt | model | parser
+print(chain.invoke({"question": "What is the capital of Peru?"}))
+```
+
+```text
+The capital of Peru is Lima.
+```
+
+There's nothing about LangSmith in this code, and that's the point. Every LangChain component already knows how to report itself; once the environment variables are set, each `invoke` is traced automatically and uploaded in the background.
+
+### Reading the trace
+
+In the LangSmith UI, open **Tracing Projects**. Next to "default" you'll find `langsmith-demo`, created by your run. Inside it is one trace with its start time, input, output, status, latency, token count and cost.
+
+Click the trace and the run tree appears:
+
+```text
+RunnableSequence            1.2s   41 tokens
+├── PromptTemplate          0.00s
+├── ChatOpenAI              1.1s   41 tokens   gpt-4.1-mini
+└── StrOutputParser         0.00s
+```
+
+Click any run to see what it received and produced. The prompt template turned `question` into a formatted prompt; the model received a human message and returned an AI message with metadata; the parser pulled out the plain string. Change the question to India and run again: the project now shows two traces, each with its own tree.
+
+## Names, tags and metadata
+
+Once you have several apps and many traces, organisation matters. Let's trace a slightly bigger chain, one that writes a detailed report on a topic and then summarises it in five points, and use it to learn four controls.
+
+### One project per app
+
+Give each application its own project so traces don't mix. The cleanest way is `LANGSMITH_PROJECT` in that app's `.env`. You can also set it from code, as long as you do it **before anything is traced**, because the SDK reads the project name once and caches it:
+
+```python
+import os
+os.environ["LANGSMITH_PROJECT"] = "sequential-llm-app"  # first lines of the script
+```
+
+Setting it later in a running process (say, halfway through a server's life) has no effect on traces. To send **part** of your code to a different project at runtime, use a context manager instead:
+
+```python
+import langsmith as ls
+
+with ls.tracing_context(project_name="nightly-batch"):
+    chain.invoke({"topic": "solar energy"})
+```
+
+### Tags, metadata and run names per call
+
+Every `invoke` accepts a `config` dictionary. Three of its keys shape the trace:
+
+```python
+from langchain.chat_models import init_chat_model
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+
+report_prompt = PromptTemplate.from_template("Write a detailed report on {topic}.")
+summary_prompt = PromptTemplate.from_template("Summarise this text in 5 bullet points:\n\n{text}")
+
+writer = init_chat_model("openai:gpt-4.1-mini", temperature=0.7)
+summariser = init_chat_model("openai:gpt-4.1", temperature=0.2)
+parser = StrOutputParser()
+
+chain = report_prompt | writer | parser | (lambda text: {"text": text}) | summary_prompt | summariser | parser
+
+config = {
+    "run_name": "report_and_summary",
+    "tags": ["report-generation", "summarisation", "v2"],
+    "metadata": {"writer_model": "gpt-4.1-mini", "writer_temperature": 0.7, "app_version": "2.3.0"},
+}
+result = chain.invoke({"topic": "unemployment in India"}, config=config)
+```
+
+- `run_name` replaces the generic "RunnableSequence" label at the top of the tree with something meaningful.
+- `tags` are short labels. Use them for things you'll filter by often, such as feature names, versions and experiments.
+- `metadata` is key-value detail: model settings, app version, user tier, customer id.
+
+Tags and metadata set on the top-level call appear on the trace. LangChain also adds its own per run. Each model run is labelled with its model, so you can see at a glance that step 2 used `gpt-4.1-mini` and step 6 used `gpt-4.1`, and each step of a sequence records its position. The payoff is **search**. In a project with 100,000 traces, you can filter for "tag = v2 and latency over 10 s" or "metadata.writer_model = gpt-4.1-mini" and get exactly the traces you care about.
+
+<Callout kind="tip">
+Put the app version in metadata on every trace. When quality or cost shifts after a release, filtering by version is the fastest way to compare before and after.
+</Callout>
+
+## Tracing a RAG pipeline
+
+RAG is where tracing pays off most, because the two failure modes of a bad answer are invisible from outside.
+
+### Retriever errors and generator errors
+
+- **Retriever error**: the question was fine, but the retriever fetched passages that don't contain the answer. Too few chunks, poor chunking, a weak embedding model or a mismatched query. Any model would struggle.
+- **Generator error**: the right passages arrived, but the model ignored them, misread them or embellished. A weaker model, a lenient prompt, or too much noisy context.
+
+The fixes are completely different (tune retrieval versus tune the prompt or model), so diagnosing **which** one failed is the whole game. A trace shows the retrieved documents and the final prompt, so you can read exactly what the model was given and judge which side failed.
+
+### A first version
+
+This app answers questions about a machine-learning textbook PDF. It loads the PDF, splits it into chunks, embeds them into a FAISS index, and runs a chain that retrieves context and answers:
+
+```python
+# rag_v1.py
+from langchain.chat_models import init_chat_model
+from langchain.embeddings import init_embeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+docs = PyPDFLoader("islr.pdf").load()  # one Document per page
+chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150).split_documents(docs)
+store = FAISS.from_documents(chunks, init_embeddings("openai:text-embedding-3-small"))
+retriever = store.as_retriever(search_kwargs={"k": 4})
+
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "Answer ONLY from the provided context. If the answer is not there, say you don't know."),
+    ("human", "Question: {question}\n\nContext:\n{context}"),
+])
+llm = init_chat_model("openai:gpt-4.1-mini")
+
+def format_docs(docs):
+    return "\n\n".join(d.page_content for d in docs)
+
+chain = (
+    RunnableParallel(context=retriever | RunnableLambda(format_docs), question=RunnablePassthrough())
+    | prompt | llm | StrOutputParser()
+)
+print(chain.invoke("Who are the authors of this book?"))
+```
+
+The parallel step sends the question down two branches at once: one branch passes it through untouched, the other retrieves and joins the chunks into a single context string. Their outputs become the prompt's `question` and `context`.
+
+The trace shows the whole chain nicely: `RunnableParallel` with the retriever branch (including the exact chunks it returned) and the passthrough branch, then the formatted prompt with the system instruction, question and context, then the model call and the parser.
+
+But it has two problems.
+
+### Problem one, untraced setup
+
+The trace starts at `chain.invoke`. Loading 400+ pages, chunking them and embedding thousands of chunks don't appear at all, yet they're a big part of the app's runtime and quality. Why? Automatic tracing covers LangChain **runnables** invoked as part of a traced call. The setup code ran as plain Python before any traced call began, so nothing recorded it.
+
+The fix is the `@traceable` decorator from the `langsmith` package. It turns **any** Python function into a run, recording its arguments as inputs, its return value as output, its duration, and any exception. Refactor the setup into functions and decorate them:
+
+```python
+from langsmith import traceable
+
+@traceable(name="load_pdf", run_type="tool", tags=["loader"], metadata={"loader": "PyPDFLoader"})
+def load_pdf(path: str):
+    return PyPDFLoader(path).load()
+
+@traceable(name="split_documents", tags=["chunking"])
+def split_documents(docs, chunk_size: int = 1000, chunk_overlap: int = 150):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    return splitter.split_documents(docs)
+
+@traceable(name="build_vectorstore", tags=["embedding"],
+           metadata={"embedding_model": "text-embedding-3-small", "dimensions": 1536})
+def build_vectorstore(chunks):
+    store = FAISS.from_documents(chunks, init_embeddings("openai:text-embedding-3-small"))
+    return store.as_retriever(search_kwargs={"k": 4})
+
+@traceable(name="setup_pipeline")
+def setup_pipeline(pdf_path: str):
+    docs = load_pdf(pdf_path)
+    chunks = split_documents(docs)
+    return build_vectorstore(chunks)
+```
+
+Notice the arguments:
+
+- `name` sets the run's label in the UI.
+- `run_type` categorises the run. The default is `"chain"`; others include `"llm"`, `"retriever"`, `"tool"`, `"prompt"`, `"parser"` and `"embedding"`, and the UI renders some of them specially.
+- `tags` and `metadata` attach to **this run**, so you can later search for every trace that used a particular embedding model.
+
+Because decorated functions call each other, their runs **nest**: `setup_pipeline` contains `load_pdf`, `split_documents` and `build_vectorstore`. Now you can see that loading took 15 seconds, splitting was instant, and embedding took most of the rest. You can also see the 441 page documents going in and the chunk count coming out.
+
+### Problem two, one app split into two traces
+
+Run the new version and the project shows **two** traces per question: `setup_pipeline` and the query chain. They're one application, but they show up as unrelated traces, because each was started at the top level.
+
+Give them a common parent. Wrap the whole request in one decorated function, and everything called inside it (decorated functions and LangChain runnables alike) nests under it automatically:
+
+```python
+@traceable(name="pdf_rag_app")
+def answer_question(pdf_path: str, question: str) -> str:
+    retriever = setup_pipeline(pdf_path)
+    chain = (
+        RunnableParallel(context=retriever | RunnableLambda(format_docs), question=RunnablePassthrough())
+        | prompt | llm | StrOutputParser()
+    )
+    return chain.invoke(question, config={"run_name": "pdf_rag_query"})
+
+print(answer_question("islr.pdf", "What is linear regression?"))
+```
+
+```text
+pdf_rag_app
+├── setup_pipeline
+│   ├── load_pdf
+│   ├── split_documents
+│   └── build_vectorstore
+└── pdf_rag_query
+    ├── RunnableParallel (retriever + passthrough)
+    ├── ChatPromptTemplate
+    ├── ChatOpenAI
+    └── StrOutputParser
+```
+
+That's the hierarchy you want: one trace per request, with setup and query as siblings inside it. Parent-child links propagate through Python's context, so you don't pass anything around by hand.
+
+### Problem three, rebuilding the index every time
+
+The trace now makes a third problem impossible to miss. Every question takes over three minutes, and almost all of it is under `setup_pipeline`. The app re-reads, re-splits and re-embeds the same book for **every question**: slow, and you pay for the same embeddings over and over.
+
+Build the index once, save it, and reuse it. The only subtlety is knowing when a saved index is stale. Rebuild when anything that affects the vectors changes: the PDF's content, the chunking parameters or the embedding model. A fingerprint of those settings makes that check mechanical:
+
+```python
+import hashlib, json, os
+
+EMBED_MODEL = "openai:text-embedding-3-small"
+
+def fingerprint(pdf_path, chunk_size, chunk_overlap):
+    stat = os.stat(pdf_path)
+    key = {"path": os.path.abspath(pdf_path), "size": stat.st_size, "mtime": stat.st_mtime,
+           "chunk_size": chunk_size, "chunk_overlap": chunk_overlap, "model": EMBED_MODEL}
+    return hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()[:16]
+
+@traceable(name="load_or_build_index")
+def load_or_build_index(pdf_path, chunk_size=1000, chunk_overlap=150):
+    index_dir = os.path.join(".indices", fingerprint(pdf_path, chunk_size, chunk_overlap))
+    embeddings = init_embeddings(EMBED_MODEL)
+    if os.path.isdir(index_dir):
+        return FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
+    chunks = split_documents(load_pdf(pdf_path), chunk_size, chunk_overlap)
+    store = FAISS.from_documents(chunks, embeddings)
+    store.save_local(index_dir)
+    return store
+```
+
+`allow_dangerous_deserialization=True` is needed because FAISS's saved metadata is a pickle file. That's fine for files your own app wrote, but never load an index from an untrusted source.
+
+The first question still pays the full cost. Every later question loads the saved index, and the trace shows a short `load_or_build_index` run instead of a long build. Latency drops from minutes to a second or two. Change the PDF, the chunk size or the embedding model, and the fingerprint changes, so a fresh index is built automatically. This is how production RAG works anyway: indexing is an offline job, and queries only read the index.
+
+<LgTraceDiagnosis />
+
+## Tracing an agent
+
+Agents are where tracing goes from helpful to essential. An agent decides its own steps: which tool to call, with what input, and when it's done. The same question can take a different path each time.
+
+Here's a small agent with two tools: a web search and a weather lookup.
+
+```python
+import requests
+from langchain.agents import create_agent
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.tools import tool
+
+search = DuckDuckGoSearchRun()  # pip install ddgs
+
+@tool
+def get_weather(city: str) -> str:
+    """Get the current weather for a city."""
+    data = requests.get(f"https://wttr.in/{city}", params={"format": "j1"}, timeout=10).json()
+    now = data["current_condition"][0]
+    return f"{city}: {now['temp_C']}°C, {now['weatherDesc'][0]['value']}, humidity {now['humidity']}%"
+
+agent = create_agent(
+    "openai:gpt-4.1-mini",
+    tools=[search, get_weather],
+    system_prompt="Use the tools to answer accurately. Search before answering factual questions.",
+)
+
+result = agent.invoke(
+    {"messages": [{"role": "user", "content": "Find the birthplace of Kalpana Chawla, then give its current temperature."}]},
+    config={"run_name": "travel_agent", "tags": ["agent-demo"]},
+)
+print(result["messages"][-1].content)
+```
+
+`create_agent` builds a LangGraph graph that loops: call the model; if it asked for tools, run them and feed the results back; repeat until the model answers without a tool call. Older agents did the same thing with text. The model wrote "Thought: … Action: … Action Input: …" into a scratchpad that was parsed and appended to the next prompt. Modern models emit structured tool calls instead, but the reasoning loop is the same, and so is what the trace reveals:
+
+```text
+travel_agent
+├── model          → tool call: duckduckgo_search("Kalpana Chawla birthplace")
+├── tools
+│   └── duckduckgo_search   → "...born in Karnal, Haryana..."
+├── model          → tool call: get_weather("Karnal")
+├── tools
+│   └── get_weather         → "Karnal: 27°C, Haze, humidity 61%"
+└── model          → "Kalpana Chawla was born in Karnal; it's currently 27°C there."
+```
+
+Every decision is laid out: what the model asked for, the exact arguments, what each tool returned and how the next decision used it. Now think back to the expensive research agent. In a trace, the runaway loop is obvious at once. Instead of one search → read → write pass you'd see four, with token counts climbing on each model call. You can also read the model's justification for looping, which leads you straight to the "keep improving until excellent" sentence.
+
+Two practical notes. First, if an answer is wrong, the trace tells you whether the search returned junk (as with a name shared by many people) or the model misread good results. Second, the top of each trace shows total tokens and cost, so outliers stand out when you sort a project's traces by cost.
+
+## LangGraph and LangSmith
+
+LangGraph and LangSmith come from the same team and fit together naturally. The same environment variables turn on tracing, and the mapping is simple:
+
+- **One graph execution becomes one trace.** Each `invoke` or `stream` call is a trace.
+- **Each node execution becomes a run** inside it. Model calls, tools and anything else invoked inside the node appear as child runs.
+- **Structure is preserved.** Conditional routing shows which branch was taken. Parallel branches appear side by side with overlapping timings. Loops appear as repeated node runs. Subgraphs nest.
+
+That makes LangSmith a debugging tool **and** a learning tool: run a graph once and you see exactly the path it took, in order.
+
+### An essay grader traced end to end
+
+This graph grades an essay on three criteria in parallel, then combines them:
+
+```python
+import operator
+from typing import Annotated, TypedDict
+
+from langchain.chat_models import init_chat_model
+from langgraph.graph import END, START, StateGraph
+from pydantic import BaseModel, Field
+
+
+class Evaluation(BaseModel):
+    feedback: str = Field(description="Two or three sentences of feedback")
+    score: int = Field(ge=0, le=10, description="Score out of 10")
+
+
+llm = init_chat_model("openai:gpt-4.1-mini")
+grader = llm.with_structured_output(Evaluation)
+
+
+class EssayState(TypedDict):
+    essay: str
+    language_feedback: str
+    analysis_feedback: str
+    clarity_feedback: str
+    scores: Annotated[list[int], operator.add]  # three branches append safely
+    overall_feedback: str
+    average_score: float
+```
+
+```python
+def make_grader(aspect: str):
+    def grade(state: EssayState):
+        result = grader.invoke(f"Evaluate the {aspect} of this essay:\n\n{state['essay']}")
+        return {f"{aspect}_feedback": result.feedback, "scores": [result.score]}
+    return grade
+
+
+def final_evaluation(state: EssayState):
+    summary = llm.invoke(
+        "Write an overall summary from this feedback:\n"
+        f"Language: {state['language_feedback']}\nAnalysis: {state['analysis_feedback']}\n"
+        f"Clarity: {state['clarity_feedback']}"
+    ).content
+    return {"overall_feedback": summary, "average_score": sum(state["scores"]) / len(state["scores"])}
+
+
+builder = StateGraph(EssayState)
+for aspect in ("language", "analysis", "clarity"):
+    builder.add_node(f"evaluate_{aspect}", make_grader(aspect))
+    builder.add_edge(START, f"evaluate_{aspect}")
+    builder.add_edge(f"evaluate_{aspect}", "final_evaluation")
+builder.add_node("final_evaluation", final_evaluation)
+builder.add_edge("final_evaluation", END)
+graph = builder.compile()
+
+result = graph.invoke(
+    {"essay": "India's growing role in global AI..."},
+    config={"run_name": "evaluate_upsc_essay", "tags": ["essay-grader"], "metadata": {"exam": "UPSC"}},
+)
+```
+
+The trace shows `evaluate_upsc_essay` at the top, three `evaluate_*` runs starting together and overlapping in time, then `final_evaluation` once all three finish. Open an evaluate node and its input is the state it received, and its output is the partial update it returned. Inside you'll find the structured-output call: the model run, then a parsing step that turns the model's raw response into the `Evaluation` object. The final node uses the plain model, so it shows just the model call. Each node has its own latency and token count, so "which criterion is slowest or most expensive" is a glance, not a guess.
+
+If you want even finer detail, decorate helper functions called inside nodes with `@traceable`, and they'll nest under the node's run. It's optional; the node-level view is often enough.
+
+<Callout kind="remember">
+LangGraph mapping: graph execution → trace, node → run, and everything inside a node → child runs. Branches, parallel fan-out, loops and subgraphs are all captured.
+</Callout>
+
+## Beyond single traces
+
+So far LangSmith has been a microscope for one execution. Production asks broader questions: is the app healthy **overall**? Is the new version **better** than the old one? Which prompt wins? Do users like the answers? The practices that answer those questions are often grouped under the name **LLMOps**, and LangSmith supports each of them.
+
+## Monitoring and alerts
+
+**Monitoring** looks across many traces at once and aggregates them over time. Each project has a monitoring view with charts such as:
+
+- trace count over time (your usage curve)
+- latency (median and tail) for whole traces and for model calls
+- error rate
+- number of LLM calls, tokens in and out, and cost, in total and per trace
+- tool usage
+- feedback scores
+
+The distinction from observability:
+
+| | Observability | Monitoring |
+|---|---|---|
+| Looks at | One trace in depth | Many traces in aggregate |
+| Answers | "Why did **this** request go wrong?" | "Is the system healthy, and is anything drifting?" |
+| Typical trigger | A complaint or a bug report | A chart or an alert |
+
+Production problems usually show up first as **patterns across many runs**, not as one bad trace. One slow request might be a blip. Median latency creeping up 30% over a week is a signal. Monitoring lets you notice the trend before users complain.
+
+**Alerts** make that proactive. Define a rule on a metric in a project (for example, error rate above 5% over 15 minutes, latency above 5 seconds, or average feedback score below a threshold) and LangSmith notifies your team through a webhook or an incident tool such as PagerDuty. The workflow is: an alert fires, you open monitoring to see when the change started, filter traces to that window, and open a few traces to find the cause.
+
+You can also build **custom dashboards** that combine the charts you care about, grouped by metadata such as model or app version, and share them with your team.
+
+## Evaluation
+
+LLMs are sensitive to small changes. Edit one line of a prompt, swap the model, change the retriever's `k`, and some answers get better while others quietly get worse. "It looked fine on the three questions I tried" isn't evidence. **Evaluation** replaces vibes with measurement: run the system on a fixed set of inputs, score the outputs consistently, and compare versions on the same scores before you ship.
+
+The pieces:
+
+- A **dataset**: examples of inputs, usually with reference outputs (the expected answer, or facts the answer must contain).
+- A **target**: the thing under test, typically a function that takes an example's inputs and returns your app's output.
+- **Evaluators**: functions that score each output, such as exact match, "contains the key fact", length checks, or an **LLM-as-judge** that grades qualities like correctness, faithfulness to context or helpfulness.
+- An **experiment**: one run of a target over a dataset with evaluators. LangSmith stores each experiment and lets you compare experiments side by side, example by example.
+
+### Running an offline evaluation in code
+
+```python
+from langsmith import Client
+
+client = Client()  # uses LANGSMITH_API_KEY
+
+dataset = client.create_dataset(dataset_name="hr-policy-qa", description="Core HR questions")
+client.create_examples(
+    dataset_id=dataset.id,
+    examples=[
+        {"inputs": {"question": "How many days of annual leave do I get?"},
+         "outputs": {"answer": "18 days of paid annual leave per year"}},
+        {"inputs": {"question": "What is the notice period after confirmation?"},
+         "outputs": {"answer": "90 days"}},
+        {"inputs": {"question": "Is dental covered by health insurance?"},
+         "outputs": {"answer": "Dental is covered only for accidents"}},
+    ],
+)
+```
+
+The target wraps your app; the evaluators score each result. A simple code evaluator receives the example's inputs, your outputs and the reference outputs:
+
+```python
+def target(inputs: dict) -> dict:
+    return {"answer": answer_question("hr_handbook.pdf", inputs["question"])}
+
+
+def mentions_reference(inputs: dict, outputs: dict, reference_outputs: dict) -> bool:
+    key_fact = reference_outputs["answer"].split()[0]  # e.g. "18", "90", "Dental"
+    return key_fact.lower() in outputs["answer"].lower()
+
+
+def concise(outputs: dict) -> bool:
+    return len(outputs["answer"].split()) <= 80
+```
+
+An LLM-as-judge evaluator is just an evaluator that asks a model to grade. Structured output keeps the verdict machine-readable:
+
+```python
+from langchain.chat_models import init_chat_model
+from pydantic import BaseModel
+
+
+class Verdict(BaseModel):
+    correct: bool
+    reasoning: str
+
+
+judge = init_chat_model("openai:gpt-4.1", temperature=0).with_structured_output(Verdict)
+
+
+def correctness(inputs: dict, outputs: dict, reference_outputs: dict) -> dict:
+    v = judge.invoke(
+        "Is the ANSWER factually consistent with the REFERENCE for this QUESTION? "
+        "Ignore wording differences.\n"
+        f"QUESTION: {inputs['question']}\nANSWER: {outputs['answer']}\n"
+        f"REFERENCE: {reference_outputs['answer']}"
+    )
+    return {"key": "correctness", "score": v.correct, "comment": v.reasoning}
+```
+
+Run the experiment:
+
+```python
+results = client.evaluate(
+    target,
+    data="hr-policy-qa",
+    evaluators=[mentions_reference, concise, correctness],
+    experiment_prefix="k4-strict-prompt",
+    metadata={"retriever_k": 4, "prompt": "strict-v3"},
+    max_concurrency=4,
+)
+```
+
+In the UI, the dataset's **Experiments** tab now lists `k4-strict-prompt-…` with average scores per evaluator. Change something (say `k=1`, or a softer prompt), run again with a different prefix, and compare the two experiments: which examples flipped from pass to fail, and why, with a link to each example's full trace.
+
+### Offline and online evaluation
+
+- **Offline** evaluation runs on a curated dataset **before** release, like the code above. It's your regression test suite for quality.
+- **Online** evaluation scores **live production traces** as they arrive. In the UI you attach evaluators to a project (LLM-as-judge prompts, or prebuilt checks such as hallucination or conciseness), optionally on a sample of traffic. Their scores land on the traces as feedback, and you can chart and alert on them.
+
+Use both. Offline catches regressions before users see them; online catches problems your dataset didn't anticipate.
+
+<LgPromptExperiment />
+
+## Prompt experimentation and versioning
+
+Prompt wording can matter as much as the model. When you have two candidate prompts, running each once in a chat window proves nothing, for the same non-determinism reasons as before. **Prompt experimentation** means an A/B test: run both prompts over the same dataset, score both with the same evaluators, and keep the records.
+
+LangSmith's **Playground** supports this interactively. Open a prompt, pick a model, run it against a dataset, and use **Compare** to put prompts (or the same prompt on different models) side by side with evaluator scores. Results are stored as experiments, so months later you can still see which variants won and under what conditions.
+
+Prompts can also live in LangSmith as **versioned artifacts** instead of strings scattered through your code. Each save is a commit; teammates can edit and review them; your app pulls a specific version at runtime:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langsmith import Client
+
+client = Client()
+
+rag_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Answer ONLY from the context. If it isn't there, say you don't know."),
+    ("human", "Question: {question}\n\nContext:\n{context}"),
+])
+client.push_prompt("hr-rag-answer", object=rag_prompt)  # creates a new commit
+
+prompt = client.pull_prompt("hr-rag-answer")  # latest version, as a ChatPromptTemplate
+```
+
+Pinning a commit, or a tag such as `:prod`, means a prompt edit in the UI can't silently change production. You promote a version deliberately after it wins an experiment. Public prompts shared by others can be browsed in the LangChain Hub.
+
+## Datasets and annotation
+
+Good evaluation needs good datasets, and the best source of examples is your own traffic. LangSmith helps you build datasets as you go:
+
+- **From traces.** On any trace or run, **Add to dataset** saves its inputs and outputs as an example. You can correct the output first so it becomes the reference answer. A customer-support team might grow a "most common questions" dataset this way, week by week, and test every future version against it.
+- **From scratch or import.** Create an empty dataset and add rows, or upload existing input/output pairs.
+- **Versioning.** Datasets are versioned, so an experiment records exactly which version it ran against, and one dataset can serve every project in your workspace.
+- **Annotation queues.** Send traces to a queue where reviewers label them: correct or incorrect, scores against a rubric, notes. Human labels become reference data, ground truth to calibrate an LLM-as-judge, or training data for fine-tuning.
+
+## User feedback
+
+The thumbs up and down under a chatbot's answer are signal you shouldn't waste. LangSmith stores feedback **attached to the trace that produced the answer**, so a thumbs-down links straight to the exact prompt, context, model and state behind it.
+
+To attach feedback, you need the run's id. You can choose the id yourself when you invoke, then send feedback against it when the user clicks:
+
+```python
+import uuid
+from langsmith import Client
+
+client = Client()
+
+run_id = uuid.uuid4()
+answer = chain.invoke(question, config={"run_id": run_id})  # the trace's root run gets this id
+
+# ... later, when the user clicks a thumb in the UI:
+client.create_feedback(run_id=run_id, key="user_rating", score=1, comment="Exactly what I needed")
+```
+
+For a `@traceable` function, pass the id with `langsmith_extra={"run_id": run_id}` when you call it. Feedback appears on the trace's **Feedback** tab and in the monitoring charts, so you can watch satisfaction over time, filter for thumbs-down traces, and add the worst ones to a dataset to fix and test against.
+
+## Collaboration
+
+Before tools like this, debugging LLM apps as a team meant screenshots in email threads: "here's the weird output, here's the prompt, I think". LangSmith makes the artifact itself shareable:
+
+- **Trace links.** Copy a trace's link and a teammate opens exactly the same execution with every run, input and output.
+- **Shared prompts** with version history, edits and review, as above.
+- **Shared datasets, experiments and dashboards** across the workspace, with roles and permissions.
+
+When "the bot said something odd" arrives, the conversation starts from the same evidence instead of a description of it.
+
+## Production tips
+
+A few settings matter once real traffic flows:
+
+- **Sampling.** High-volume apps may not need every trace. `LANGSMITH_TRACING_SAMPLING_RATE=0.1` keeps about 10%.
+- **Sensitive data.** Traces contain user inputs and model outputs. `LANGSMITH_HIDE_INPUTS=true` and `LANGSMITH_HIDE_OUTPUTS=true` stop them being sent, and you can mask selectively in code.
+- **Conversation threads.** Add a `thread_id` (or `session_id`) key to each turn's metadata and LangSmith groups the turns of one conversation into a thread view. It pairs nicely with LangGraph's own `thread_id`.
+- **Short-lived processes.** Traces upload in a background thread. Scripts flush on exit, but in serverless functions call `Client().flush()` (or `wait_for_all_tracers()` from `langchain_core.tracers.langchain` for LangChain code) before returning, so traces aren't lost.
+
+## Cheat sheet
+
+- Observability means inspecting one execution step by step; LangSmith records it as a trace.
+- Project = one app's bucket, trace = one execution, run = one component's execution inside it.
+- Enable with `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY` and `LANGSMITH_PROJECT`; LangChain and LangGraph trace with no code changes.
+- Set the project before anything is traced; use `tracing_context(project_name=...)` to redirect at runtime.
+- Use `config={"run_name", "tags", "metadata"}` on `invoke` to label and make traces searchable.
+- `@traceable(name=..., run_type=..., tags=..., metadata=...)` traces any Python function; nested calls nest.
+- Wrap a whole request in one `@traceable` function so setup and query share one trace.
+- In RAG, read the retrieved chunks and final prompt to tell retriever errors from generator errors.
+- LangGraph: graph execution → trace, node → run; branches, loops and subgraphs are captured.
+- Monitoring aggregates many traces (latency, errors, tokens, cost, feedback); alerts fire on thresholds.
+- Evaluate with a dataset, a target and evaluators via `client.evaluate`, then compare experiments.
+- Version prompts with `push_prompt` and `pull_prompt`, and record user thumbs with `create_feedback(run_id=...)`.

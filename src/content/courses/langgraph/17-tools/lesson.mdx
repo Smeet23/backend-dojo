@@ -1,0 +1,384 @@
+import { LgToolLoopStepper } from "@/components/widgets/LgToolLoopStepper";
+
+## From talking to doing
+
+The chatbot so far can only talk. Its answers come from what the model learned during training, so it can't tell you today's headlines, it often fumbles exact arithmetic on big numbers, and it has no idea what a share of Apple costs right now. Ask it to *do* something and the best it can offer is a plausible-sounding paragraph.
+
+**Tools** fix that. A tool is a function your program owns, with a name, a description and typed arguments, that the model is allowed to ask for. Give the chatbot a calculator, a web search and a stock-price lookup, and it becomes something closer to an agent: for small talk it just answers, but when a question needs an action, it picks the right tool, your code runs it, and the model uses the result to write the reply.
+
+This lesson builds exactly that. First the fundamentals in a small standalone graph, then the same tools wired into the Streamlit chatbot with persistence and streaming.
+
+## How tool calling works
+
+The single most important fact about tool calling: **the model never runs anything.** It only produces text, and in tool-calling mode some of that output is a structured request.
+
+The flow looks like this:
+
+1. You describe your tools to the model: each tool's **name**, **description** and **argument schema** (JSON Schema, generated from the Python signature).
+2. You send the conversation. The model decides whether a tool would help.
+3. If yes, it returns an `AIMessage` whose `tool_calls` list holds one or more requests, each with a tool name, arguments and a unique `id`. Its text content is often empty.
+4. **Your code** runs the tool and wraps the result in a `ToolMessage` carrying the same `tool_call_id`.
+5. You send the conversation again, now including the tool call and its result. The model reads the result and either answers in plain text or asks for another tool.
+
+```python
+AIMessage(
+    content="",
+    tool_calls=[{"name": "get_stock_price", "args": {"symbol": "AAPL"}, "id": "call_abc123"}],
+)
+ToolMessage(content='{"symbol": "AAPL", "price": "229.10"}', tool_call_id="call_abc123")
+```
+
+Steps 2 to 5 are a **loop**, and loops are exactly what LangGraph is good at. The `tool_call_id` pairing matters: providers reject a conversation where a tool call has no matching result, which is why tool results travel as their own message type rather than as plain text.
+
+## Prebuilt and custom tools
+
+LangChain gives you two ways to get a tool.
+
+**Prebuilt tools** ship with LangChain integrations for common jobs: web search, Wikipedia, Python execution, SQL and so on. Web search is the classic one. DuckDuckGo's needs no API key, which makes it handy for learning:
+
+```bash
+pip install -U langgraph langchain langchain-openai langchain-community ddgs requests python-dotenv
+```
+
+```python
+from langchain_community.tools import DuckDuckGoSearchRun
+
+search_tool = DuckDuckGoSearchRun()
+print(search_tool.invoke("LangGraph 1.0 release"))  # a text blob of search snippets
+```
+
+**Custom tools** are your own functions turned into tools with the `@tool` decorator. The decorator reads the function name, the type hints and the **docstring**, and builds the schema the model sees:
+
+```python
+from langchain_core.tools import tool
+
+@tool
+def calculator(first_num: float, second_num: float, operation: str) -> dict:
+    """Perform a basic arithmetic operation on two numbers.
+    Supported operations: add, sub, mul, div."""
+    if operation == "add":
+        result = first_num + second_num
+    elif operation == "sub":
+        result = first_num - second_num
+    elif operation == "mul":
+        result = first_num * second_num
+    elif operation == "div":
+        if second_num == 0:
+            return {"error": "Division by zero is not allowed"}
+        result = first_num / second_num
+    else:
+        return {"error": f"Unsupported operation '{operation}'"}
+    return {"first_num": first_num, "second_num": second_num, "operation": operation, "result": result}
+```
+
+A stock-price tool that calls a real API (Alpha Vantage has a free tier; get your own key and keep it in `.env`):
+
+```python
+import os
+import requests
+
+@tool
+def get_stock_price(symbol: str) -> dict:
+    """Fetch the latest stock price for a ticker symbol such as 'AAPL' or 'TSLA'."""
+    url = "https://www.alphavantage.co/query"
+    params = {"function": "GLOBAL_QUOTE", "symbol": symbol, "apikey": os.environ["ALPHAVANTAGE_API_KEY"]}
+    return requests.get(url, params=params, timeout=10).json()
+```
+
+<Callout kind="tip">
+The docstring is not decoration: it **is** the tool's description, and the model chooses tools by reading it. "Fetch the latest stock price for a ticker symbol" tells the model when to use it and what argument shape to send. A vague docstring gives you a model that calls the wrong tool or invents arguments. Clear names and type hints help in the same way.
+</Callout>
+
+Tools return whatever is convenient (a dict, a string, a list). The tool runner converts the result to a `ToolMessage`, serialising non-strings, so the model sees it as text.
+
+### Designing good tools
+
+Because the model only ever sees a tool's schema and its results, a few design habits pay off quickly:
+
+- **One clear job per tool.** `get_stock_price(symbol)` is easy to choose correctly; a do-everything `finance(action, payload)` tool forces the model to guess an action vocabulary you never showed it.
+- **Arguments the model can fill from conversation.** Ask for a ticker or a city name, not an internal database id the user never mentions. If an argument has a fixed set of values, say so in the docstring (as the calculator does with `add, sub, mul, div`) or type it as a `Literal`.
+- **Return what the model needs, not everything you got.** The raw Alpha Vantage response is fine for learning, but trimming it to symbol, price and change saves input tokens on every later turn, since tool results stay in the message history.
+- **Return errors as data.** `{"error": "Division by zero is not allowed"}` lets the model read the problem and recover ("I can't divide by zero; did you mean...?"). An uncaught exception just kills the run.
+- **Be careful with side effects.** A lookup is harmless to repeat; "send email" or "buy shares" is not. The human-in-the-loop lesson shows how to pause for approval before such tools run.
+
+### Test tools on their own first
+
+A tool is a runnable, so you can call it directly before any model is involved:
+
+```python
+calculator.invoke({"first_num": 7, "second_num": 0, "operation": "div"})
+# {'error': 'Division by zero is not allowed'}
+
+print(calculator.name, calculator.args)
+# calculator {'first_num': {'title': 'First Num', 'type': 'number'}, ...}
+```
+
+Checking `name`, `description` and `args` shows you exactly what the model will see. If a tool misbehaves inside the agent, first confirm it works in isolation; then you know the problem is the model's choice or arguments, not your function.
+
+## Binding tools to the model
+
+Collect the tools in a list and **bind** them to the chat model:
+
+```python
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+
+load_dotenv()
+
+llm = init_chat_model("openai:gpt-4.1-mini")
+tools = [search_tool, calculator, get_stock_price]
+llm_with_tools = llm.bind_tools(tools)
+```
+
+`bind_tools` doesn't change `llm`. It returns a new runnable that sends the tool schemas along with every request. Use `llm_with_tools` wherever the model should be able to call tools. Calling it directly shows the decision without running anything:
+
+```python
+llm_with_tools.invoke("What is 654 times 713?").tool_calls
+# [{'name': 'calculator', 'args': {'first_num': 654, 'second_num': 713, 'operation': 'mul'}, 'id': 'call_...', 'type': 'tool_call'}]
+
+llm_with_tools.invoke("hi").tool_calls
+# []   -> plain chat, content holds the reply
+```
+
+By default the model is free to choose: answer directly, call one tool, or call several. `bind_tools` accepts a `tool_choice` argument when you need something stricter, for example `tool_choice="calculator"` to force a specific tool in a pipeline step where an answer without it would be wrong, or `"any"` to require *some* tool call. Use forcing sparingly inside a chat loop: a model forced to call a tool on every turn can never give its final answer, so the loop would never end. For a conversational agent, the default ("auto") is almost always right, and good descriptions do the steering.
+
+## The graph with ToolNode and tools_condition
+
+Start from the simplest chat graph: `START → chat_node → END`. Two things change.
+
+First, `chat_node` now uses the tool-bound model, so its output is **either** a normal answer **or** a tool request. The graph needs to branch on that.
+
+Second, something has to execute the requested tools. LangGraph ships two prebuilt pieces for this, in `langgraph.prebuilt`:
+
+| Piece | What it is | What it does |
+|---|---|---|
+| `ToolNode(tools)` | A ready-made **node** | Reads the last `AIMessage`, runs every tool call in it (in parallel when there are several), and returns one `ToolMessage` per call |
+| `tools_condition` | A ready-made **routing function** for a conditional edge | Returns `"tools"` if the last message has tool calls, otherwise `END` |
+
+You could think of `ToolNode` as the tool executor: the model says what to run with what arguments; `ToolNode` looks up the tool by name and runs it. `tools_condition` is the decision point: chat, or act?
+
+```python
+from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage, HumanMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+
+class ChatState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+def chat_node(state: ChatState):
+    response = llm_with_tools.invoke(state["messages"])
+    return {"messages": [response]}
+
+builder = StateGraph(ChatState)
+builder.add_node("chat_node", chat_node)
+builder.add_node("tools", ToolNode(tools))   # the name must be "tools" for tools_condition
+
+builder.add_edge(START, "chat_node")
+builder.add_conditional_edges("chat_node", tools_condition)
+graph = builder.compile()
+```
+
+`tools_condition` returns the literal string `"tools"`, so the tool node must be registered under that name (or you pass a mapping like `{"tools": "my_tools", END: END}` as the third argument).
+
+Try it:
+
+```python
+graph.invoke({"messages": [HumanMessage("hi")]})["messages"][-1].content
+# 'Hello! How can I help you today?'
+
+graph.invoke({"messages": [HumanMessage("What is 2 times 3?")]})["messages"][-1].content
+# '{"first_num": 2.0, "second_num": 3.0, "operation": "mul", "result": 6.0}'
+```
+
+The chat path works. The tool path *runs* the tool, but look at what the user would see.
+
+## Why the first version is broken
+
+The graph above goes `chat_node → tools → END`. Two problems follow from that shape.
+
+**Problem 1: raw output reaches the user.** The last message in state is the `ToolMessage`, so the "answer" is a JSON dict. For the stock tool it's a wall of API fields. Nobody wants that in a chat window; a model should turn it into "Apple is trading at $229.10."
+
+**Problem 2: no multi-step reasoning.** Ask "What's Apple's stock price, and how much would 15 shares cost?" The model needs the price *before* it can multiply. It requests `get_stock_price`, the tool runs, and the graph ends. The model never sees the price, so the multiplication never happens. (Some models, sensing they get one shot, even guess a number and call the calculator at the same time, giving a confidently wrong total.)
+
+Both problems have the same cause: the tool's result never goes back to the model.
+
+## Closing the loop
+
+The fix is one edge:
+
+```python
+builder = StateGraph(ChatState)
+builder.add_node("chat_node", chat_node)
+builder.add_node("tools", ToolNode(tools))
+
+builder.add_edge(START, "chat_node")
+builder.add_conditional_edges("chat_node", tools_condition)  # tools or END
+builder.add_edge("tools", "chat_node")                       # results always go back to the model
+graph = builder.compile()
+```
+
+Now the graph is a **loop**: the model can call tools as many times as it needs, and the only way out is through `chat_node` choosing to answer in plain text. The two-step question now plays out like this:
+
+1. `chat_node`: the model sees the question and requests `get_stock_price(symbol="AAPL")`. `tools_condition` routes to `tools`.
+2. `tools`: runs the API call, appends a `ToolMessage` with the quote.
+3. `chat_node` again: the model sees the question, its own earlier request and the price. It requests `calculator(229.10, 15, "mul")`. Route to `tools`.
+4. `tools`: appends `{"result": 3436.5}`.
+5. `chat_node`: everything needed is in the history, so it replies "Apple is at $229.10; 15 shares would cost about $3,436.50." No tool calls, so `tools_condition` returns `END`.
+
+This "reason, act, observe, repeat" loop is the **ReAct** pattern, and the model plus `ToolNode` plus `tools_condition` plus the back edge is the canonical way to build it in LangGraph. Step through it below, with and without the back edge.
+
+<LgToolLoopStepper />
+
+<Callout kind="remember">
+The back edge `tools → chat_node` is what makes this an agent. Without it you have a one-shot tool runner that dumps raw output; with it, the model can chain tools and always gets the last word.
+</Callout>
+
+### Parallel tool calls
+
+`tool_calls` is a list for a reason. Ask "What are Apple's and Tesla's stock prices?" and a capable model requests both lookups **in the same message**, because neither depends on the other. `ToolNode` runs every call in that message (concurrently), appends one `ToolMessage` per call, each tied to its call by `tool_call_id`, and the model then answers with both results in one go. That's one round trip instead of two.
+
+Compare that with the Apple-plus-15-shares question, where the second call needs the first call's output. Dependent calls must happen in separate rounds of the loop; independent ones can share a round. The model works this out itself; your graph only needs to support both, and the loop with `ToolNode` does.
+
+### Keeping the loop bounded
+
+A loop needs a stop condition. Here it's the model deciding to stop, which usually happens, but a confused model can keep calling tools. LangGraph protects you with a **recursion limit**: each node execution is a step, and the run raises `GraphRecursionError` once the limit is hit (the default is generous). Set your own per call:
+
+```python
+graph.invoke({"messages": [HumanMessage("...")]}, config={"recursion_limit": 10})
+```
+
+## What ToolNode does for you
+
+`ToolNode` is convenient, but it's worth knowing there's no magic. A simplified version:
+
+```python
+from langchain_core.messages import ToolMessage
+
+tools_by_name = {t.name: t for t in tools}
+
+def run_tools(state: ChatState):
+    last = state["messages"][-1]
+    results = []
+    for call in last.tool_calls:
+        tool = tools_by_name[call["name"]]
+        output = tool.invoke(call["args"])
+        results.append(ToolMessage(content=str(output), tool_call_id=call["id"], name=call["name"]))
+    return {"messages": results}
+```
+
+The real `ToolNode` adds the details you'd otherwise write yourself: it runs multiple calls concurrently, supports async tools, serialises outputs, and can catch tool errors and return them to the model as a `ToolMessage` (configurable with `handle_tool_errors`) so the model can retry with better arguments instead of crashing the run.
+
+And `tools_condition` is just:
+
+```python
+def route(state: ChatState):
+    last = state["messages"][-1]
+    return "tools" if getattr(last, "tool_calls", None) else END
+```
+
+Write your own versions when you need custom behaviour, for example a tool node that refuses certain calls, or a router that sends different tools to different nodes.
+
+## Reading a tool call in LangSmith
+
+With the tracing variables from the previous lesson in `.env`, every run shows up in LangSmith. A stock-price question produces a trace with three node runs in sequence:
+
+1. **chat_node**: the model's input is the human message, plus the three tool schemas (LangSmith lists the tools available to that call). Its output is an `AIMessage` with a `get_stock_price` call and `{"symbol": "AAPL"}`. The `tools_condition` step under it shows the route it picked: `tools`.
+2. **tools**: the `get_stock_price` run with its input and the raw API response.
+3. **chat_node** again: its input now contains the question, the tool request and the tool result. Its output is the final text, and the routing step shows `__end__`.
+
+When an agent misbehaves, this view tells you which kind of problem you have: wrong tool chosen (fix the docstrings), right tool with bad arguments (fix the schema or description), or good tool output that the model misread (fix the prompt).
+
+## Adding tools to the chatbot
+
+The production chatbot keeps everything from earlier lessons: message state, SQLite checkpointer, threads. The backend change is the graph you just built, plus the checkpointer:
+
+```python
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+conn = sqlite3.connect("chatbot.db", check_same_thread=False)
+checkpointer = SqliteSaver(conn)
+
+builder = StateGraph(ChatState)
+builder.add_node("chat_node", chat_node)
+builder.add_node("tools", ToolNode(tools))
+builder.add_edge(START, "chat_node")
+builder.add_conditional_edges("chat_node", tools_condition)
+builder.add_edge("tools", "chat_node")
+
+chatbot = builder.compile(checkpointer=checkpointer)
+```
+
+Tool calls and tool results are now part of each thread's saved history, which is what you want: on the next turn, the model can see that it already looked up a price.
+
+### Stream only the model's words
+
+The frontend streamed every message chunk with `stream_mode="messages"`. With tools in the graph, that stream also carries `ToolMessage`s, so raw JSON would flash up in the chat bubble before the real answer. Filter by type and only stream the AI's text:
+
+```python
+from langchain_core.messages import AIMessageChunk, HumanMessage
+
+def ai_text_only():
+    for chunk, metadata in chatbot.stream(
+        {"messages": [HumanMessage(content=user_input)]},
+        config=CONFIG,
+        stream_mode="messages",
+    ):
+        if isinstance(chunk, AIMessageChunk) and isinstance(chunk.content, str) and chunk.content:
+            yield chunk.content
+
+with st.chat_message("assistant"):
+    reply = st.write_stream(ai_text_only())
+```
+
+The `content` check also skips the empty chunks the model emits while it's building a tool call.
+
+### Show which tool is running
+
+Tool calls take time (a web search can take seconds), and a silent pause feels broken. Streamlit's `st.status` container can show "Using get_stock_price..." while it happens. The first chunk of a tool request carries the tool's name in `tool_call_chunks`, so you can open the status box the moment the model decides:
+
+```python
+with st.chat_message("assistant"):
+    status = {"box": None}
+
+    def ai_text_only():
+        for chunk, metadata in chatbot.stream(
+            {"messages": [HumanMessage(content=user_input)]}, config=CONFIG, stream_mode="messages"
+        ):
+            if not isinstance(chunk, AIMessageChunk):
+                continue  # skip ToolMessages
+            for tc in chunk.tool_call_chunks:
+                if tc.get("name"):
+                    label = f"Using {tc['name']}..."
+                    if status["box"] is None:
+                        status["box"] = st.status(label, expanded=True)
+                    else:
+                        status["box"].update(label=label)
+            if isinstance(chunk.content, str) and chunk.content:
+                yield chunk.content
+
+    reply = st.write_stream(ai_text_only())
+    if status["box"] is not None:
+        status["box"].update(label="Tool finished", state="complete", expanded=False)
+```
+
+That's the whole upgrade: the user can chat normally, or ask for a search, a calculation or a quote, and see which tool the bot reached for.
+
+<Callout kind="tip">
+Start with a few tools that have clearly different jobs. As the list grows, overlapping descriptions ("search the web" vs "look up news") make tool choice less reliable, and every schema costs input tokens on every call.
+</Callout>
+
+## Cheat sheet
+
+- The model never runs tools: it returns an `AIMessage` with `tool_calls`; your code runs them and returns `ToolMessage`s with matching `tool_call_id`s.
+- Prebuilt tools (e.g. `DuckDuckGoSearchRun`) come from integrations; custom tools use `@tool`, whose name, type hints and docstring become the schema.
+- `llm.bind_tools(tools)` returns a new model that sends the tool schemas with every call.
+- `ToolNode(tools)` executes the tool calls in the last AI message; register it as `"tools"`.
+- `tools_condition` routes to `"tools"` when there are tool calls, else to `END`.
+- Always add `builder.add_edge("tools", "chat_node")`: without it users see raw tool output and multi-step tasks fail.
+- The loop ends when the model answers without tool calls; `recursion_limit` is the safety net.
+- With `stream_mode="messages"`, stream only `AIMessageChunk` text so tool JSON never reaches the UI.
+- Tool names in `tool_call_chunks` let the UI show which tool is running.
+- LangSmith traces show each chat, route and tool step, so you can tell bad tool choice from bad arguments.

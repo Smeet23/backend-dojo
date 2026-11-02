@@ -1,0 +1,371 @@
+import { LgMcpUpgradeSim } from "@/components/widgets/LgMcpUpgradeSim";
+
+## Where hand-written tools start to hurt
+
+The chatbot now has three tools: web search (a prebuilt LangChain tool), a calculator and a stock-price lookup (both custom). Suppose your company now wants the same bot to answer questions about its GitHub repositories, for the developers on the team.
+
+LangChain has no ready-made tool for "list the open pull requests in our repo", so you write one:
+
+```python
+@tool
+def list_pull_requests(owner: str, repo: str, state: str = "open", limit: int = 5) -> str:
+    """List pull requests in a GitHub repository. state is 'open' or 'closed'."""
+    resp = requests.get(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                 "Accept": "application/vnd.github+json"},
+        params={"state": state, "per_page": limit},
+        timeout=10,
+    )
+    return "\n".join(f"#{p['number']} {p['title']} by {p['user']['login']}" for p in resp.json())
+```
+
+It works. That's one tool for one operation. Commits need another tool, issues another, file contents another. A useful GitHub integration might be ten such functions.
+
+## The maintenance problem
+
+The code above hard-codes facts that belong to GitHub, not to you: the URL path, the auth header, the response field names (`number`, `title`, `user.login`). That makes it **brittle**. If GitHub ships a new API version that renames a path or a field, your bot starts failing the moment someone asks about pull requests, and you have to read GitHub's changelog and patch your code.
+
+Patching one function is fine. Now scale it:
+
+- A real integration is around 10 tools per service.
+- Your company may have several assistants (one for developers, one for support, one for sales), each with its own copy of those tools.
+- And GitHub is one service. Next come Slack, Gmail, Jira, the internal database...
+
+With **M** applications and **N** services, you own roughly **M × N** integrations, all coupled to APIs you don't control. Every upstream change ripples into every app. The core flaw is that the **tool implementation lives on the client side**, inside each app, even though the knowledge it encodes belongs to the service.
+
+## What MCP changes
+
+The **Model Context Protocol (MCP)** is an open standard for connecting AI applications to tools and data. It doesn't add a new capability (tools are still tools); it moves where they live and standardises how they're reached.
+
+MCP splits the world into two roles:
+
+| Role | Who builds it | What it holds |
+|---|---|---|
+| **MCP server** | The service owner (GitHub, a SaaS vendor, your platform team) | The tool implementations, their names, descriptions and argument schemas |
+| **MCP client** | You, inside your app (the chatbot) | Only **connection config**: where the server is and how to talk to it |
+
+When the client connects, it asks the server which tools it offers, and the server answers with the full list, descriptions and schemas included. The client converts them into ordinary tools for the model. So:
+
+- GitHub changes its REST API? The GitHub MCP server's maintainers update the server. Your client config, a URL or a command, doesn't change.
+- The server adds a new tool? Your app sees it the next time it lists tools, with no code change.
+- Ten apps want GitHub? They all point at the same server. M × N integrations become M clients plus N servers.
+
+That separation of concerns is MCP's main selling point, and the reason it became an industry standard that major chat apps and IDEs now support. Servers can also expose **resources** (readable data) and **prompts** (templates), but tools are what an agent uses most, and they're the focus here.
+
+<LgMcpUpgradeSim />
+
+### Client, not server
+
+Building an MCP integration has two halves: the server and the client. This lesson builds the **client** inside LangGraph. Servers are written with an MCP server library such as **FastMCP**, not with LangGraph. For the examples you need a server to talk to, so here is a tiny one, saved as `math_server.py`:
+
+```python
+# math_server.py  (pip install fastmcp)
+from fastmcp import FastMCP
+
+mcp = FastMCP("math")
+
+@mcp.tool
+def add(a: float, b: float) -> float:
+    """Add two numbers."""
+    return a + b
+
+@mcp.tool
+def multiply(a: float, b: float) -> float:
+    """Multiply two numbers."""
+    return a * b
+
+@mcp.tool
+def modulus(a: float, b: float) -> float:
+    """Remainder of a divided by b."""
+    return a % b
+
+if __name__ == "__main__":
+    mcp.run()  # stdio transport by default
+```
+
+Notice it's ordinary decorated functions with docstrings, very much like `@tool`. The difference is *where* this code runs: in its own process, owned by whoever maintains the server.
+
+### What happens on the wire
+
+MCP messages are JSON-RPC: small JSON requests and responses with a method name, parameters and an id. A client session goes through three phases:
+
+1. **Initialise.** The client connects and the two sides exchange protocol versions and capabilities ("I support tools and resources").
+2. **Discover.** The client sends `tools/list`. The server replies with each tool's `name`, `description` and `inputSchema` (JSON Schema). This is the same information `@tool` builds from a docstring and type hints, which is why an MCP tool can become a LangChain tool without any glue code from you.
+3. **Call.** When the model requests a tool, the client sends `tools/call` with the tool name and arguments. The server runs its function and returns the result content, or an error flag the model can read.
+
+Two consequences matter in practice. First, discovery happens **at runtime**, so a client always sees the server's current tool list; nothing is baked into your code. Second, the protocol is the same whatever the transport, so moving a server from your laptop (stdio) to a hosted service (HTTP) changes only the connection config, never the tools.
+
+## Step one is async
+
+The client library used here, `langchain-mcp-adapters`, is **async-only**: connecting to servers, listing tools and calling tools are all coroutines. So before adding MCP, convert the chatbot from synchronous to asynchronous code. LangGraph supports both styles with the same graph API.
+
+### Why async at all
+
+Async lets one Python process wait on many slow things at once. Suppose a user asks for the weather at a stadium and the live cricket score. Both are network calls. Synchronously, the weather call runs, everything waits, then the score call runs. Asynchronously, both requests go out together and the total time is roughly the slower of the two. When the model requests several tools in one turn, an async `ToolNode` runs them concurrently. MCP is network and process I/O through and through, so its client is built async from the ground up.
+
+### Converting the graph
+
+Start from the sync calculator chatbot from the tools lesson. Three kinds of change:
+
+1. **Your own nodes** become `async def` and `await` the model with `ainvoke`.
+2. **`ToolNode` doesn't change.** It already supports async execution, and when the graph runs async it awaits async tools.
+3. **The entry point** calls `await graph.ainvoke(...)` (or `astream`) inside an `async def main()`, started with `asyncio.run`.
+
+```python
+import asyncio
+from typing import Annotated, TypedDict
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AnyMessage, HumanMessage
+from langgraph.graph import StateGraph, START
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+
+load_dotenv()
+llm = init_chat_model("openai:gpt-4.1-mini")
+
+class ChatState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+def build_graph(tools, checkpointer=None):
+    llm_with_tools = llm.bind_tools(tools)
+
+    async def chat_node(state: ChatState):
+        response = await llm_with_tools.ainvoke(state["messages"])
+        return {"messages": [response]}
+
+    builder = StateGraph(ChatState)
+    builder.add_node("chat_node", chat_node)
+    builder.add_node("tools", ToolNode(tools))
+    builder.add_edge(START, "chat_node")
+    builder.add_conditional_edges("chat_node", tools_condition)
+    builder.add_edge("tools", "chat_node")
+    return builder.compile(checkpointer=checkpointer)
+```
+
+Graph construction moved into a `build_graph(tools)` function. That looks unnecessary right now, but it's deliberate: in a moment the tool list will come from an async call, so the graph can only be built after that call finishes.
+
+```python
+async def main():
+    chatbot = build_graph([calculator])  # still the local @tool for now
+    result = await chatbot.ainvoke(
+        {"messages": [HumanMessage("Find 2341 modulo 97 and announce it like a cricket commentator.")]}
+    )
+    print(result["messages"][-1].content)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run it and you get the same answer as before. Nothing about the graph's behaviour changed; only how it waits.
+
+<Callout kind="warn">
+Mixing styles is the classic async bug. Calling `chatbot.invoke(...)` on a graph whose tools are async-only fails, and calling `ainvoke` without `await` just gives you a coroutine object. Inside async code: `async def` nodes, `await ...ainvoke`, `await graph.ainvoke`.
+</Callout>
+
+## Connecting to a local server over stdio
+
+Install the adapter library:
+
+```bash
+pip install -U langchain-mcp-adapters fastmcp
+```
+
+Now delete the local `calculator` tool and replace it with an MCP client. `MultiServerMCPClient` takes a dict of named servers; each entry says how to reach one server:
+
+```python
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+client = MultiServerMCPClient(
+    {
+        "math": {
+            "transport": "stdio",
+            "command": "python",
+            "args": ["/absolute/path/to/math_server.py"],
+        },
+    }
+)
+
+async def main():
+    tools = await client.get_tools()          # discovered from the server
+    print([t.name for t in tools])            # ['add', 'multiply', 'modulus']
+    chatbot = build_graph(tools)
+    result = await chatbot.ainvoke(
+        {"messages": [HumanMessage("Find 2341 modulo 97 and announce it like a cricket commentator.")]}
+    )
+    print(result["messages"][-1].content)
+```
+
+What happens:
+
+1. `stdio` means the server is a **local program**. The client starts it as a subprocess with `command` and `args`, and the two talk over the process's standard input and output.
+2. `get_tools()` performs the MCP handshake, asks for the tool list, and converts every MCP tool into a LangChain tool with the server's name, description and schema.
+3. From there it's the same graph as before: bind the tools to the model, give them to `ToolNode`. The model can't tell an MCP tool from a local one.
+
+That's the "config code" promise in practice. The chatbot contains no arithmetic. If the server's author changes how `modulus` works, or adds a `power` tool, this file stays exactly as it is.
+
+<Callout kind="tip">
+Use an absolute path in `args`, because the subprocess is started from wherever your app runs. If the server needs its own virtual environment, point `command` at that environment's Python (or at a launcher such as `uv` with suitable args).
+</Callout>
+
+## Adding a remote server over HTTP
+
+Most useful servers aren't on your laptop: they're deployed services. Remote servers use the **streamable HTTP** transport. Adding one is another entry in the same dict, here an expense-tracker server with `add_expense`, `list_expenses` and `summarize` tools:
+
+```python
+client = MultiServerMCPClient(
+    {
+        "math": {
+            "transport": "stdio",
+            "command": "python",
+            "args": ["/absolute/path/to/math_server.py"],
+        },
+        "expenses": {
+            "transport": "streamable_http",       # recent versions also accept "http"
+            "url": "https://expense-tracker.example.com/mcp",
+            "headers": {"Authorization": f"Bearer {os.environ['EXPENSES_TOKEN']}"},
+        },
+    }
+)
+```
+
+`get_tools()` now returns the math tools **and** the expense tools, merged into one list. Ask "Add an expense of 500 for an online course on 10 November" and the model calls `add_expense` with a date, amount and category it inferred; ask "List my expenses for November" and it calls `list_expenses` with a date range. The chatbot gained an entire expense-tracking feature without a line of expense code.
+
+| | stdio | Streamable HTTP |
+|---|---|---|
+| Where the server runs | A local subprocess the client starts | A separate service at a URL |
+| Config keys | `command`, `args` (optionally `env`) | `url` (optionally `headers` for auth) |
+| Typical use | Local tools, dev machines, desktop apps | Shared and hosted servers, company-wide integrations |
+| Who keeps it running | The client, per connection | The server's operator |
+
+### Sessions and the cost of stdio
+
+By default, `MultiServerMCPClient` is **stateless**: each tool call opens a fresh MCP session, runs the tool and closes the session. For HTTP that's a short request. For stdio it means **starting the server process again on every call**, which is fine for a toy math server but slow for a heavy one, and it loses any state the server keeps between calls.
+
+When you need one long-lived connection, open a session explicitly and load tools from it:
+
+```python
+from langchain_mcp_adapters.tools import load_mcp_tools
+
+async def main():
+    async with client.session("math") as session:
+        tools = await load_mcp_tools(session)
+        chatbot = build_graph(tools)
+        await chatbot.ainvoke({"messages": [HumanMessage("What is 7 modulo 3?")]})
+    # the session (and the subprocess) close here
+```
+
+## Mixing local tools and MCP tools
+
+It isn't either-or. MCP tools and `@tool` functions are the same kind of object once loaded, so combine them in one list:
+
+```python
+async def main():
+    mcp_tools = await client.get_tools()
+    tools = [search_tool, get_stock_price, *mcp_tools]   # local + remote
+    chatbot = build_graph(tools)
+```
+
+A sensible rule of thumb: keep a local tool when it's tiny, specific to this app and unlikely to be reused; prefer an MCP server when the integration wraps someone else's API, is shared by several apps, or is maintained by another team. As more services publish official MCP servers, the local list tends to shrink.
+
+<Callout kind="warn">
+An MCP server is code you didn't write. A stdio server runs on your machine with your permissions; a remote server sees whatever arguments the model sends it. Use servers from sources you trust, give them the narrowest credentials that work, and treat their tool descriptions as untrusted input to your model.
+</Callout>
+
+## Debugging MCP connections
+
+When an MCP setup fails, it usually fails at startup, in one of a few predictable ways:
+
+| Symptom | Likely cause | What to check |
+|---|---|---|
+| `get_tools()` hangs or the stdio server exits immediately | The command can't start the server: wrong interpreter, relative path, missing package in that environment | Run the exact `command` and `args` yourself in a terminal |
+| A stdio server works alone but breaks under the client | The server prints logs to **stdout**, corrupting the protocol stream | Log to stderr; stdout belongs to MCP messages |
+| HTTP connection refused or 404 | Wrong URL or path (many servers serve at `/mcp`), or the server isn't running | Open the URL, check the server's docs for the endpoint path |
+| 401 or 403 from a remote server | Missing or wrong credentials | The `headers` entry and the token's scopes |
+| Tools load but the model never picks them | Vague tool descriptions on the server | Print `[(t.name, t.description) for t in tools]` and read what the model sees |
+| Model calls a tool and gets an error back | Arguments don't match the server's schema | The tool's `args` schema and the LangSmith trace of the call |
+
+Printing the discovered tools right after `get_tools()` is the single most useful check: it proves the connection works and shows you exactly what descriptions the model will be choosing from. With LangSmith enabled, MCP tool calls appear in traces like any other tool run, arguments and results included.
+
+## The chatbot with MCP
+
+Bringing MCP into the Streamlit chatbot touches four components, and they don't all agree on sync versus async:
+
+| Component | Sync or async |
+|---|---|
+| MCP client | Async only |
+| LangGraph | Either |
+| SQLite checkpointer | Has an async variant |
+| Streamlit | Fundamentally synchronous |
+
+The backend changes are straightforward:
+
+- Nodes are `async`, the graph is built after `await client.get_tools()`, and local tools are merged with MCP tools as shown above.
+- The checkpointer switches to the async SQLite saver, which uses `aiosqlite` under the hood:
+
+```bash
+pip install -U langgraph-checkpoint-sqlite aiosqlite
+```
+
+```python
+import aiosqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+async def make_chatbot():
+    tools = [search_tool, get_stock_price, *await client.get_tools()]
+    conn = await aiosqlite.connect("chatbot.db")   # stays open for the app's lifetime
+    checkpointer = AsyncSqliteSaver(conn)
+    return build_graph(tools, checkpointer=checkpointer)
+```
+
+- The frontend iterates `chatbot.astream(..., stream_mode="messages")` instead of `stream`, and helpers like listing threads use `await checkpointer.alist(None)`.
+
+The awkward part is Streamlit. It reruns your script synchronously on every interaction, and it doesn't own a long-lived event loop, so you can't simply `await` the graph in the UI code. The usual workaround is to run one asyncio loop in a background thread for the app's lifetime and submit coroutines to it:
+
+```python
+import asyncio
+import threading
+
+_loop = asyncio.new_event_loop()
+threading.Thread(target=_loop.run_forever, daemon=True).start()
+
+def run_async(coro):
+    """Run a coroutine on the background loop and wait for its result."""
+    return asyncio.run_coroutine_threadsafe(coro, _loop).result()
+
+chatbot = run_async(make_chatbot())   # build once, reuse across reruns (cache it)
+```
+
+Streaming tokens back means pumping the async stream through a queue into a sync generator for `st.write_stream`. It works, but it's glue code fighting the framework. For production, a cleaner architecture is an async API server (for example FastAPI with server-sent events) running the graph, and a separate web frontend consuming the stream. Streamlit is fine for a prototype; it's the wrong place to host an async agent long-term.
+
+## A note on the newer MCP API
+
+MCP support is moving fast. Recent LangChain releases ship a built-in `langchain.mcp` module (in beta, `langchain[mcp]` 1.4 or later) whose `MCPAdapter` replaces `MultiServerMCPClient`. The ideas are identical: config in, LangChain tools out. The config uses the common `mcpServers` shape and infers the transport from each entry:
+
+```python
+from langchain.mcp import MCPAdapter
+
+config = {"mcpServers": {
+    "math": {"command": "python", "args": ["/absolute/path/to/math_server.py"]},
+    "expenses": {"url": "https://expense-tracker.example.com/mcp"},
+}}
+
+async with MCPAdapter(config) as adapter:
+    tools = await adapter.list_tools()
+```
+
+If you're starting fresh on a current LangChain, check which of the two your version recommends. Everything else in this lesson (async graphs, binding, `ToolNode`, mixing tools) applies unchanged.
+
+## Cheat sheet
+
+- Hand-written API tools are brittle: upstream API changes break every app that copied the integration (an M × N maintenance problem).
+- MCP separates roles: the **server** owns tool code and schemas; the **client** holds only connection config and discovers tools at runtime.
+- Servers are built with a server library such as FastMCP; LangGraph apps act as **clients**.
+- `langchain-mcp-adapters` is async-only: make nodes `async def`, use `await llm.ainvoke`, run with `await graph.ainvoke` / `astream` under `asyncio.run`.
+- `ToolNode` already handles async tools; only your custom nodes need converting.
+- `MultiServerMCPClient({...})` + `await client.get_tools()` returns LangChain tools from every configured server.
+- `stdio` = local subprocess (`command`, `args`); `streamable_http` = remote URL (`url`, optional `headers`).
+- Calls are stateless by default (stdio respawns per call); use `client.session(name)` with `load_mcp_tools` for a persistent connection.
+- MCP tools and `@tool` functions mix freely in one list.
+- With MCP in the chatbot, use `AsyncSqliteSaver`; Streamlit needs a background event loop, and an async API server is the production-grade choice.

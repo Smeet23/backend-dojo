@@ -1,0 +1,518 @@
+import { LgChainVsGraph } from "@/components/widgets/LgChainVsGraph";
+import { LgFrameworkPicker } from "@/components/widgets/LgFrameworkPicker";
+
+## Why use a framework
+
+You now know what an agentic system is: a brain, an orchestrator, tools, memory and a supervisor. You could write all of that in plain Python. People do, once. Then they discover they've built half a workflow engine: loops, branching, a state dictionary, retry logic, a way to pause for a human and pick up again days later, persistence so a crash doesn't lose everything, and logging to work out what went wrong.
+
+That's why agent frameworks exist. CrewAI, Microsoft's AutoGen, the OpenAI Agents SDK and **LangGraph** all give you the orchestration layer so you can focus on the logic. This course uses LangGraph, built by the LangChain team. It's one of the most widely used options, it's low-level enough that you understand exactly what runs, and it plugs straight into LangChain's ecosystem of models, tools and retrievers.
+
+This lesson answers one question in depth: **what can't LangChain do comfortably that made LangGraph necessary?** We'll take one realistic workflow, try to build it with LangChain chains, list every problem we hit, and see how LangGraph handles each. By the end you'll be able to look at a project's requirements and tell which tool it needs.
+
+## LangChain in one page
+
+**LangChain** is an open-source library for building **LLM-based applications**: chatbots, summarisers, document Q&A, assistants inside existing products. Such apps involve gluing together several moving parts, and LangChain gives you standard, swappable building blocks for them.
+
+### The building blocks
+
+| Block | What it gives you |
+|---|---|
+| **Chat models** | One interface for many providers (OpenAI, Anthropic, Google, open models via Ollama or Hugging Face). Swap the model without rewriting your app. |
+| **Prompts** | Templates with variables, for engineering prompts cleanly and reusing them. |
+| **Retrievers** | Fetch the most relevant documents from a vector store or other knowledge base, with several search strategies. |
+| **Tools** | Wrap a Python function or API so a model can decide to call it, with what arguments. |
+| **Output parsers** | Turn raw model output into a string, JSON or a typed object. |
+| **Document loaders, text splitters** | Get PDFs, web pages and files in, chopped into chunks for retrieval. |
+
+### Chains
+
+LangChain's signature idea is the **chain**: connect components so that each one's output automatically becomes the next one's input. With the LangChain Expression Language (LCEL), you compose them with the pipe operator:
+
+```python
+from langchain.chat_models import init_chat_model
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+llm = init_chat_model("openai:gpt-4.1-mini")      # reads OPENAI_API_KEY from the environment
+
+report_prompt = ChatPromptTemplate.from_template("Write a detailed report on {topic}.")
+summary_prompt = ChatPromptTemplate.from_template("Summarise this report in 5 bullets:\n\n{report}")
+
+report_chain = report_prompt | llm | StrOutputParser()
+pipeline = {"report": report_chain} | summary_prompt | llm | StrOutputParser()
+
+print(pipeline.invoke({"topic": "vector databases"}))
+```
+
+Data flows left to right: topic, prompt, model, text, a second prompt, a second model call, a summary. You never wire outputs to inputs by hand.
+
+### What chains are good at
+
+With those blocks and chains, LangChain handles a wide range of apps comfortably:
+
+- **Simple conversational flows**: a chatbot or summariser. Prompt in, model, answer out, perhaps in a loop for a chat.
+- **Fixed multi-step pipelines**: the report-then-summary pipeline above.
+- **Basic RAG**: question, retriever, relevant chunks, prompt with context, model, answer. For example, "what's our notice period?" answered from the company's HR documents.
+- **Simple tool use**: give the model a weather tool; when asked about today's weather, it calls the tool and formats the result.
+
+All of these share a shape: **mostly straight lines**, short-lived, finished in seconds.
+
+## Workflows and agents
+
+Before building something bigger, one distinction matters. Anthropic's widely cited guide *Building effective agents* draws it cleanly:
+
+- A **workflow** is a system where LLMs and tools are orchestrated through **predefined code paths**. The developer decides the steps and their order.
+- An **agent** is a system where the LLM **dynamically directs its own process** and tool use, deciding how to accomplish the task.
+
+A workflow is a flowchart someone drew in advance; run it a hundred times and information flows the same way every time (though branch choices depend on data). An agent draws its own flowchart as it goes, and two runs may take quite different paths. Both use LLMs; the difference is **who decides the control flow**.
+
+LangGraph builds both. Workflows are where you start, because they make the mechanics visible, and agents are graphs where an LLM picks the next step.
+
+## The hiring workflow
+
+Here's the automated hiring process from earlier lessons, now as a **workflow** a developer designed:
+
+```text
+START
+  → receive_request        "remote backend engineer, 2-4 years"
+  → create_jd              LLM writes a job description
+  → review_jd              human approves?   no → back to create_jd (with feedback)
+                                              yes ↓
+  → post_jd                job-board APIs
+  → wait 7 days
+  → count_applications     enough (≥ 20)?    no → revise_jd → wait 48 h → count again
+                                              yes ↓
+  → shortlist              parse resumes, LLM scores each against the JD
+  → schedule_interviews    calendar + email APIs
+  → conduct_interviews     question bank, reminders, several rounds
+  → for each candidate:    selected?  no → regret email
+                                       yes → send_offer (LLM drafts, email API)
+  → wait for reply         accepted?  no → human renegotiates → new offer → wait again
+                                       yes ↓
+  → onboard                HR system: welcome email, laptop, first-week sessions
+END
+```
+
+Read it as a developer would. There are **branches** (enough applications or not), **loops** (revise the JD until approved; widen and wait until there are enough applicants), **jumps** back to earlier steps, **waits** measured in days, and **human decisions** in several places.
+
+Now let's try to build it with LangChain and keep score.
+
+## Challenge 1: control flow
+
+A chain is linear: step 1, then step 2, then step 3. This workflow is **non-linear** in three ways:
+
+- **Conditional branches**: the next step depends on a result.
+- **Loops**: steps repeat until a condition holds.
+- **Jumps**: control moves back (or forward) to a non-adjacent step.
+
+LCEL has no first-class loop and no "go back to that earlier step". (It does have a simple routing helper, `RunnableBranch`, for picking one of several sub-chains, but nothing for cycles.) So you write the control flow yourself, in Python, around the chains.
+
+### The chain version
+
+Take just the first slice: create a JD, get it approved (looping until it is), then post it.
+
+```python
+jd_prompt = ChatPromptTemplate.from_template(
+    "Write a job description for this request:\n{request}\n\n"
+    "Reviewer feedback to address (may be empty):\n{feedback}"
+)
+jd_chain = jd_prompt | llm | StrOutputParser()
+
+def review(jd: str) -> tuple[bool, str]:
+    print(jd)
+    answer = input("Type 'y' to approve, or write feedback: ")
+    return answer.strip().lower() == "y", answer
+
+def post_jd(jd: str) -> None:
+    ...  # call the job-board APIs
+
+request = "Remote backend engineer, 2-4 years, Python and Django"
+feedback, approved = "", False
+while not approved:                       # control flow written by hand
+    jd = jd_chain.invoke({"request": request, "feedback": feedback})
+    approved, feedback = review(jd)
+post_jd(jd)
+```
+
+It works. But notice that only `jd_chain` is LangChain. The `while` loop, the `if`s inside `review`, the variables carrying `jd` and `feedback` between steps: that's **glue code**, your own Python stitching the pieces together.
+
+A little glue is fine. This slice is maybe a tenth of the flowchart. Building the rest means nested loops for re-posting, branches per candidate, a renegotiation loop and multi-day waits, all as hand-written control flow wrapped around chains. Glue code is code the framework doesn't understand: it isn't visible in traces, it isn't reusable, and every new branch makes the tangle harder to read, test and change as a team.
+
+### The graph version
+
+LangGraph represents the workflow as what it already is: a **graph**. Each task is a **node** (a plain Python function), and **edges** say where control goes next. Because a graph can have branches and cycles, non-linear flow is natural rather than bolted on.
+
+```python
+from typing import Literal, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class HiringState(TypedDict):
+    request: str
+    jd: str
+    feedback: str
+    approved: bool
+    posted: bool
+
+def create_jd(state: HiringState) -> dict:
+    jd = jd_chain.invoke({"request": state["request"], "feedback": state.get("feedback", "")})
+    return {"jd": jd}
+
+def review_jd(state: HiringState) -> dict:
+    approved, feedback = get_review(state["jd"])    # how the human answers: see challenge 5
+    return {"approved": approved, "feedback": feedback}
+
+def post_jd(state: HiringState) -> dict:
+    ...  # call the job-board APIs
+    return {"posted": True}
+
+def route_after_review(state: HiringState) -> Literal["post_jd", "create_jd"]:
+    return "post_jd" if state["approved"] else "create_jd"
+
+builder = StateGraph(HiringState)
+builder.add_node("create_jd", create_jd)
+builder.add_node("review_jd", review_jd)
+builder.add_node("post_jd", post_jd)
+builder.add_edge(START, "create_jd")
+builder.add_edge("create_jd", "review_jd")
+builder.add_conditional_edges("review_jd", route_after_review)   # the loop lives here
+builder.add_edge("post_jd", END)
+graph = builder.compile()
+```
+
+There's no `while` and no control-flow `if` in the orchestration. The loop is simply an edge that points backwards: after `review_jd`, the router returns either `"post_jd"` or `"create_jd"`, and LangGraph goes there. The `Literal` return type tells LangGraph which nodes the router can reach, so it can draw the graph. Extending to the whole flowchart means adding nodes and edges, not nesting loops.
+
+Notice also that the LLM call inside `create_jd` is still a LangChain chain. LangGraph orchestrates; LangChain still provides the components.
+
+### Running and inspecting the graph
+
+`compile()` turns the builder into a runnable graph with the same interface as a chain: `invoke`, `stream`, and async versions. You pass the initial state and get the final state back:
+
+```python
+final = graph.invoke({"request": "Remote backend engineer, 2-4 years", "feedback": ""})
+print(final["posted"])          # True
+print(final["jd"][:200])        # the approved JD
+```
+
+Because the structure is data rather than code paths buried in loops, LangGraph can also show it to you:
+
+```python
+print(graph.get_graph().draw_mermaid())   # Mermaid source you can paste into any Mermaid viewer
+```
+
+The diagram shows `create_jd → review_jd`, then a dashed conditional edge to `post_jd` or back to `create_jd`. That's the flowchart you designed, generated from the code. For a chain-plus-glue program there's nothing equivalent to draw, because the loop only exists in Python's control flow. And instead of `invoke`, `graph.stream(..., stream_mode="updates")` yields each node's update as it finishes, which is how UIs show progress step by step.
+
+<Callout kind="remember">
+LangGraph's core model: **nodes** are functions that do work, **edges** decide what runs next, and **conditional edges** pick the next node from the current state. Branches, loops and jumps are all just edges.
+</Callout>
+
+## Challenge 2: state
+
+Ask what data this workflow depends on, and the list is long:
+
+- the **JD** text (created, reviewed, posted, revised)
+- whether it's **approved**, and the reviewer's **feedback**
+- whether it's **posted**, and where
+- the **application count**, and the **threshold** to start interviews
+- the **shortlisted candidates** and their contact details
+- **offers sent** and each offer's **status**
+- the **onboarding status**
+
+And these values **evolve** as the workflow runs. At `receive_request` the JD is empty. After `create_jd` it's set. After `review_jd`, `approved` is true or false. After `post_jd`, `posted` is true. Later the application count changes after every check.
+
+This collection of evolving data points is the workflow's **state**. It's what tells you where you are and where to go next. A workflow can't run correctly if its state isn't tracked correctly.
+
+### State in a chain
+
+A chain passes **one value** from step to step: the previous step's output. There's no built-in object that holds the whole workflow's state as key-value pairs. LangChain's memory features are **conversation** memory (past chat messages for the model), which is a different thing; they can't tell you "posted: true, applications: 12".
+
+So you build it yourself: a dictionary at the top of your script, which every bit of glue code reads and mutates at the right moment. In a long flow, that's a constant source of bugs: a branch that forgets to set a flag, two steps that disagree about a key name, a value that silently goes stale. Chain-based apps are, in this sense, **stateless**: the framework carries data along, not state.
+
+### State in a graph
+
+LangGraph is **stateful** by design. You declare the state's shape once, as a `TypedDict` (or a Pydantic model), and pass it to `StateGraph`. Then:
+
+- Every node **receives the current state**, so it can read any field.
+- Every node **returns a partial update**, only the keys it changed, and LangGraph merges it into the state.
+- The updated state flows to the next node, and every later node sees the change.
+
+```python
+def count_applications(state: HiringState) -> dict:
+    n = job_board.count(state["job_id"])         # read what you need
+    return {"applications": n}                   # return only what changed
+
+def route_after_count(state: HiringState) -> Literal["shortlist", "revise_jd"]:
+    return "shortlist" if state["applications"] >= state["threshold"] else "revise_jd"
+```
+
+The state also drives routing: conditional edges decide by reading it. No global dictionary, no glue to keep it consistent.
+
+By default a returned key **overwrites** the old value. Some fields should **accumulate** instead, such as a log of every JD version or the conversation's messages. For those you attach a **reducer**, a function that combines the old and new values:
+
+```python
+import operator
+from typing import Annotated
+
+class HiringState(TypedDict):
+    request: str
+    jd: str
+    feedback: str
+    jd_history: Annotated[list[str], operator.add]   # appended to, not replaced
+    applications: int                                 # replaced on each update
+    threshold: int
+
+def create_jd(state: HiringState) -> dict:
+    jd = jd_chain.invoke({"request": state["request"], "feedback": state.get("feedback", "")})
+    return {"jd": jd, "jd_history": [jd]}             # adds one entry to the list
+```
+
+Reducers get their own lesson; for now, the point is that the framework owns how state changes, so every node follows the same rules.
+
+## Challenge 3: event-driven execution
+
+Workflows can execute in two ways:
+
+- **Sequential**: start, run every step back to back, finish. A chain does this: block 1 ends, block 2 starts, without stopping.
+- **Event-driven**: run until a point where you must **wait for something external**, pause, and **resume** when the event arrives.
+
+The hiring flow is full of event-driven points:
+
+- After posting, **wait 7 days**, then count applications.
+- After widening the JD, **wait 48 hours**, then count again.
+- After sending an offer, wait until the **candidate replies**.
+- At review points, wait until the **human decides**.
+
+LangChain chains are built for sequential execution: once invoked, a chain runs to completion. There's no "stop here and continue next Tuesday". To fake it you split the flow into separate chains, write your own scheduler to trigger the second one, and hand-code the transfer of state from the first to the second. More glue.
+
+LangGraph has this built in, through two features that work together:
+
+- A **checkpointer** saves the graph's state after every step, under a **thread ID** that names this particular run.
+- `interrupt()` inside a node **pauses** the run and returns control to the caller. Nothing keeps running while you wait.
+
+Later, any process (a cron job, a webhook handler, a queue consumer) resumes the same thread with `Command(resume=...)`, and the value it passes becomes the return value of `interrupt()`:
+
+```python
+from langgraph.types import interrupt, Command
+
+def wait_for_applicants(state: HiringState) -> dict:
+    # Pause here. Whatever resumes the thread passes in the current count.
+    count = interrupt({"waiting_for": "applications", "check_after_hours": 168})
+    return {"applications": count}
+
+# --- days later, in a scheduled job ---
+config = {"configurable": {"thread_id": "hire-backend-42"}}
+graph.invoke(Command(resume=job_board.count("job-123")), config)
+```
+
+The run doesn't sleep for a week holding memory. It stops, its state sits in the checkpointer, and it picks up exactly where it left off when the event comes in.
+
+## Challenge 4: fault tolerance
+
+**Fault tolerance** is a system's ability to keep working, or recover, when something fails. It matters most for **long-running** workflows, and this one can run for weeks, so faults are close to certain. They come in two sizes:
+
+- **Small faults**: a single step fails. The job-board API returns an error when you try to post.
+- **Big faults**: the whole process dies. The server restarts, the container is replaced, the machine goes down mid-run.
+
+In a chain, a failure at step 3 of 5 means running the chain again **from the start**. There's no record of how far it got, because LangChain assumes chains are short-lived. You can wrap individual runnables with retries, but recovering a half-finished multi-day process is up to you.
+
+LangGraph covers both sizes.
+
+**Retries for small faults.** Attach a retry policy to a node, and transient failures are retried automatically:
+
+```python
+from langgraph.types import RetryPolicy
+
+builder.add_node("post_jd", post_jd, retry_policy=RetryPolicy(max_attempts=3))
+```
+
+**Recovery for big faults.** With a durable checkpointer, the state after every completed node is on disk. After a crash, invoking the same thread with no new input continues from the last checkpoint instead of from the start:
+
+```python
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver   # pip install langgraph-checkpoint-sqlite
+
+conn = sqlite3.connect("hiring.db", check_same_thread=False)
+graph = builder.compile(checkpointer=SqliteSaver(conn))
+config = {"configurable": {"thread_id": "hire-backend-42"}}
+
+graph.invoke({"request": "Remote backend engineer, 2-4 years"}, config)
+
+# ...the server crashes and restarts...
+print(graph.get_state(config).next)   # which node(s) run next, e.g. ('post_jd',)
+graph.invoke(None, config)            # continue from the last saved checkpoint
+```
+
+Think of it as a video game's save points: if the power goes out on level 3, you restart on level 3, not level 1.
+
+<Callout kind="warn">
+Checkpoints are written **between** nodes. If a crash hits in the middle of a node, that node runs again on resume. So nodes with side effects (posting a job, sending an email, charging a card) should be safe to repeat: check whether the job is already posted, or pass an idempotency key to the API.
+</Callout>
+
+`InMemorySaver` (from `langgraph.checkpoint.memory`) is handy in development, but it lives in the process's memory, so it survives a paused run, not a crash. For real recovery, use a database-backed saver like SQLite or Postgres.
+
+## Challenge 5: human in the loop
+
+**Human-in-the-loop** means the workflow stops at a certain point for a person to decide: approve the JD, approve posting it, approve an offer. Risky actions should carry human accountability, so real workflows have several of these points.
+
+In a chain, the only built-in option is to block on input, as the `input()` call did earlier. That's fine when the human is sitting at the terminal. It's hopeless when the hiring manager approves tomorrow afternoon: the script would sit there for a day holding memory and a connection, and any restart in between loses everything. The workaround is, again, splitting into two chains with hand-written state transfer.
+
+In LangGraph, human-in-the-loop is a **first-class feature**, built on the same checkpointing as challenges 3 and 4. The graph can pause **indefinitely**, for minutes, hours or days, because the state is saved after every step and the run resumes exactly where it stopped. Here's the real review node:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+def review_jd(state: HiringState) -> dict:
+    decision = interrupt({"jd": state["jd"], "question": "Approve this JD?"})
+    return {"approved": decision["approved"], "feedback": decision.get("feedback", "")}
+
+graph = builder.compile(checkpointer=InMemorySaver())   # interrupts need a checkpointer
+config = {"configurable": {"thread_id": "hire-backend-42"}}
+
+result = graph.invoke({"request": "Remote backend engineer, 2-4 years"}, config)
+print(result["__interrupt__"][0].value["question"])     # Approve this JD?
+
+# Later, from your UI or an approval email link:
+graph.invoke(Command(resume={"approved": False, "feedback": "Mention on-call duties"}), config)
+# ...create_jd runs again with the feedback, and the graph pauses at review_jd once more...
+graph.invoke(Command(resume={"approved": True}), config)  # → post_jd → END
+```
+
+When a run resumes, the paused node **starts again from its beginning**, and this time `interrupt()` returns the resume value instead of pausing. So keep code before an `interrupt()` free of side effects.
+
+The resume value can be anything JSON-serialisable, which makes interrupts more flexible than a yes/no gate. The human can **approve or reject**, **edit** (send back a corrected JD that the node writes into the state), or **supply missing input** (the salary range the agent wasn't sure about). One mechanism covers all three; the node decides what to do with the answer.
+
+Challenges 3, 4 and 5 are really one capability seen from three angles: **stateful execution with checkpoints**. Waiting for an event, surviving a crash and waiting for a human all reduce to "save the state, stop, resume later from exactly here".
+
+<LgChainVsGraph />
+
+## Nested workflows
+
+The next item is less a LangChain weakness than a LangGraph feature: **subgraphs**. A subgraph is a graph used as a node inside another graph.
+
+Look at `conduct_interviews` in the flowchart. It's one box, but it hides a workflow of its own: generate questions per candidate, run round 1, evaluate, run round 2, evaluate, maybe round 3. Rather than flatten all that into the main graph, build it as its own graph and drop it in as a single node:
+
+```python
+interview_graph = interview_builder.compile()
+
+builder.add_node("conduct_interviews", interview_graph)   # a compiled graph used as a node
+builder.add_edge("schedule_interviews", "conduct_interviews")
+builder.add_edge("conduct_interviews", "send_offers")
+```
+
+This is encapsulation applied to workflows, and it has two big uses:
+
+- **Multi-agent systems.** Each agent is its own graph, and a parent graph coordinates them. Picture a self-driving car: one agent fuses sensor data, one handles driving, one runs the cabin's entertainment, and a supervising agent directs the others.
+- **Reuse.** The hiring flow needs approvals in several places: the JD, the posting, the interview schedule, the offer. Build one small approval subgraph and reuse it wherever it's needed, the way you'd reuse a function.
+
+The design question with subgraphs is how the parent's state and the child's state relate: shared keys pass through directly, and differing schemas need a translation step. You'll work through both cases in the subgraphs lesson. Chains have no equivalent: if the outer flow is already a tangle of glue code, nesting another flow inside it only makes it worse.
+
+## Challenge 6: observability
+
+**Observability** is how easily you can monitor, debug and understand what a workflow is doing at runtime. In production it's essential. Say an agent boosted job posts with no spending limit and burned through the budget. You need to replay exactly what it saw and decided at each step: for debugging, and for auditing.
+
+The LangChain ecosystem's tool for this is **LangSmith**. Enable it with environment variables and every LangChain call is traced automatically: the prompt sent, the response, token counts, latency.
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=...        # from your LangSmith settings
+```
+
+With a chain plus glue code, though, the trace shows the chain calls as **disconnected events**. It doesn't know they happened inside a `while` loop, on its third iteration, because a reviewer rejected the JD twice, since that logic is your own Python. You can instrument the glue yourself with LangSmith's `@traceable` decorator, but you're adding the structure by hand and it's easy to leave gaps. In practice you get **partial** observability.
+
+With LangGraph, the control flow **is** the framework, so a trace captures the whole run as a structured timeline: which node ran, the state going in and coming out, which edge was taken and why, the messages exchanged, and when a human interrupted and what they answered. Nothing is hidden in glue code because there is no glue code. You'll set this up properly in the observability lessons.
+
+## The whole workflow as a graph
+
+Here's the full hiring flowchart wired up, with node bodies omitted. Compare it with the flowchart at the top: every box is a node and every arrow is an edge.
+
+```python
+builder = StateGraph(HiringState)
+for name, fn in [
+    ("create_jd", create_jd), ("review_jd", review_jd), ("post_jd", post_jd),
+    ("wait_for_applicants", wait_for_applicants), ("revise_jd", revise_jd),
+    ("shortlist", shortlist), ("schedule_interviews", schedule_interviews),
+    ("conduct_interviews", interview_graph),          # a subgraph
+    ("send_offers", send_offers), ("wait_for_reply", wait_for_reply),
+    ("renegotiate", renegotiate), ("onboard", onboard),
+]:
+    builder.add_node(name, fn)
+
+builder.add_edge(START, "create_jd")
+builder.add_edge("create_jd", "review_jd")
+builder.add_conditional_edges("review_jd", route_after_review)           # post_jd | create_jd
+builder.add_edge("post_jd", "wait_for_applicants")
+builder.add_conditional_edges("wait_for_applicants", route_after_count)  # shortlist | revise_jd
+builder.add_edge("revise_jd", "wait_for_applicants")
+builder.add_edge("shortlist", "schedule_interviews")
+builder.add_edge("schedule_interviews", "conduct_interviews")
+builder.add_edge("conduct_interviews", "send_offers")
+builder.add_edge("send_offers", "wait_for_reply")
+builder.add_conditional_edges("wait_for_reply", route_after_reply)       # onboard | renegotiate
+builder.add_edge("renegotiate", "send_offers")
+builder.add_edge("onboard", END)
+
+graph = builder.compile(checkpointer=SqliteSaver(conn))
+```
+
+Three loops (JD review, application threshold, offer renegotiation), three event-driven waits, human decisions, a nested interview workflow, and crash recovery, with no hand-written loops or state plumbing. The remaining work is writing each node as a small function that reads the state and returns an update, which is also what makes each piece easy to test on its own.
+
+## What LangGraph is
+
+Putting it all together:
+
+> **LangGraph is an orchestration framework for building stateful, multi-step, event-driven workflows with LLMs.** It suits both single-agent and multi-agent applications.
+
+A useful mental picture: **a flowchart engine for LLM apps**. You define the steps as **nodes**, connect them with **edges**, and write the logic that governs transitions. LangGraph handles the rest: **state management, conditional branching, looping, pausing and resuming, and fault recovery**. Those are exactly the things that separate a demo from a production system.
+
+| Challenge | With LangChain chains | With LangGraph |
+|---|---|---|
+| Control flow | Linear chains; loops and branches in hand-written glue code | Nodes and edges; conditional edges for branches, loops and jumps |
+| State | One value passed along; workflow state is your own dict | Typed state object read and updated by every node |
+| Event-driven execution | Runs start to finish; split into chains and schedule them yourself | `interrupt()` + checkpointer; resume the thread when the event arrives |
+| Fault tolerance | Rerun from scratch | Retry policies per node; resume from the last checkpoint |
+| Human in the loop | Blocking input, short waits only | First-class: pause indefinitely, resume with `Command(resume=...)` |
+| Nested workflows | No equivalent | Subgraphs for reuse and multi-agent systems |
+| Observability | Chain calls traced; glue logic invisible unless hand-instrumented | Whole run traced: nodes, state, routing, interrupts |
+
+## When to use which
+
+**Use LangChain chains** for simple, linear, short-lived flows: a prompt chain, a summariser, a basic RAG pipeline, a single tool call.
+
+**Use LangGraph** when you need any of: conditional paths, loops, more than a trivial amount of workflow state, human-in-the-loop steps, waiting on external events, crash recovery, or multiple agents working together.
+
+<LgFrameworkPicker />
+
+### Borderline cases
+
+A few situations come up often enough to settle in advance:
+
+- **A chatbot that remembers the conversation.** A chain plus a list of past messages works for a demo. As soon as you want per-user threads that survive restarts, a LangGraph graph with a checkpointer gives you that for free, and it's the approach this course takes from the chatbot lesson onwards.
+- **A standard tool-calling agent.** If you just need "model plus tools, loop until done", LangChain's `create_agent` gives you a prebuilt one, and it runs on LangGraph underneath, so it supports checkpointers and interrupts. Reach for a hand-built graph when you need custom steps, routing or approval points that the prebuilt loop doesn't have.
+- **A pipeline that might grow.** If a linear chain today is likely to gain an approval step or a retry loop next quarter, starting as a small graph costs little and saves a rewrite later.
+- **A truly one-shot call.** Don't wrap a single prompt in a graph for the sake of it. A three-line chain is clearer.
+
+## LangGraph builds on LangChain
+
+After a lesson listing LangChain's limits, it's tempting to conclude you should drop it. Don't. **LangGraph is built on top of LangChain's building blocks, not as a replacement for them.**
+
+Inside your graph's nodes you'll still call chat models, write prompt templates, load documents, split text, query retrievers, define tools and parse outputs, all with LangChain components. Every node in this lesson's examples called a LangChain chain. The division of labour is clean:
+
+- **LangChain** provides the **components** (and chains, for simple wiring).
+- **LangGraph** provides the **orchestration**: how components are connected, in what order, with what state, and how the run survives waits and failures.
+
+The relationship goes the other way too: since LangChain 1.0, LangChain's own ready-made agent (`create_agent`) runs on the LangGraph runtime. So what you learned about LangChain still counts, and everything in this course builds on it.
+
+## Cheat sheet
+
+- LangChain gives you building blocks (models, prompts, retrievers, tools, parsers) and linear chains via LCEL's `|`.
+- A workflow follows developer-defined paths; an agent lets the LLM choose its own path. LangGraph builds both.
+- Chains are linear; loops, branches and jumps around them become glue code that's hard to maintain and trace.
+- LangGraph models the flow as a graph: nodes are functions, edges decide what's next, conditional edges route on state.
+- State is the set of evolving data points a workflow depends on; in LangGraph it's a `TypedDict` or Pydantic model passed to every node.
+- Nodes return partial updates; LangGraph merges them into the state.
+- A checkpointer saves state after every node under a `thread_id`; that one feature enables waiting, recovery and human approval.
+- `interrupt()` pauses a run; `graph.invoke(Command(resume=value), config)` continues it, and `value` is what `interrupt()` returns.
+- `RetryPolicy` on a node handles transient failures; `graph.invoke(None, config)` resumes after a crash with a durable checkpointer.
+- Subgraphs (a compiled graph as a node) give you reuse and multi-agent systems.
+- LangGraph runs give LangSmith a full trace: nodes, state, routing and interrupts.
+- Use chains for simple linear flows; use LangGraph for anything with branching, loops, long waits, humans or multiple agents. You'll use both together.

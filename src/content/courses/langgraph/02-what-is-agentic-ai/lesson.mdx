@@ -1,0 +1,384 @@
+import { LgPlanPicker } from "@/components/widgets/LgPlanPicker";
+import { LgAgentLoop } from "@/components/widgets/LgAgentLoop";
+
+## What agentic AI is
+
+The previous lesson built up to agentic AI through a story. This one defines it properly and takes it apart.
+
+**Agentic AI** is AI that can take a **task or goal** from a user and then **work towards completing it on its own**, with minimal human guidance. It plans, takes actions, adapts when things change, and asks for help only when it needs to.
+
+Think of it as a different **software paradigm**. In ordinary software, a developer decides every step in advance. In a chatbot, the user decides every step as they go. In an agentic system, you state the outcome you want, and the system works out the steps, carries them out and keeps going until the outcome is reached.
+
+### Reactive vs proactive, in one example
+
+Say you want a trip to Goa from the 15th to the 20th. A trip involves a chain of decisions: transport, hotel, what to see, where to eat, all depending on dates, budget and weather.
+
+With a **generative AI chatbot**, the interaction is **reactive**. You ask "what's the best way to get to Goa on the 15th?" and get exactly that answer. Then you ask about hotels for those dates. Then about places to visit given the weather. Each answer is good and precisely scoped to the question. You hold the plan; the chatbot fills in the blanks you point at.
+
+With an **agentic system**, you say "plan my Goa trip, 15th to 20th, mid-range budget". It works out that it needs transport, a hotel and an itinerary, researches each, comes back with options, books what you approve and assembles the itinerary. You described the destination; it drove the journey.
+
+That's the core shift: from **answering prompts** to **pursuing goals**.
+
+## A worked example: the AI recruiter
+
+We'll analyse one system throughout this lesson: an agentic recruiting assistant. If you followed the last lesson this will be familiar, so here's the short version, told from the agent's side.
+
+The recruiter types: *"Hire a remote backend engineer with 2 to 4 years of experience."*
+
+1. **Understand the goal.** Role, seniority, remote, and the company's usual stack and salary band, pulled from internal documents.
+2. **Make a plan.** Draft a JD, post it on the best platforms, monitor applications, adjust if they're low, screen candidates, schedule interviews, support the interviews, send an offer, onboard.
+3. **Execute step by step.**
+   - Drafts the JD from company documents and asks the recruiter to review it.
+   - Posts it on two job boards through their APIs.
+   - Monitors applications. After a few days it notices only two people have applied, well below expectation. It proposes widening the title to full-stack and paying to boost the post, gets approval and does both.
+   - When applications pick up, it parses the resumes, ranks them (2 strong, 3 partial, 3 weak) and offers to schedule the strong ones.
+   - Checks the recruiter's calendar, books Friday, sends invitations, sends a reminder and a question pack on the day.
+   - Drafts the offer, gets approval, sends it, and watches for the reply.
+   - When it's accepted, sends a welcome email, requests IT access and a laptop, and offers to set up an intro meeting.
+
+The striking thing is **how little the human did**. One goal at the start, and a handful of approvals along the way. Everything else, including noticing a problem and fixing it, was the system's own initiative.
+
+## Six traits of an agentic system
+
+How do you tell whether a given product is genuinely agentic or just a chatbot with good marketing? Look for six traits:
+
+1. **Autonomy**: it makes decisions and acts without step-by-step instructions.
+2. **Goal orientation**: everything it does serves a persistent objective.
+3. **Planning**: it breaks the goal into a sequence of sub-goals and actions.
+4. **Reasoning**: it interprets information, draws conclusions and decides.
+5. **Adaptability**: it changes its plan when circumstances change.
+6. **Context awareness**: it remembers what matters across a long, multi-step task.
+
+They aren't independent. Autonomy without a goal is aimless; planning without reasoning is impossible; adapting requires remembering what you were doing. Let's go through each.
+
+## Autonomy
+
+**Autonomy** is the system's ability to make decisions and take actions on its own to achieve a goal, without needing a human to spell out each step.
+
+The recruiter agent was given one sentence and ran a multi-week process. That's autonomy. A practical consequence is that the system is **proactive**: it acts before you ask. When applications were low, nobody told the agent to check; it was monitoring because monitoring was part of its plan, and it raised the problem itself. A chat assistant would only have helped once you noticed, came back and asked "what should I do?"
+
+### Where autonomy shows up
+
+Autonomy isn't one switch. It appears in several places:
+
+- **Execution.** It moves through the plan's steps by itself: JD, then posting, then monitoring.
+- **Decisions.** It decides how many candidates to shortlist and by what criteria, and reports the result.
+- **Tool use.** It decides which tool fits the moment: the resume parser, the calendar, email.
+
+### How proactive behaviour actually happens
+
+"It noticed on its own" sounds like magic, so it's worth being concrete. Software only does something when code runs, and an LLM only thinks when it's called. Proactivity comes from the system around the model:
+
+- **Schedules.** A timer resumes the agent every morning, or seven days after posting, to check application counts.
+- **Events.** A webhook fires when a candidate replies to the offer email, and that resumes the agent's run.
+- **The plan itself.** "Monitor applications" is a step in the plan, so when execution reaches it, the agent checks without being asked.
+
+In each case the agent's saved state (goal, plan, progress) is loaded, the model is asked "given this, what now?", and it acts. That's why durable state matters so much: an agent that's resumed by a timer next week must find its context exactly as it left it. LangGraph's checkpointers exist for exactly this.
+
+### Controlling autonomy
+
+Autonomy is powerful and risky in equal measure, so real systems put **limits** on it. Four common controls:
+
+| Control | What it does | Recruiter example |
+|---|---|---|
+| **Permission scope** | Limits which tools and actions the agent may take on its own | It may screen resumes, but must ask before rejecting anyone |
+| **Human-in-the-loop checkpoints** | Forces a pause for human approval before certain steps | It drafts the JD freely but must get approval before posting it |
+| **Override controls** | Lets a human stop, pause or redirect the agent at any time | The recruiter issues "pause hiring" and everything stops until resumed |
+| **Guardrails and policies** | Hard rules and ethical boundaries it must always follow | Never schedule interviews on weekends; never use informal language with candidates |
+
+### What goes wrong without controls
+
+Picture the recruiter agent with full autonomy and no checks:
+
+- It **sends offers on its own**, with the wrong salary or terms. Now you have a legal and HR problem.
+- It **shortlists with a bias** it picked up from its training data or from your past hiring records, filtering on age or nationality. In many countries that's illegal, and you might not notice for months.
+- It **spends without limit**. It had permission to boost job posts, so it boosted them, with no cap.
+
+None of these require a malicious model; they just require a capable one with too much freedom. That's why you'll spend real effort in this course on approval points, pausing and resuming runs, and tracing what an agent did and why.
+
+<Callout kind="warn">
+The more irreversible or expensive an action is, the more it needs a checkpoint. Reading data is cheap to get wrong; sending money, emails or offers is not.
+</Callout>
+
+## Goal orientation
+
+Being **goal-oriented** means the system operates with a **persistent objective** and continuously directs its actions towards it, rather than responding to isolated prompts.
+
+Every action of the recruiter agent, from the JD to the laptop request, served one goal: hire the engineer. Goal orientation is the **compass for autonomy**. Autonomy is the ability to act independently; the goal decides *what* to act on. Without a goal, an autonomous system has nothing to steer by. The two traits always travel together.
+
+### Goals with constraints
+
+A goal can be bare, or come with constraints that narrow the acceptable solutions:
+
+- Bare: *hire a backend engineer.*
+- Constrained: *hire a backend engineer **based in India**, **fully remote**, **within a $X budget**.*
+
+Constraints matter because they turn "any solution" into "a solution we'd accept". Most real goals are constrained, and a good agent treats constraints as part of the goal rather than as suggestions.
+
+### How a goal is held in memory
+
+An agent has to keep its goal, constraints and progress somewhere it can consult at every step. Conceptually it looks like a structured record:
+
+```json
+{
+  "main_goal": "Hire a backend engineer",
+  "constraints": { "experience": "2-4 years", "remote": true, "stack": ["Python", "Django", "AWS"] },
+  "status": "active",
+  "created_at": "2026-10-01",
+  "progress": {
+    "jd_drafted": true,
+    "posted_on": ["Board A", "Board B"],
+    "applications": 8,
+    "interviews_scheduled": 2,
+    "hired": null,
+    "onboarded": false
+  }
+}
+```
+
+This isn't any library's real format. In LangGraph you'll define something similar yourself, as the graph's **state**: a typed dictionary that every step can read and update. The point is that the goal and progress are explicit data, not something the model is trusted to "keep in mind".
+
+### Changing goals midway
+
+Goals can change. Suppose a week in, the recruiter says: *"Forget the full-time hire; it's a three-month project, find a freelancer."* The main goal is replaced, so the plan must be redone (freelance marketplaces, not job boards), and the agent continues executing the new plan. A well-built agent handles this as a normal event, not a crash.
+
+## Planning
+
+**Planning** is the agent's ability to break a high-level goal into a **structured sequence of actions or sub-goals**, and to choose the best path to the outcome.
+
+Planning is so central that you can describe any agentic system as operating in two phases:
+
+1. **Plan**: given a goal, work out how to achieve it.
+2. **Execute**: carry the plan out, step by step.
+
+And the two phases form a **loop**. Midway through execution you may discover that step 4 is impossible (an API doesn't exist, a constraint can't be met), so you go back to planning, produce a new plan, and execute again. This repeats until the goal is achieved or the agent gives up and escalates.
+
+### Generate candidate plans
+
+When an agent plans, it shouldn't commit to the first idea. There's usually more than one way to get from the starting state ("we need an engineer") to the goal state ("an engineer has joined"). You can think of planning as a **search problem** over those paths.
+
+For the recruiter, two candidate plans might be:
+
+- **Plan A**: write a JD, post it on job boards, promote it, screen applicants.
+- **Plan B**: run an internal referral drive, and brief a recruiting agency.
+
+### Evaluate them
+
+Each candidate is scored against criteria:
+
+- **Efficiency**: which finishes faster?
+- **Tool availability**: does the agent actually have the tools each plan needs? If plan A requires a web-search API and none is installed, plan A is out, however good it looks.
+- **Cost**: agencies charge a fee; job boards are cheaper. With a tight budget, that decides it.
+- **Risk**: how likely is each to fail? Job boards might attract too few applicants.
+- **Alignment with constraints**: for a remote-only role, which channel reaches remote candidates better?
+
+### Select one
+
+Then a plan is chosen, in one of three ways:
+
+- **Ask the human**: present the options and let the supervisor pick.
+- **Follow a preset policy**: rules decide, for example "always prefer the cheapest viable plan".
+- **Let the model decide**: the LLM weighs the criteria and justifies its choice.
+
+So planning is: **generate several plans, evaluate them, select one**, and then hand it to execution.
+
+<LgPlanPicker />
+
+<Callout kind="tip">
+Many simple agents skip explicit candidate plans and decide one step at a time ("what should I do next, given what I know?"). That works for short tasks. For long, expensive tasks, an explicit plan you can inspect and approve is safer and easier to debug.
+</Callout>
+
+## Reasoning
+
+**Reasoning** is the cognitive process by which an agent **interprets information, draws conclusions and makes decisions**, both while planning and while executing.
+
+A human example makes the three parts clear. You're travelling and your phone is stolen.
+
+- **Interpret**: information arrives from your environment. "My phone is gone."
+- **Conclude**: "Whoever has it might misuse my number and accounts."
+- **Decide**: "First, call my carrier and block the SIM."
+
+An agent does the same with feedback from its environment: a tool result, an error, a message from the human.
+
+### Reasoning while planning
+
+- **Goal decomposition.** Turning "hire a backend engineer" into concrete steps is itself reasoning.
+- **Tool selection.** If a step is "find the market salary for 2 to 4 years' experience", the agent must conclude it needs an external tool, such as web search, to do it.
+- **Resource estimation.** How long will each step take? What depends on what? Where are the risks?
+
+### Reasoning while executing
+
+- **Decisions.** Three candidates match well: interview two or all three?
+- **When to involve the human.** Unsure of the right salary: search the web, or ask the recruiter? Knowing when you don't know is part of reasoning.
+- **Error handling.** The job board API is down. Retry later, tell the human, or post on another platform? Picking the right response to a failure is reasoning, not a hard-coded rule.
+
+In an LLM-based agent, nearly all of this reasoning is done by the LLM, which is why it's called the agent's **brain**.
+
+### Reason, act, observe
+
+The most common way to get this reasoning out of an LLM is a simple cycle, often called **ReAct** (reason + act):
+
+1. **Reason**: the model looks at the goal, the history so far and the latest result, and decides what to do next.
+2. **Act**: it either calls a tool (with arguments it chooses) or gives a final answer.
+3. **Observe**: the tool's result is added to the history, and the cycle repeats.
+
+A trace of the recruiter agent scheduling interviews might read: *reason* "I need the recruiter's free slots", *act* call the calendar tool, *observe* "503 error", *reason* "the calendar is down; asking directly is faster than waiting", *act* message the recruiter, *observe* "Friday 3 pm", *reason* "now I can send invites", and so on. Each step is one model call with the accumulated context. Prompting the model to think through a problem before answering generally improves these decisions, and many current models are trained to do some of that thinking internally.
+
+You'll build exactly this cycle with LangGraph in the tools lesson: a model node, a tool node, and an edge that loops between them until the model stops calling tools.
+
+## Adaptability
+
+**Adaptability** is the agent's ability to **modify its plans, strategies or actions** in response to unexpected conditions, **while staying aligned with the goal**.
+
+The low-applicant episode is the classic case: the plan said "post and wait", reality said "two applicants", and the agent changed strategy (broader title, paid boost) without changing the goal.
+
+To talk about adaptation precisely, you need the idea of an **environment**: everything the agent operates in and gets feedback from. For a chess agent, it's the board. For a self-driving car, it's the road, other vehicles and pedestrians. For the recruiter agent, it's the job boards, the applicants, the calendar, the inbox and the human recruiter.
+
+An agent has to adapt for three kinds of reasons:
+
+| Trigger | Example | Adaptation |
+|---|---|---|
+| **Failures** | The calendar API is down when scheduling interviews | Ask the recruiter for their availability directly instead |
+| **External feedback** | The job board reports very few applications | Widen the role and boost the post |
+| **Goal changes** | The recruiter switches from a full-time hire to a freelancer | Re-plan around freelance platforms |
+
+Adaptability is what separates an agent from a script. A script with a broken step stops or crashes. An agent notices, reasons about alternatives and finds another route.
+
+## Context awareness
+
+**Context awareness** is the agent's ability to **understand, retain and use relevant information** from the ongoing task, past interactions, user preferences and environmental cues, so it can make good decisions across a multi-step process.
+
+Hiring runs for days or weeks. If the agent forgets what it did yesterday, it can't work at all. Ask "how many people applied?" four days after posting, and an agent that replies "applied to what?" is useless.
+
+The context an agent typically carries:
+
+- **The original goal** and its constraints, available at every step.
+- **Progress so far** and the **conversation history** with the human: JD approved, posted on two boards.
+- **Environment state**: the job is live, 8 people have applied, the ad budget runs out in two days.
+- **Tool results**: the resume parser says candidate B has 3 years of Django and AWS; the calendar says the recruiter is free at 2 pm.
+- **User preferences**: the company prefers remote candidates; this recruiter likes interview questions as a shared doc.
+- **Policies and guardrails**: never send an offer without approval; never use paid platforms without asking.
+
+### Short-term and long-term memory
+
+All of this lives in the agent's **memory**, which comes in two kinds, much like yours:
+
+- **Short-term memory** holds what matters for the **current task or session**. For you: today's meeting is at 4 pm, these are the slides you still need. For the agent: the current conversation, recent tool results (candidate B's experience), what step it's on.
+- **Long-term memory** holds what persists **across sessions**. For you: where you live, what your job is. For the agent: user preferences, past interactions, standing policies like "never send an offer without approval".
+
+LangGraph handles these with separate mechanisms: short-term memory is the graph's state, saved by a **checkpointer** per conversation thread; long-term memory lives in a **store** shared across threads. You'll build both later in the course.
+
+## Is it agentic
+
+You can now use the traits as a checklist. Shown any AI product, ask six questions:
+
+1. Does it act without being told each step? (**autonomy**)
+2. Is it working towards a persistent objective, not just answering? (**goal orientation**)
+3. Does it break that objective into steps? (**planning**)
+4. Does it interpret results and make decisions? (**reasoning**)
+5. Does it change course when something goes wrong? (**adaptability**)
+6. Does it remember what it's done and what matters? (**context awareness**)
+
+If the answers are all yes, it's agentic. Most products are somewhere in between, and that's fine. "Agentic" is a spectrum, not a badge, and the right amount of agency depends on the task.
+
+## The five components
+
+Traits describe *behaviour*. Components describe *architecture*: the parts you actually build. Almost every agentic system has five:
+
+1. **Brain**
+2. **Orchestrator**
+3. **Tools**
+4. **Memory**
+5. **Supervisor**
+
+### Brain
+
+In an LLM-based agent, the **brain is the LLM**. (Agents also exist in reinforcement learning, where the "brain" is a learned policy, but this course is about LLM-based agents.) The brain does most of the thinking:
+
+- **Interprets the goal**: what does the user actually want?
+- **Plans**: breaks the goal into sub-goals.
+- **Reasons**: during both planning and execution.
+- **Selects tools**: which one fits this step, with what inputs?
+- **Communicates**: understands the human's messages and writes its own in natural language.
+
+It's the backbone: most of the heavy lifting in the workflow is an LLM call.
+
+### Orchestrator
+
+The brain produces a plan; the **orchestrator executes it**. It decides which step runs now, what runs next given the last result, and what happens when something fails. Its jobs:
+
+- **Sequencing**: run steps in the right order.
+- **Conditional routing**: after step 2, go to step 3 or step 4 depending on the result.
+- **Retries**: the job board API is down, so try again shortly.
+- **Loops and iteration**: repeat "revise JD, wait, check applications" until there are enough.
+- **Delegation**: hand this step to the LLM, that one to a tool, the next one to the human.
+
+If the brain is the thinker, the orchestrator is the **project manager**, or the nervous system connecting every part. This is the component that agent frameworks provide. LangGraph, CrewAI, AutoGen and the OpenAI Agents SDK are all, at heart, ways to build orchestrators. In LangGraph, the orchestrator is the **graph** you define.
+
+### Tools
+
+**Tools** are how the agent touches the outside world: calling APIs, querying or updating databases, sending email, reading files. If the brain is the head, tools are the **hands and legs**.
+
+A knowledge base used for RAG is also best thought of as a tool: the agent calls a retriever to fetch facts and domain-specific information that ground its answers, just as it calls any other tool.
+
+### Memory
+
+**Memory** stores context so the agent can stay coherent over time:
+
+- **Short-term**: messages in the current session, recent tool calls and their results, immediate decisions.
+- **Long-term**: high-level goals, past interactions, user preferences, decisions that should carry across sessions.
+- **State tracking**: what's done and what remains.
+
+### Supervisor
+
+The **supervisor** is how a human and an agent work together; it's where **human-in-the-loop** is implemented. It handles:
+
+- **Approvals** for high-risk actions, like sending an offer or spending on ads. The supervisor pauses the run, notifies the human and continues only with permission.
+- **Guardrail enforcement**: checking actions against the rules before they happen.
+- **Escalations** for edge cases. Say a guardrail restricts shortlisting to a set of universities, but one applicant from elsewhere has an outstanding resume. Rather than silently filter them out or silently break the rule, the agent flags the case to a human.
+
+### The components in action
+
+Step through the recruiter agent below. Each entry is tagged with its phase in the loop, and the boxes show which component is doing the work. Try switching on failures and goal changes, and try turning the approval rules off.
+
+<LgAgentLoop />
+
+Notice how the traits come from the components working together:
+
+| Trait | Mostly comes from |
+|---|---|
+| Autonomy | Orchestrator running the loop without waiting for prompts |
+| Goal orientation | Goal held in memory, consulted by the brain at every decision |
+| Planning and reasoning | Brain |
+| Adaptability | Brain re-planning, orchestrator routing to the new plan |
+| Context awareness | Memory |
+| Safe autonomy | Supervisor |
+
+### How the components map onto LangGraph
+
+You'll meet each of these as concrete LangGraph features:
+
+| Component | In LangGraph |
+|---|---|
+| Brain | A chat model, e.g. `init_chat_model("openai:gpt-4.1-mini")`, called inside nodes |
+| Orchestrator | A `StateGraph`: nodes, edges, conditional edges and loops |
+| Tools | `@tool` functions bound to the model, executed by a `ToolNode` |
+| Memory | Graph state saved by a checkpointer (short-term) and a store (long-term) |
+| Supervisor | `interrupt()` to pause for a human, `Command(resume=...)` to continue |
+
+### Deeper inside the brain
+
+Five components is the high-level picture. Look closer and each splits into parts: the brain often has a **planner** that proposes plans and an **evaluator** (sometimes called a critic) that scores them or checks the agent's own output; memory splits into several stores; supervision may include automated policy checks before any human sees an action. Later lessons build several of these patterns explicitly. For now, the five components are enough to read any agent's architecture.
+
+## Cheat sheet
+
+- Agentic AI takes a goal and works towards it with minimal guidance: plans, acts, adapts, asks for help when needed.
+- Generative chatbots are reactive (answer each prompt); agentic systems are proactive (pursue the goal).
+- Six traits: autonomy, goal orientation, planning, reasoning, adaptability, context awareness.
+- Control autonomy with permission scope, human-in-the-loop checkpoints, override controls and guardrails.
+- The goal is the compass for autonomy; constraints are part of the goal, and goals can change midway.
+- Planning is generate candidates, evaluate (speed, tools, cost, risk, constraints), select; plan and execute repeat in a loop.
+- Reasoning means interpret, conclude, decide, during both planning and execution.
+- Adaptation is triggered by failures, external feedback from the environment, and goal changes.
+- Short-term memory holds the current task; long-term memory holds what persists across sessions.
+- Five components: brain (LLM), orchestrator (the graph), tools, memory, supervisor (human-in-the-loop).

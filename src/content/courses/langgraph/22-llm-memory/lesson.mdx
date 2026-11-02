@@ -1,0 +1,333 @@
+import { LgContextBuilder } from "@/components/widgets/LgContextBuilder";
+import { LgMemorySorter } from "@/components/widgets/LgMemorySorter";
+
+## Why memory matters
+
+Picture a chatbot that forgets everything the moment it replies. You tell it your name, and in the next message it asks who you are. You explain that your project uses Postgres, and two questions later it suggests MongoDB. You'd stop using it within minutes.
+
+Every useful chatbot, copilot or agent needs **memory**: it has to carry facts, decisions and context from one moment of the conversation to the next, and ideally from one conversation to the next. Yet the language model at the heart of these systems **has no memory at all**. Every bit of "remembering" you've ever seen from ChatGPT, Claude or Gemini is built *around* the model by ordinary software.
+
+This lesson builds memory up from first principles, without tying it to a framework. We'll start with what an LLM actually is at inference time, see exactly why it can't remember, and then invent the pieces you need: a conversation buffer (short-term memory), threads, persistence, ways to keep the buffer small, and finally long-term memory that survives across conversations. The next two lessons implement all of this in LangGraph.
+
+## An LLM is a function
+
+At inference time (when you call a trained model, as opposed to training it), an LLM is just a **parameterized mathematical function**:
+
+```text
+y = f(x; θ)
+```
+
+A *parameterized* function is one whose output depends on its input **and** on some extra numbers, the parameters, that you don't supply when you call it.
+
+Linear regression is the friendliest example. A best-fit line is `y = m·x + b`. You supply `x`; the slope `m` and intercept `b` were learned from data during training. You could write it as `y = f(x; m, b)`.
+
+An LLM has exactly the same shape, just enormously bigger:
+
+| Symbol | In linear regression | In an LLM |
+|---|---|---|
+| `f` | a straight line | a deep transformer network |
+| `θ` | two numbers, `m` and `b` | billions of weights ("a 70B model") |
+| `x` | one number | the **input tokens**: your whole prompt |
+| `y` | one number | the **output tokens**: the reply |
+
+Two facts about this equation matter for everything that follows:
+
+- **`θ` is frozen.** It was fixed during training. When you call the model you can't nudge the weights, and nothing you say in a chat changes them.
+- **`x` is the only thing you control.** That's why changing the prompt changes the answer. If you want the model to behave differently, or to know something, it has to be in `x`.
+
+## Stateless by design
+
+A system is **stateless** if its output depends **only on the current input**, not on anything that happened before.
+
+The LLM function is stateless. Call it twice:
+
+```text
+y1 = f(x1; θ)
+y2 = f(x2; θ)
+```
+
+`y2` is computed from `x2` and `θ`. Nothing about `x1` or `y1` takes part. The first call left no trace anywhere: `θ` didn't change, and there's no hidden scratchpad that carries over.
+
+You can watch this happen in a few lines of code:
+
+```python
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model("openai:gpt-4.1-mini")  # reads OPENAI_API_KEY from the environment
+
+print(llm.invoke("Hi, my name is Asha.").content)
+# Hi Asha! Nice to meet you. How can I help?
+
+print(llm.invoke("What is my name?").content)
+# I'm sorry, I don't know your name. You haven't told me.
+```
+
+The second call is a brand-new evaluation of the function. The model genuinely never saw the first message.
+
+<Callout kind="remember">
+An LLM at inference has **no intrinsic memory**. Each call is independent. Whatever it "remembers" must be put back into the input by your code.
+</Callout>
+
+## The memory deadlock
+
+So we're stuck between two facts:
+
+1. **LLMs can't remember.** Statelessness is built into what they are.
+2. **Almost no LLM application works without memory.** A chatbot that treats every message as the first one is frustrating; an agent that forgets which tool calls it already made can't finish a task.
+
+The way out is a third fact: **if the model has no memory, we build memory outside it.** The model sits at the centre, and around it we add ordinary software (variables, databases, retrieval logic) that decides what goes into `x` on every call. That outside system is what everyone means by "LLM memory".
+
+Before inventing it, we need two properties of LLMs that make it possible.
+
+## Two ideas that make memory possible
+
+### The context window
+
+How many tokens can `x` contain? Every model has a limit called the **context window**: the maximum amount of text (input plus output, measured in tokens) the model can process in a single call.
+
+Think of a camera. The model is the camera and the context window is the lens: a narrow lens captures a small part of the scene, a wide one captures much more. Whatever falls outside the frame simply doesn't exist for that shot.
+
+Modern windows are large. Many models accept 128K tokens or more, and some accept a million. 128K tokens is very roughly 90,000 English words, a few hundred pages of text. The useful takeaway: **you can send a lot of text in `x`**, far more than a single question.
+
+### In-context learning
+
+During training, a model absorbs patterns from huge amounts of text, and that knowledge ends up stored in `θ`. This is called **parametric knowledge**.
+
+As models grew, they showed an **emergent ability**: they can also use information that appears **in the prompt itself**, even if they never saw it in training. Paste a 40-page internal policy document into the prompt and ask a question about it, and the model answers from the document. That's **in-context learning**: using knowledge present in the input, in addition to the parametric knowledge in the weights.
+
+Put the two ideas together and the memory design falls out:
+
+- the context window means we **can** fit past conversation into `x`;
+- in-context learning means the model **will use** whatever we put there.
+
+## Short-term memory as a conversation buffer
+
+Here's the trick. On every call, instead of sending only the newest user message, we send **the entire conversation so far**:
+
+```text
+y1 = f(x1; θ)
+y2 = f(x1 + y1 + x2; θ)
+y3 = f(x1 + y1 + x2 + y2 + x3; θ)
+```
+
+When the user asks "What is my name?", the input now contains the earlier message where they said it. The model reads its own context and answers correctly. We never asked the model to remember anything; we just **gave it continuity** by replaying the history every time.
+
+In code, that's a list you keep appending to:
+
+```python
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model("openai:gpt-4.1-mini")
+messages = []  # the conversation buffer
+
+def chat(user_text: str) -> str:
+    messages.append({"role": "user", "content": user_text})
+    reply = llm.invoke(messages)          # send the WHOLE history
+    messages.append(reply)                # remember the model's answer too
+    return reply.content
+
+chat("Hi, my name is Asha.")   # "Nice to meet you, Asha!"
+chat("What is my name?")       # "Your name is Asha."
+```
+
+The `messages` list acts as **state**. The model is still stateless, but the system as a whole (model plus list) is now **stateful**. This list is often called a **conversation buffer**, and this kind of memory is called **short-term memory**.
+
+Why "short-term"? Restart the script and `messages` is empty again: the memory lived in a Python variable, so it's gone. It's temporary, tied to one running conversation.
+
+<LgContextBuilder />
+
+<Callout kind="tip">
+Notice that the model never "remembers" between calls in any of these designs. What changes is **what your code puts into the input**. That's the core of all LLM memory engineering: deciding what goes into the context window on each call.
+</Callout>
+
+## Threads and conversation scope
+
+Chat products organise history into **conversations**: you open a chat, talk about one topic, and leave. Tomorrow you start another chat about something else. The sidebar lists them all.
+
+Short-term memory is **scoped to one conversation**. Each conversation has its own buffer. When you switch conversations, the buffer is swapped: the old conversation's messages leave the context and the new conversation's messages come in.
+
+Why not keep one giant buffer for all of a user's conversations?
+
+- **Size.** A thousand conversations concatenated would blow past any context window.
+- **Coherence.** Mixing a debugging session, a holiday plan and a cover letter into one prompt confuses the model. Clear boundaries keep each conversation focused.
+
+The common name for a conversation in frameworks is a **thread**, identified by a **thread ID**. So you'll often read that **short-term memory is thread-scoped**: it exists only inside one thread. LangGraph uses exactly this vocabulary.
+
+## Problems with short-term memory
+
+The conversation buffer works, but it has three weaknesses, and each one pushes the design forward.
+
+### It is fragile
+
+A buffer that lives in a variable dies with the process. If the server restarts, crashes, or is redeployed, every in-progress conversation loses its context. Even without a crash, the in-variable design breaks when the user switches threads: if you simply clear the list and load the new thread, the old thread's messages are gone when they click back.
+
+The fix is **persistence**: save each thread's messages in a database, keyed by thread ID.
+
+1. While the user chats in thread `t-1`, keep its messages in the buffer **and** write them to the database under `t-1`.
+2. When they open a new chat, create thread `t-2`, start an empty buffer, and save to `t-2` as you go.
+3. When they return to `t-1`, **load its messages from the database** back into the buffer and carry on.
+
+Now the conversation survives restarts and thread switches. In LangGraph this is exactly what a **checkpointer** does: it saves the graph's state per `thread_id` after every step, in memory for experiments or in SQLite or Postgres for real use.
+
+### It overflows the context window
+
+Because every call resends the whole history, the input grows with every turn. A long-running chat with big model replies can eventually exceed the model's context window. What happens then depends on the provider: most APIs **reject the request** with a context-length error, and some silently drop text. Long before the hard limit, quality also degrades. Models attend less reliably to information buried in the middle of very long inputs, and every call costs more tokens and takes longer.
+
+There are two standard remedies, usually combined:
+
+- **Trimming.** Only send the most recent messages that fit within a token budget, for example the last 50 messages instead of all 500. The bet is that the relevant context is mostly recent. The weakness: anything important said early (the user's name, a key constraint) is silently lost.
+- **Summarization.** Before discarding old messages, send them to a model and ask for a **summary**: "Discussed project X; deadline is Friday; user wants feature W." Then send the summary plus the recent messages. The summary is far shorter than the messages it replaces, so the input stays within budget while the gist survives.
+
+The next lesson implements both, plus deleting messages from state outright.
+
+### It is locked inside one thread
+
+This is the deepest limitation, and it's a direct consequence of thread scoping. Three things become impossible:
+
+1. **No continuity of who the user is.** Asha tells the assistant in one chat that she only writes Python, and it switches from Java to Python for the rest of that chat. Two days later, in a new chat, it shows her Java again. Her preference died with the thread.
+2. **Learning never compounds.** In one chat she spends ten minutes coaching it: "use a window function, not a correlated subquery". Next week, with a new table, it writes the slow subquery again. Every new chat starts from zero.
+3. **No reasoning across threads.** "What did we decide last time about the cache TTL?" can't be answered, because last time was a different thread.
+
+With short-term memory alone, **every new conversation makes the user a stranger again**. That rules out the thing people most want from an assistant: personalisation. A good personal assistant knows you and improves with you, and the facts that make that possible arrive scattered across many conversations: your language in one, your job in another, your travel plans in a third.
+
+## Long-term memory
+
+We need a second kind of memory with two properties:
+
+1. **It outlives a single conversation.** It stores information whose usefulness extends beyond one session, possibly for weeks or months. If you're writing a book with an assistant's help, details about the book matter in every chat until the book is done.
+2. **It is selective.** We don't dump whole transcripts into it. We extract the small, **stable, useful, reusable** pieces (facts about the user, how they like things done, what worked and what failed) and ignore the noise.
+
+This is **long-term memory**. Short-term memory lives and dies inside one thread; long-term memory lives **outside** threads, usually scoped to a user (or an organisation, or the agent itself), and is available to every conversation.
+
+## Three kinds of long-term memory
+
+Borrowing terms from psychology, long-term memory usually holds three types of information.
+
+### Semantic memory
+
+**Facts**: what is true about the user, the system or the task. This is the most common and most important type.
+
+- "Asha prefers Python."
+- "Asha is new to Kubernetes."
+- "This project uses Postgres 16."
+- "The travel budget is 40,000 rupees."
+
+Semantic memory answers *"what do I know?"*. It's what lets an assistant personalise answers without being told the same things again.
+
+### Episodic memory
+
+**Past events and experiences**: what happened before, and how it turned out.
+
+- "Last session, the user rejected the Redis-based solution."
+- "The deploy on Tuesday failed because the credentials were wrong."
+- "Approach B fixed the flaky test; approach A didn't."
+
+Episodic memory answers *"what happened last time?"*, *"have we tried this?"*. It improves the current conversation by learning from past ones. A common use is storing a few past interactions as worked examples.
+
+### Procedural memory
+
+**How to do things**: rules, strategies, learned behaviours.
+
+- "When writing SQL for this user, prefer window functions over subqueries."
+- "If tool X fails, retry with tool Y."
+- "Explain things to this user step by step."
+- "The preferred workflow for a release is: tests, changelog, tag, deploy."
+
+Procedural memory answers *"what's the right way to do this here?"*. In practice it often lives in the system prompt, and the agent can update its own instructions as it learns. This is the memory that makes an assistant feel like it has adapted to you.
+
+| Type | Holds | Answers | Example |
+|---|---|---|---|
+| Semantic | Facts | What is true? | User prefers Python |
+| Episodic | Past events | What happened before? | Last deploy failed on credentials |
+| Procedural | Rules and strategies | How should I do this? | Always explain step by step |
+
+<LgMemorySorter />
+
+## How long-term memory works
+
+A long-term memory system runs a four-stage loop.
+
+### Creation
+
+While a conversation happens, something has to ask: **did anything just happen that's worth remembering beyond this conversation?** It looks at user messages, model replies and, in agents, tool outputs. For each candidate it:
+
+1. **Extracts** a memory candidate ("I prefer Python over Java").
+2. **Filters noise**, keeping only the core fact.
+3. **Decides the scope**: is this about the user, the app, or the agent itself?
+4. **Decides the action**: create a new memory, **update** an existing one (the user moved from Pune to Bengaluru), or **ignore** it.
+
+This stage is also called the *update* stage because changing or merging existing memories is as important as adding new ones. Usually an LLM does this extraction, prompted to return structured output.
+
+### Storage
+
+Memories must survive restarts and crashes, so they go into a **durable store**, tagged with identifiers and metadata (user ID, type, timestamps) that make them easy to find later. The right store depends on the memory type and how you'll search it:
+
+| Store | Good for |
+|---|---|
+| Relational DB | Structured profiles (name, plan, settings) |
+| Key-value store | Fast lookups by user and key |
+| Append-only log or file | Episodic history, audit trails |
+| Vector database | Semantic search over many free-text memories |
+
+### Retrieval
+
+When the user sends a message in a **new** conversation, the system decides whether memory could help, searches the store, and brings back a **small, relevant subset**. The guiding question is: *given what's happening right now, what should I recall?*
+
+**Retrieval is selective, not exhaustive.** Short-term memory replays everything; long-term memory is searched. Loading a hundred stored facts into every prompt would waste tokens and distract the model.
+
+### Injection
+
+The model never reads the store directly. Retrieved memories are **injected into the context**, usually into the system prompt or as an extra message, so they become part of the input tokens for this call:
+
+```text
+System: You are a helpful assistant.
+        What you know about this user:
+        - Prefers Python
+        - Teaches backend engineering
+User:   Write me a Fibonacci function.
+```
+
+To the model, memories are just more input tokens. Long-term memory always reaches the model **through short-term memory**, which closes the loop back to the very first insight: memory is about what goes into `x`.
+
+## Why long-term memory is hard
+
+The loop is simple to describe and hard to get right:
+
+1. **Deciding what to remember.** Real chats are noisy. Is "ugh, I hate Mondays" a durable preference? Is "I'm in Goa this week" worth storing, and for how long? Store too little and the assistant stays generic; store too much and memory fills with junk, duplicates and stale facts.
+2. **Deciding what to recall.** With hundreds of memories per user, picking the three that matter for *this* message, in real time and cheaply, is a retrieval problem in its own right.
+3. **Orchestrating it all.** Your agent is already complex. Adding extraction calls, stores, search, deduplication and prompt injection adds moving parts, latency and cost, and all of it has to be engineered and monitored.
+
+## Memory layers and research
+
+Because this is hard, a category of **memory layer** tools has appeared. They handle extraction, storage and retrieval so you can call a few functions instead of building the loop yourself:
+
+- **LangMem**: from the LangChain team; integrates with LangGraph's store and provides memory-extraction and summarization helpers.
+- **Mem0**: a memory layer and managed platform for LLM apps.
+- **Supermemory**: another managed memory API for AI apps.
+
+There's also research on giving models memory of their own instead of bolting it on, for example Google Research's work on architectures (Titans) that learn to memorise at test time. Until such ideas are mainstream, memory is an engineering problem around a stateless model, which is exactly what LangGraph gives you building blocks for: **checkpointers** for short-term memory and **stores** for long-term memory.
+
+## Short-term vs long-term memory
+
+| | Short-term memory | Long-term memory |
+|---|---|---|
+| Scope | One thread (conversation) | Across threads, usually per user |
+| Contents | The raw message history | Extracted facts, events, rules |
+| How it reaches the model | Whole buffer resent each call | Searched, then injected into the prompt |
+| Main risk | Context window overflow | Remembering the wrong things |
+| Remedies | Trimming, deleting, summarizing | Good extraction, dedup, selective retrieval |
+| In LangGraph | Checkpointer + `thread_id` | Store + namespaces |
+
+## Cheat sheet
+
+- At inference an LLM is `y = f(x; θ)`: weights `θ` are frozen, only the input `x` changes.
+- LLMs are **stateless**: each call depends only on its current input.
+- All LLM memory is built **outside** the model by controlling what goes into the context window.
+- **Context window** = how many tokens one call can handle; **in-context learning** = the model uses what's in the prompt.
+- **Short-term memory** = resend the conversation buffer on every call; it is **thread-scoped**.
+- Persist the buffer per **thread ID** in a database so it survives restarts and thread switches.
+- Long buffers overflow: use **trimming** (keep recent) and **summarization** (compress old).
+- Short-term memory can't personalise across conversations; **long-term memory** can.
+- Long-term memory types: **semantic** (facts), **episodic** (past events), **procedural** (how to do things).
+- The loop: **create → store → retrieve → inject**; retrieval is **selective**, and memories reach the model as prompt tokens.
+- Hard parts: what to remember, what to recall, and orchestration; tools like LangMem and Mem0 help.

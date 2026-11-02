@@ -1,0 +1,456 @@
+import { LgReducerLab } from "@/components/widgets/LgReducerLab";
+import { LgGraphStepper } from "@/components/widgets/LgGraphStepper";
+
+## Fan-out and fan-in
+
+In a sequential workflow, every node waits for the one before it. Often that waiting is pointless: if two tasks don't need each other's results, they can run **at the same time**.
+
+A **parallel workflow** has two characteristic shapes:
+
+- **Fan-out**: one node (or `START`) has several outgoing edges, so several nodes start together.
+- **Fan-in**: several nodes have edges into the same node, which combines their results.
+
+```text
+            ┌─→ task_b ─┐
+START → task_a ─┤          ├─→ task_d → END
+            └─→ task_c ─┘
+```
+
+LangGraph runs `task_b` and `task_c` in the **same super-step**, concurrently. With LLM calls that's a real speed-up: three 3-second calls in parallel finish in about 3 seconds, not 9.
+
+This lesson builds two parallel workflows. The first does simple arithmetic, so you can see the mechanics and the one error everybody hits. The second grades an essay with three LLM evaluators and needs two more tools: **structured output** and a **reducer**.
+
+## A batting stats workflow
+
+Given a batter's innings (runs, balls faced, fours and sixes), compute three statistics:
+
+| Statistic | Meaning | Formula |
+|---|---|---|
+| Strike rate | Runs per 100 balls | `runs / balls * 100` |
+| Balls per boundary | How often they hit a four or six | `balls / (fours + sixes)` |
+| Boundary percentage | Share of runs from fours and sixes | `(fours*4 + sixes*6) / runs * 100` |
+
+Each statistic depends only on the inputs, not on the other statistics, so all three can be computed in parallel. A final `summary` node then combines them.
+
+```text
+        ┌─→ strike_rate ────────┐
+START ──┼─→ balls_per_boundary ─┼─→ summary → END
+        └─→ boundary_pct ───────┘
+```
+
+The state holds the four inputs, the three results and the summary:
+
+```python
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class BattingState(TypedDict):
+    runs: int
+    balls: int
+    fours: int
+    sixes: int
+    strike_rate: float
+    balls_per_boundary: float
+    boundary_pct: float
+    summary: str
+```
+
+### The mistake everyone makes first
+
+Suppose you write the nodes in the "modify the state and return it" style:
+
+```python
+def strike_rate(state: BattingState) -> BattingState:
+    state["strike_rate"] = state["runs"] / state["balls"] * 100
+    return state  # the whole state
+
+# balls_per_boundary and boundary_pct written the same way...
+```
+
+Wire it up with fan-out from `START` and fan-in to `summary`, invoke it, and you get:
+
+```text
+InvalidUpdateError: At key 'runs': Can receive only one value per step.
+Use an Annotated key to handle multiple values.
+```
+
+Nothing touched `runs`. Every node only **read** it. So why the complaint?
+
+Because LangGraph can't tell reading from writing by looking at your code; it only sees what you **return**. Each node returned the entire state, so from LangGraph's point of view each of the three nodes **wrote** `runs`, `balls`, `fours`, `sixes` and everything else. Three writes to `runs` arrived in the same super-step. A key with no reducer holds exactly one value, and LangGraph won't guess which of three writes should win, so it stops with an error. (It complains about `runs` simply because that's the first key it checks.)
+
+### The fix is partial updates
+
+Return **only the keys the node computed**:
+
+```python
+def strike_rate(state: BattingState) -> dict:
+    return {"strike_rate": state["runs"] / state["balls"] * 100}
+
+
+def balls_per_boundary(state: BattingState) -> dict:
+    boundaries = state["fours"] + state["sixes"]
+    return {"balls_per_boundary": state["balls"] / boundaries}
+
+
+def boundary_pct(state: BattingState) -> dict:
+    boundary_runs = state["fours"] * 4 + state["sixes"] * 6
+    return {"boundary_pct": boundary_runs / state["runs"] * 100}
+
+
+def summary(state: BattingState) -> dict:
+    text = (
+        f"Strike rate: {state['strike_rate']:.1f}\n"
+        f"Balls per boundary: {state['balls_per_boundary']:.1f}\n"
+        f"Boundary %: {state['boundary_pct']:.1f}"
+    )
+    return {"summary": text}
+```
+
+Now each branch writes a different key, so there's no conflict. Wire the fan-out and fan-in with ordinary edges:
+
+```python
+builder = StateGraph(BattingState)
+builder.add_node("strike_rate", strike_rate)
+builder.add_node("balls_per_boundary", balls_per_boundary)
+builder.add_node("boundary_pct", boundary_pct)
+builder.add_node("summary", summary)
+
+# fan-out: three edges leave START
+builder.add_edge(START, "strike_rate")
+builder.add_edge(START, "balls_per_boundary")
+builder.add_edge(START, "boundary_pct")
+
+# fan-in: three edges arrive at summary
+builder.add_edge("strike_rate", "summary")
+builder.add_edge("balls_per_boundary", "summary")
+builder.add_edge("boundary_pct", "summary")
+
+builder.add_edge("summary", END)
+graph = builder.compile()
+
+print(graph.invoke({"runs": 100, "balls": 50, "fours": 6, "sixes": 4})["summary"])
+# Strike rate: 200.0
+# Balls per boundary: 5.0
+# Boundary %: 48.0
+```
+
+Parallel graphs aren't harder to write than sequential ones; they're the same `add_edge` calls arranged differently. The only new rule is about what nodes return.
+
+<Callout kind="remember">
+**Return only what you changed.** It's correct in sequential graphs and required in parallel ones, so make it your default everywhere. Returning the whole state from parallel branches always fails, because every branch appears to write every key.
+</Callout>
+
+Two small notes on the arithmetic. Strike rate **multiplies** by 100 (100 runs off 50 balls is 200, not 0.02), which is an easy slip when you're also writing a percentage formula. And `balls_per_boundary` divides by zero for an innings with no fours or sixes; production code should return `None` or skip the stat in that case.
+
+Step through the batting graph to see the three nodes share one super-step:
+
+<LgGraphStepper initial="batting" />
+
+## How fan-in waits
+
+Why does `summary` run once, after all three branches, instead of three times? Because of super-steps. All three branches start in super-step 1, and their updates are all applied at the end of it. In super-step 2, `summary` has been triggered and runs once, seeing all three results.
+
+That reasoning depends on the branches being the **same length**. Suppose one branch has an extra step:
+
+```text
+START ─┬─→ fetch_scores → clean_scores ─┐
+       └─→ fetch_profile ───────────────┴─→ join
+```
+
+`fetch_profile` finishes in super-step 1, so `join` is triggered in super-step 2, **alongside** `clean_scores`. Then `clean_scores` finishes and triggers `join` again in super-step 3. `join` runs twice, and the first time it sees no cleaned scores.
+
+You have two ways to make `join` wait for everything:
+
+```python
+# Option 1: one edge from a list of sources. join runs only after ALL have finished.
+builder.add_edge(["clean_scores", "fetch_profile"], "join")
+
+# Option 2: mark the node as deferred. It runs once, after all other pending work.
+builder.add_node("join", join, defer=True)
+```
+
+Use the list form when you know exactly which nodes must finish; use `defer=True` when the branches vary (for example, when a conditional edge decides how many run).
+
+## What a branch can see
+
+Parallel branches don't see each other's work. Every node in a super-step receives the state **as it was at the start of that super-step**. Updates are applied only when the super-step ends.
+
+So if `strike_rate` and `boundary_pct` run together, `boundary_pct` can't read `state["strike_rate"]`; it isn't there yet. Reading it with `state["strike_rate"]` raises a `KeyError`; reading it with `.get` returns `None`. Either way the code is wrong, and it's wrong **every** time, not just under unlucky timing. That's a useful property: LangGraph's super-steps make parallel execution deterministic, so you don't get the "works on my machine" race conditions of hand-rolled threads.
+
+The rule that follows: **if node B needs node A's output, B must come after A**, via an edge. Only nodes that are truly independent belong in the same fan-out.
+
+## When a branch fails
+
+If one branch raises an exception, the whole super-step fails and `invoke` raises; you don't get a final state. The sibling branches that succeeded aren't thrown away entirely: once you add a checkpointer (covered in the persistence lesson), their writes are saved, so retrying the run re-executes only the branch that failed. Until then, handle expected failures **inside** the node, for example by catching a timeout and returning `{"language_feedback": "unavailable", "individual_scores": []}`, so one flaky API call doesn't sink the other two.
+
+## Choosing what to parallelize
+
+Parallelism reduces **latency**, not **cost**. Three evaluator calls cost the same tokens whether they run one after another or all at once; you just wait less. A few practical points:
+
+- **Check for hidden dependencies.** "Summarise the essay" and "score the summary" look like two tasks but are a sequence.
+- **Mind rate limits.** Ten parallel calls to the same provider can trip per-minute limits. Cap how many nodes run at once with the run config, for example `graph.invoke(inputs, {"max_concurrency": 3})`.
+- **Plain functions still run concurrently.** LangGraph runs a super-step's synchronous nodes in a thread pool, which suits I/O-bound work like API calls. For many concurrent calls, write `async def` nodes and use `await graph.ainvoke(...)`.
+- **Keep branches about the same length** when they meet, or use the join techniques above.
+
+## Grading essays in parallel
+
+Now a realistic version. An exam-practice site grades a submitted essay on three aspects, each by its own LLM call, then combines them:
+
+```text
+          ┌─→ evaluate_language ─┐
+START ────┼─→ evaluate_analysis ─┼─→ final_evaluation → END
+          └─→ evaluate_clarity ──┘
+```
+
+- `evaluate_language`: vocabulary, grammar, tone.
+- `evaluate_analysis`: depth of analysis and accuracy of claims.
+- `evaluate_clarity`: clarity of thought and structure.
+
+Each evaluator returns two things: **written feedback** and a **score from 0 to 10**. `final_evaluation` then does two jobs: asks an LLM to merge the three pieces of feedback into one summary, and averages the three scores.
+
+This brings in two new requirements:
+
+1. The evaluators must return feedback and a number **reliably**, in a shape code can use.
+2. Three branches running at once must each add a score to the **same list**.
+
+The first is solved by structured output, the second by a reducer.
+
+## Structured output
+
+If you just prompt "give feedback and a score out of 10", the model will comply most of the time. But sometimes the score arrives as "Score: 7/10", "seven", or buried in the middle of a paragraph. Your averaging code can't do arithmetic on "seven". When code depends on an LLM's answer, the answer needs a **schema**.
+
+**Structured output** means you give the model a schema and it returns an object matching it. Define the schema with Pydantic:
+
+```python
+from pydantic import BaseModel, Field
+
+class Evaluation(BaseModel):
+    feedback: str = Field(description="Detailed, specific feedback on this aspect of the essay")
+    score: int = Field(ge=0, le=10, description="Score out of 10")
+```
+
+The `description` strings are sent to the model as part of the schema, so make them informative; they guide the model like a mini-prompt. `ge=0, le=10` constrains the range, and Pydantic validates it.
+
+Then wrap the model:
+
+```python
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+
+load_dotenv()
+model = init_chat_model("openai:gpt-4.1-mini")
+evaluator_model = model.with_structured_output(Evaluation)
+```
+
+`with_structured_output` returns a new runnable. Invoking it gives back an `Evaluation` **object**, not a message:
+
+```python
+result = evaluator_model.invoke(
+    "Evaluate the language quality of this essay. Give feedback and a score out of 10.\n\n"
+    + essay_text
+)
+print(result.score)     # 8
+print(result.feedback)  # 'Vocabulary is varied and precise; a few long sentences...'
+```
+
+A classic slip is invoking the plain `model` instead of `evaluator_model`. You get an ordinary text reply and `.score` doesn't exist. Keep both around and use each deliberately: the structured one where code needs fields, the plain one where you want prose.
+
+## A reducer for the scores
+
+Here's the state for the grader:
+
+```python
+import operator
+from typing import Annotated, TypedDict
+
+class EssayState(TypedDict):
+    essay: str
+    language_feedback: str
+    analysis_feedback: str
+    clarity_feedback: str
+    overall_feedback: str
+    individual_scores: Annotated[list[int], operator.add]
+    average_score: float
+```
+
+The three feedback keys are separate, so each branch writes its own key, the same way the batting stats did. But the scores go into **one** list, `individual_scores`, because `final_evaluation` wants to average a list. That means three branches write the **same key** in the **same super-step**.
+
+Without a reducer that's exactly the `InvalidUpdateError` you saw earlier, now on `individual_scores`. LangGraph doesn't silently keep the last write; it refuses. You have to say how simultaneous writes should combine.
+
+`Annotated[list[int], operator.add]` says it: "when updates arrive for this key, combine them with `+`". A reducer is a two-argument function, `reducer(current_value, update)`, and `operator.add` is just the function version of the `+` operator (you can't pass a bare `+` as an argument). For lists, `+` concatenates:
+
+```text
+current:            []
+evaluate_analysis:  [] + [8]       = [8]
+evaluate_clarity:   [8] + [6]      = [8, 6]
+evaluate_language:  [8, 6] + [7]   = [8, 6, 7]
+```
+
+So each evaluator returns its score **wrapped in a one-item list**, `{"individual_scores": [result.score]}`, and the reducer stitches the three together. If you returned a bare `8`, `+` would try to add an int to a list and fail.
+
+Two details worth knowing:
+
+- **Order.** The combined list has a deterministic order, but it's not the order you added the edges, and not necessarily the order the calls finished. That's fine for an average. If you need to know which score belongs to which aspect, don't rely on position; see the dict variant below.
+- **Any function works.** `operator.add` is the common case. You can write your own, for example `def keep_max(a, b): return max(a, b)`, and use `Annotated[int, keep_max]`.
+
+Try every combination in the lab below. Notice that in a **sequential** graph, a missing reducer fails silently (earlier scores just vanish), while in a **parallel** graph it fails loudly. Notice too what happens when a node returns the whole list it already saw *and* the key has an append reducer.
+
+<LgReducerLab />
+
+<Callout kind="warn">
+With an append reducer, return **only the new items**. A node that returns the full list it read (old items plus its new one) gets the old items appended a second time, and your list fills with duplicates.
+</Callout>
+
+## Building the grader
+
+With the schema and state ready, the three evaluators are near-copies. Each reads the essay, calls the structured model, and returns its own feedback key plus a one-item score list:
+
+```python
+def evaluate_language(state: EssayState) -> dict:
+    prompt = (
+        "Evaluate the LANGUAGE quality of this essay: vocabulary, grammar and tone. "
+        "Give detailed feedback and a score out of 10.\n\n" + state["essay"]
+    )
+    result = evaluator_model.invoke(prompt)
+    return {"language_feedback": result.feedback, "individual_scores": [result.score]}
+
+
+def evaluate_analysis(state: EssayState) -> dict:
+    prompt = (
+        "Evaluate the DEPTH OF ANALYSIS of this essay: insight, evidence and accuracy. "
+        "Give detailed feedback and a score out of 10.\n\n" + state["essay"]
+    )
+    result = evaluator_model.invoke(prompt)
+    return {"analysis_feedback": result.feedback, "individual_scores": [result.score]}
+
+
+def evaluate_clarity(state: EssayState) -> dict:
+    prompt = (
+        "Evaluate the CLARITY OF THOUGHT in this essay: structure, logic and focus. "
+        "Give detailed feedback and a score out of 10.\n\n" + state["essay"]
+    )
+    result = evaluator_model.invoke(prompt)
+    return {"clarity_feedback": result.feedback, "individual_scores": [result.score]}
+```
+
+`final_evaluation` uses the **plain** model for the summary, since it wants free text and no score, and computes the average itself. There's no reason to ask an LLM to do arithmetic Python can do exactly:
+
+```python
+def final_evaluation(state: EssayState) -> dict:
+    prompt = (
+        "Combine these three pieces of feedback into one concise summary for the student.\n"
+        f"Language: {state['language_feedback']}\n"
+        f"Analysis: {state['analysis_feedback']}\n"
+        f"Clarity: {state['clarity_feedback']}"
+    )
+    overall = model.invoke(prompt).content
+    scores = state["individual_scores"]
+    return {"overall_feedback": overall, "average_score": sum(scores) / len(scores)}
+```
+
+Wiring is the same fan-out and fan-in as before:
+
+```python
+builder = StateGraph(EssayState)
+for name, fn in [
+    ("evaluate_language", evaluate_language),
+    ("evaluate_analysis", evaluate_analysis),
+    ("evaluate_clarity", evaluate_clarity),
+]:
+    builder.add_node(name, fn)
+    builder.add_edge(START, name)
+    builder.add_edge(name, "final_evaluation")
+
+builder.add_node("final_evaluation", final_evaluation)
+builder.add_edge("final_evaluation", END)
+
+grader = builder.compile()
+```
+
+Run it on an essay. You only need to pass the `essay`; the reducer starts `individual_scores` from an empty list.
+
+```python
+result = grader.invoke({"essay": essay_text})
+
+print(result["individual_scores"])  # e.g. [8, 8, 7]
+print(result["average_score"])      # 7.67
+print(result["overall_feedback"])
+```
+
+A good test is to feed it something deliberately weak: short, unstructured, full of grammar mistakes. All three scores, and the average, should drop sharply. If one evaluator still scores it highly, its prompt is too vague, and the per-aspect feedback tells you which one.
+
+### Making the evaluators trustworthy
+
+LLM graders are only as consistent as their instructions. Three cheap improvements:
+
+- **Put the rubric in the prompt.** "8 to 10: precise vocabulary, no grammatical errors; 5 to 7: minor errors that don't impede reading; below 5: errors that obscure meaning" gives the model anchors instead of vibes.
+- **Ask for feedback before the score.** Declaring `feedback` first in the schema nudges the model to reason about the essay and then settle on a number consistent with what it wrote.
+- **Keep the three prompts parallel in structure.** If only one evaluator has a rubric, its scores won't be comparable with the others, and the average mixes different scales.
+
+Because the three evaluators are independent nodes, you can improve one without touching the others, and `stream(..., stream_mode="updates")` shows each one's output separately when you're tuning them.
+
+### Watching the branches
+
+Streaming updates shows the parallel structure directly:
+
+```python
+for update in grader.stream({"essay": essay_text}, stream_mode="updates"):
+    for node, data in update.items():
+        print(node, data.get("individual_scores"))
+
+# the three evaluator lines can come in any order
+# evaluate_analysis [8]
+# evaluate_clarity [8]
+# evaluate_language [7]
+# final_evaluation None
+```
+
+Each evaluator's update arrives as its own chunk, containing only its one-item list; the combined list exists only in the state. `final_evaluation` appears once, after all three, which is the fan-in working as intended. If you ever see the join node appear twice, revisit the section on uneven branches.
+
+### Keeping scores labelled
+
+Averaging doesn't care which score is which, but a results page might ("Language: 7, Analysis: 8, Clarity: 8"). Instead of a list, collect a dict and merge with a small custom reducer:
+
+```python
+def merge_dicts(current: dict, update: dict) -> dict:
+    return {**current, **update}
+
+class EssayState(TypedDict):
+    essay: str
+    scores: Annotated[dict[str, int], merge_dicts]
+    # ...feedback keys as before
+
+# in evaluate_language:
+#     return {"language_feedback": result.feedback, "scores": {"language": result.score}}
+```
+
+Each branch adds its own labelled entry, and the order question disappears.
+
+## When branches aren't known in advance
+
+Everything in this lesson used a **fixed** fan-out: three evaluators, wired at build time, run for every essay. That's the parallelization pattern from the core-concepts lesson.
+
+The orchestrator-workers pattern needs something more: the number and kind of branches decided at run time, for example one research worker per sub-question an LLM came up with. LangGraph supports that too. A conditional edge can return a list of node names to run several branches chosen by the state (the next lesson shows this), and the `Send` API can launch the same node many times with different inputs, one per sub-task. Both rest on exactly what you learned here: branches in a shared super-step, partial updates, and a reducer to collect the results.
+
+## Parallelism, summarised
+
+| Situation | What to do |
+|---|---|
+| Branches compute different things | Give each its own key; no reducer needed |
+| Branches contribute to one collection | One key with a reducer (`operator.add` for lists, a merge for dicts) |
+| Any node in a parallel branch | Return only the keys it changed |
+| Branches of unequal length meet | `add_edge([...], "join")` or `add_node(..., defer=True)` |
+| Code needs fields from an LLM | `with_structured_output(Schema)` |
+
+## Cheat sheet
+
+- **Fan-out**: several `add_edge` calls from one node; **fan-in**: several edges into one node.
+- Parallel nodes run in the **same super-step**, concurrently.
+- Returning the whole state from parallel branches raises **`InvalidUpdateError`**: every key looks written.
+- **Return only the keys you changed**, in every graph.
+- Two branches may write the same key only if it has a **reducer**; without one, LangGraph errors instead of picking a winner.
+- `Annotated[list[int], operator.add]` appends; return **one-item lists**, never the full list.
+- Don't rely on the **order** of reducer-combined results; use a dict with a merge reducer when labels matter.
+- Unequal branches: `add_edge(["a", "b"], "join")` or `defer=True` so the join runs once.
+- `model.with_structured_output(PydanticModel)` returns validated objects; describe fields well.
+- Use the **plain model** for free text and **Python** for arithmetic.

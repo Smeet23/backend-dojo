@@ -1,0 +1,257 @@
+import { LgStreamModes } from "@/components/widgets/LgStreamModes";
+
+## The blank-screen problem
+
+Open the Streamlit chatbot from the last lecture and ask for something long: "Write a 500-word blog post about test cricket." The page sits blank for five to ten seconds, then the whole post appears at once.
+
+Two things are wrong with that:
+
+- **The wait feels broken.** You know the model is working. A less technical user just sees nothing happening and assumes the app froze. Some will reload or leave.
+- **A wall of text is hard to read.** Getting 500 words dropped on you at once is harder to follow than watching them arrive.
+
+Every popular assistant avoids this by showing the answer **as it's being written**, word by word, like a typewriter. That's **streaming**, and adding it barely changes your code.
+
+## What streaming is
+
+A language model generates text one **token** at a time (a token is roughly a word or word-piece). Without streaming, the API waits for the last token, then returns the complete response. With streaming, it **sends each token as soon as it's generated**, and your code receives a sequence of small chunks instead of one big result.
+
+```
+Without streaming:  [ ......... 8 s of nothing ......... ] → full answer
+With streaming:     Test → cricket → is → the → oldest → ... (first word after ~0.4 s)
+```
+
+The **total** time is about the same. The model does the same work either way. What changes is **time to first token**: how long until the user sees *something*. That's the delay people actually notice.
+
+## Why streaming matters
+
+- **Faster perceived response.** Text starts appearing in well under a second, so the app feels responsive even when the full answer takes ten.
+- **It feels like a conversation.** Text arriving at reading speed feels like someone is talking to you. It builds trust and keeps people engaged.
+- **Voice and multimodal apps depend on it.** A voice assistant that waits for the complete answer before speaking has an awkward silence after every question. Streaming lets text-to-speech start on the first sentence.
+- **Long outputs are easier to follow.** Watching code or a long explanation build up line by line is easier than parsing a finished block.
+- **Users can stop early.** If the answer is heading the wrong way, the user can cancel it. The model stops generating, and since you pay per token, cancelled tokens are money saved.
+- **Progress for agents.** Streaming isn't only for model text. An agent booking a ticket can report each step ("opened the cinema site", "picked seats", "paying") instead of going silent for a minute.
+
+## Python generators in one minute
+
+LangGraph's streaming API returns a **generator**, so you need to know what that is.
+
+A normal function computes everything and `return`s once. A **generator function** uses `yield` to hand back values one at a time, pausing between them. Calling it gives you a generator object; looping over it runs the function up to each `yield`:
+
+```python
+def countdown(n):
+    while n > 0:
+        yield n          # hand back one value, pause here
+        n -= 1
+
+for x in countdown(3):
+    print(x)             # 3, then 2, then 1
+```
+
+Values are produced **lazily**: the next one isn't computed until you ask for it. That's exactly the shape of a stream. You loop over it, and each iteration hands you the next chunk as soon as it exists.
+
+## From invoke to stream
+
+Every compiled graph has `stream()` alongside `invoke()`. Same input, same config, plus a `stream_mode` that chooses **what** gets streamed:
+
+```python
+from langchain_core.messages import HumanMessage
+from chat_backend import chatbot
+
+config = {"configurable": {"thread_id": "demo-1"}}
+inputs = {"messages": [HumanMessage(content="Give me a pasta recipe in 5 steps.")]}
+
+stream = chatbot.stream(inputs, config=config, stream_mode="messages")
+print(type(stream))   # <class 'generator'>
+```
+
+Nothing has run yet. The graph runs as you loop over it.
+
+### The stream modes
+
+| `stream_mode` | Each chunk is | Typical use |
+|---|---|---|
+| `"values"` | The **full state** after each super-step | Watching the whole state evolve; debugging |
+| `"updates"` | `{node_name: what_that_node_returned}` | Progress ("retrieve finished"), cheap step-by-step output |
+| `"messages"` | A `(message_chunk, metadata)` tuple per **LLM token** | Typewriter effect in chat UIs |
+| `"custom"` | Anything a node sends via `get_stream_writer()` | Your own progress messages or partial results |
+| `"debug"` | Detailed checkpoint and task events | Deep debugging |
+
+For a chatbot, `"messages"` is the one you want.
+
+### Messages mode
+
+Each item is a pair: the **chunk** (an `AIMessageChunk` holding a few characters in `.content`) and **metadata** describing where it came from.
+
+```python
+for chunk, metadata in chatbot.stream(inputs, config=config, stream_mode="messages"):
+    if chunk.content:
+        print(chunk.content, end="", flush=True)
+```
+
+```
+1. Boil salted water... 2. Add the pasta...      (appearing a few characters at a time)
+```
+
+- `end=""` stops `print` adding a newline after every token, and `flush=True` pushes each one to the screen immediately.
+- `if chunk.content` skips empty chunks. Some chunks carry no text, for example the start or end of a message, or pieces of a tool call when the model decides to use a tool.
+
+Your `chat_node` still calls `llm.invoke(...)`, not a streaming method. You don't need to change it. In `"messages"` mode LangGraph hooks into the model call and forwards tokens as they arrive. When the run finishes, the node's return value is merged into the state as usual, and with a checkpointer the **complete** `AIMessage` is saved. Streaming changes what you see during the run, not what's stored.
+
+### Filtering by node
+
+The `metadata` dict tells you which node produced each token, in `metadata["langgraph_node"]`. That matters as soon as more than one node calls a model. Suppose a graph first rewrites the user's question with an LLM, then answers it. In `"messages"` mode **both** nodes' tokens come through, and without a filter the rewritten query would appear in the chat bubble before the answer:
+
+```python
+for chunk, metadata in graph.stream(inputs, config=config, stream_mode="messages"):
+    if chunk.content and metadata["langgraph_node"] == "answer":
+        print(chunk.content, end="", flush=True)
+```
+
+You can also filter by **tags**: create a model with `init_chat_model(..., tags=["final_answer"])` and check `metadata["tags"]`. Or tag an internal model with `"nostream"` to keep its tokens out of `"messages"` mode altogether.
+
+### Updates and values
+
+These two stream **state**, not tokens. On the chatbot, `"updates"` yields one chunk per node:
+
+```python
+for update in chatbot.stream(inputs, config=config, stream_mode="updates"):
+    print(update)
+# {'chat_node': {'messages': [AIMessage(content='1. Boil salted water...')]}}
+```
+
+`"values"` yields the whole state after each step, starting with the input:
+
+```python
+for state in chatbot.stream(inputs, config=config, stream_mode="values"):
+    print(len(state["messages"]), state["messages"][-1].type)
+# 1 human   (with a new thread; on an existing thread the count includes history)
+# 2 ai
+```
+
+Neither gives a typewriter effect: the reply arrives in one piece when the node finishes. They're the right tool when you care about **steps**, like a multi-node workflow reporting "researching", "drafting", "reviewing".
+
+### Custom progress events
+
+When you want to report something that isn't state or tokens, use the stream writer inside a node:
+
+```python
+from langgraph.config import get_stream_writer
+
+def search_docs(state):
+    writer = get_stream_writer()
+    writer({"status": "Searching the changelog…"})
+    results = run_search(state["query"])   # your search function
+    writer({"status": f"Found {len(results)} matching entries"})
+    return {"results": results}
+
+for event in graph.stream(inputs, config=config, stream_mode="custom"):
+    print(event["status"])
+```
+
+### Several modes at once
+
+Pass a list and each item becomes a `(mode, chunk)` pair, so one loop can drive both a progress line and the typewriter text:
+
+```python
+for mode, chunk in graph.stream(inputs, config=config, stream_mode=["custom", "messages"]):
+    if mode == "custom":
+        print(f"\n[{chunk['status']}]")
+    else:
+        token, metadata = chunk
+        if token.content and metadata["langgraph_node"] == "answer":
+            print(token.content, end="", flush=True)
+```
+
+<Callout kind="tip">
+Recent LangGraph versions also accept `version="v2"` on `stream()`. Every chunk then has the same shape, a dict with `type`, `ns` and `data` keys, whatever modes you combine. The default output shown above still works. In async code (FastAPI, for example) use `async for chunk in graph.astream(...)` with the same arguments.
+</Callout>
+
+<LgStreamModes />
+
+## Streaming in the Streamlit UI
+
+Back to the chatbot's frontend. Streamlit has an element made for this: **`st.write_stream(stream)`** takes a generator (or any iterable), writes each string chunk to the page with a typewriter effect, and **returns the full text** when the stream ends.
+
+So the job is to turn LangGraph's `(chunk, metadata)` tuples into a generator of plain strings. A small generator function does it:
+
+```python
+def reply_tokens(user_input: str):
+    for chunk, metadata in chatbot.stream(
+        {"messages": [HumanMessage(content=user_input)]},
+        config=CONFIG,
+        stream_mode="messages",
+    ):
+        if chunk.content and metadata["langgraph_node"] == "chat_node":
+            yield chunk.content
+```
+
+Then, in the frontend, replace the `invoke` call and the line that displayed the reply:
+
+```python
+user_input = st.chat_input("Type here")
+if user_input:
+    st.session_state["message_history"].append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    with st.chat_message("assistant"):
+        ai_message = st.write_stream(reply_tokens(user_input))
+
+    st.session_state["message_history"].append({"role": "assistant", "content": ai_message})
+```
+
+Three details:
+
+- The stream must be written **inside** `with st.chat_message("assistant"):` so the tokens land in the assistant's bubble.
+- `st.write_stream` returns the complete reply (a string, when every chunk was text). Store **that** in session state, so the next rerun can redraw it as a normal message. Without this, the reply would vanish on the next interaction.
+- Pass the real `user_input` to the generator. Hard-coding a test prompt there is an easy mistake to make while experimenting: the bot then answers the same question whatever the user types.
+
+The backend doesn't change at all. The same compiled graph serves `invoke` and `stream`, and the checkpointer still saves each finished turn, so memory keeps working.
+
+<Callout kind="warn">
+Some model providers return `content` as a **list of content blocks** rather than a string, especially when the model mixes text with tool calls or reasoning. If you switch providers and see lists or empty strings in your stream, extract the text blocks in your generator before yielding. Yield strings to `st.write_stream`; other types are rendered with `st.write` instead of the typewriter effect.
+</Callout>
+
+## Showing steps, not just tokens
+
+For a multi-step graph, tokens alone don't tell the user much while the early nodes are working. Streamlit's `st.status` draws a collapsible box with a label that you can update as each node finishes, which pairs naturally with `"updates"` mode:
+
+```python
+LABELS = {"rewrite_query": "Understood your question", "search": "Searched the docs", "answer": "Wrote the answer"}
+
+with st.status("Working…", expanded=True) as status:
+    for update in graph.stream(inputs, config=CONFIG, stream_mode="updates"):
+        for node_name in update:
+            st.write(LABELS.get(node_name, node_name))
+    status.update(label="Done", state="complete", expanded=False)
+```
+
+Each `update` is a dict keyed by the node that just finished, so the box fills with one line per completed step. For a step-by-step view **and** typing, combine `["updates", "messages"]` and send each kind to its own place: step lines into the status box, tokens into the assistant bubble.
+
+## Stopping a stream early
+
+Because a stream is a generator, the consumer controls it. Breaking out of the loop stops asking for more chunks:
+
+```python
+for i, (chunk, metadata) in enumerate(chatbot.stream(inputs, config=config, stream_mode="messages")):
+    print(chunk.content, end="", flush=True)
+    if i > 200:
+        break                     # stop reading
+```
+
+Once the stream is closed, LangGraph schedules no further steps. How quickly an in-flight model call is cut off depends on how the graph is being run. Async code that cancels the `astream` task, which is what web servers do when a client disconnects, is the reliable way to stop generation and stop paying for tokens. In a web app the trigger is usually the user clicking "Stop" or closing the page. Two consequences:
+
+- A cancelled run never reaches the end of the node, so the partial reply is **not** written to the state. If you want to keep what the user saw, save it yourself.
+- Anything after the cancelled node doesn't run. Don't put "must happen" bookkeeping after a step the user can cancel.
+
+## Cheat sheet
+
+- Streaming sends tokens as they're generated; total time stays about the same, time to first token drops sharply.
+- Benefits: responsive feel, conversational UX, voice apps, readable long output, cancel early to save tokens, live agent progress.
+- `graph.stream(inputs, config, stream_mode=...)` returns a generator; the graph runs as you iterate.
+- `"values"` gives full state per step, `"updates"` gives each node's return, `"messages"` gives LLM tokens, `"custom"` gives your own events.
+- Messages mode yields `(chunk, metadata)`; print `chunk.content` and skip empty chunks.
+- Filter tokens with `metadata["langgraph_node"]` (or tags) when several nodes call models.
+- Nodes keep calling `llm.invoke`; LangGraph forwards tokens in messages mode, and the full message is still checkpointed.
+- A list of modes yields `(mode, chunk)` pairs; `get_stream_writer()` emits custom events from inside a node.
+- In Streamlit, call `st.write_stream(generator)` inside the assistant bubble and save its return value to session state.

@@ -1,0 +1,390 @@
+import { LgChatMemory } from "@/components/widgets/LgChatMemory";
+
+## Where this chatbot is heading
+
+The workflows so far ran once and finished: give them a topic, get an answer. A chatbot is different. It's a **conversation**: the same user sends message after message, and each reply only makes sense in light of what came before.
+
+Over the next several lectures one chatbot grows step by step. It gets memory, a web UI, streaming, multiple conversations, a database, tracing, tools, retrieval and human approval. This lecture builds the core, a chat graph that talks to a model and remembers the conversation. It also explains, precisely, why the obvious first version forgets everything.
+
+## The shape of a chat graph
+
+A minimal chatbot is the simplest graph you'll ever write: one node.
+
+```
+START → chat_node → END
+```
+
+The user's message enters at `START`. `chat_node` sends the conversation to a model and gets a reply. The graph ends. For the next message, the graph runs again from the top.
+
+So the "loop" of a conversation isn't inside the graph. It's outside, in whatever drives the graph: a `while` loop in a terminal, or a web page that calls the graph each time the user hits Enter. The graph handles **one turn**.
+
+Why not put the conversation loop inside the graph, with an edge from `chat_node` back to a "wait for the user" node? Because waiting for a human is not something a node can do by blocking. The user might reply in five seconds or five days, and you can't keep a run open that long. LangGraph's answer is to finish the run (or pause it with an interrupt, which comes later) and start or resume a run when the next message arrives. "One run per turn" is the natural shape for chat, and it's how every UI you'll build drives the graph: an HTTP request, a Streamlit rerun or a message from Slack each trigger one `invoke`.
+
+The interesting part isn't the graph. It's the **state**.
+
+## What the state holds
+
+Ask what data a chatbot can't live without: the messages. Every user message and every model reply, in order. That list *is* the conversation, and it's what you send to the model so it has context.
+
+So the state has one key, `messages`, holding a list of message objects.
+
+### Message types
+
+LangChain represents each turn as a typed message object rather than a plain string:
+
+| Class | Who produced it | Example |
+|---|---|---|
+| `HumanMessage` | The user | "What's the capital of Portugal?" |
+| `AIMessage` | The model | "Lisbon." |
+| `SystemMessage` | You, the developer: instructions for the model | "You are a concise travel assistant." |
+| `ToolMessage` | A tool's result, fed back to the model | `{"temp_c": 21}` |
+
+All of them inherit from `BaseMessage`. Typed messages matter because chat models are trained on role-tagged turns, and the role decides how the model treats the text. A list of plain strings would lose that.
+
+For type hints you'll see two options:
+
+- `list[BaseMessage]`: the common base class.
+- `list[AnyMessage]`: a union of the concrete message types. The LangGraph docs use it, and it plays better with serialization and type checkers.
+
+Either works; we'll use `AnyMessage`.
+
+## Why the messages key needs a reducer
+
+By default a state key is **overwritten** by whatever a node returns. For a chatbot that would be a disaster. The user says "Hi, I'm Nitya", the model replies, and that reply *replaces* the user's message. By the third turn the state holds only the latest message.
+
+You saw the fix in earlier lectures: a reducer that **merges** updates instead of replacing. You could use `operator.add`, which concatenates lists. LangGraph ships a better one for messages, `add_messages`:
+
+```python
+from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
+class ChatState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+```
+
+`add_messages` appends new messages, like `operator.add`, but it also understands what messages are:
+
+| Behaviour | `operator.add` | `add_messages` |
+|---|---|---|
+| Append new messages | Yes | Yes |
+| Accept dicts like `{"role": "user", "content": "hi"}` | No, they stay plain dicts | Converts them to message objects |
+| Give every message an `id` | No | Yes |
+| A message with an **existing id** | Appended as a duplicate | **Replaces** the old one |
+| Delete a message (`RemoveMessage`) | Not possible | Supported |
+
+The id-based replace matters later: it's how a human can edit a model message, and how memory-trimming code removes old messages. Use `add_messages` for any list of chat messages.
+
+<Callout kind="tip">
+LangGraph also ships a ready-made state, `MessagesState`, which is exactly a `messages` key with `add_messages`. `class ChatState(MessagesState): ...` gives you that key, and you add your own fields alongside it.
+</Callout>
+
+## The chat node
+
+The node reads the conversation from the state, sends it to the model and returns the reply.
+
+```python
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model("openai:gpt-4.1-mini")   # reads OPENAI_API_KEY from the environment
+
+def chat_node(state: ChatState) -> dict:
+    response = llm.invoke(state["messages"])    # an AIMessage
+    return {"messages": [response]}
+```
+
+Two details:
+
+- The model receives the **whole list**, not just the latest message. That list is the model's entire knowledge of the conversation. Models are stateless; they only "remember" what you send them.
+- The node returns `[response]`, a one-item list. `add_messages` merges that into the existing list. You return the **new** messages only, never the full history.
+
+### Adding a system prompt
+
+To give the bot a persona, prepend a `SystemMessage` when you call the model instead of storing it in the state:
+
+```python
+from langchain_core.messages import SystemMessage
+
+SYSTEM = SystemMessage(content="You are a friendly assistant. Answer in at most three sentences.")
+
+def chat_node(state: ChatState) -> dict:
+    response = llm.invoke([SYSTEM, *state["messages"]])
+    return {"messages": [response]}
+```
+
+The persona applies to every turn, can be changed in code at any time, and doesn't clutter the saved conversation.
+
+## Building and testing one turn
+
+```python
+from langgraph.graph import StateGraph, START, END
+from langchain_core.messages import HumanMessage
+
+builder = StateGraph(ChatState)
+builder.add_node("chat_node", chat_node)
+builder.add_edge(START, "chat_node")
+builder.add_edge("chat_node", END)
+
+chatbot = builder.compile()
+
+result = chatbot.invoke({"messages": [HumanMessage(content="What's the capital of Portugal?")]})
+for m in result["messages"]:
+    m.pretty_print()
+```
+
+```
+================================ Human Message =================================
+What's the capital of Portugal?
+================================== Ai Message ==================================
+The capital of Portugal is Lisbon.
+```
+
+`invoke` returns the **final state**, so `result["messages"]` holds both messages: the one you sent and the reply the reducer appended. The reply alone is the last element:
+
+```python
+answer = result["messages"][-1].content
+```
+
+### What's inside a message
+
+Each message object carries more than its text. Printing the reply's attributes shows what you have to work with:
+
+```python
+reply = result["messages"][-1]
+print(reply.type)             # 'ai'
+print(reply.content)          # 'The capital of Portugal is Lisbon.'
+print(reply.id)               # a unique string id, used by add_messages
+print(reply.usage_metadata)   # {'input_tokens': 14, 'output_tokens': 8, 'total_tokens': 22}
+```
+
+- `type` is `"human"`, `"ai"`, `"system"` or `"tool"`. It's handy when you render a conversation and need to know who said what.
+- `id` is what lets `add_messages` recognise a message it has already seen.
+- `usage_metadata` reports token counts for model replies. Watch it grow as a conversation gets longer; that's your bill.
+
+## Making it conversational
+
+One question and done isn't a chatbot. Wrap the graph in a loop that keeps asking for input until the user types an exit word:
+
+```python
+EXIT_WORDS = {"exit", "quit", "bye"}
+
+while True:
+    user_text = input("You: ")
+    if user_text.strip().lower() in EXIT_WORDS:
+        break
+
+    result = chatbot.invoke({"messages": [HumanMessage(content=user_text)]})
+    print("Bot:", result["messages"][-1].content)
+```
+
+`strip().lower()` tolerates "Bye " and "QUIT". It looks like a chatbot now. Try this conversation:
+
+```
+You: Hi, I'm Nitya.
+Bot: Nice to meet you, Nitya! How can I help?
+You: What's my name?
+Bot: I'm sorry, I don't have access to personal information like your name.
+You: What is 10 + 100?
+Bot: 110.
+You: Now multiply that by 2.
+Bot: Could you tell me which number you'd like me to multiply by 2?
+```
+
+It answers each question on its own, but it has no idea what was said a moment ago.
+
+## Why it forgets
+
+The code looks right: the state has a `messages` list and a reducer that appends. So why doesn't the history accumulate?
+
+Look at what each `invoke` actually does:
+
+1. **Turn 1.** `invoke` starts a fresh run with state `{"messages": [Hi, I'm Nitya]}`. The node appends the reply, so the state now has 2 messages. The run reaches `END`, returns the final state, and **that state is discarded**.
+2. **Turn 2.** `invoke` starts another fresh run, with state `{"messages": [What's my name?]}`. Only one message. The reducer appends to *this run's* list, which starts empty apart from your input.
+
+The reducer merges updates **within a single run**. Nothing carries state **between runs**. Each `invoke` is a new, independent execution, and when it ends its state is gone. The model never saw the name because that message was never sent to it again.
+
+<Callout kind="remember">
+A graph's state lives for one execution only. Your `while` loop calls `invoke` many times, so it starts many separate executions. To remember across turns, something has to save the state at the end of one run and load it at the start of the next.
+</Callout>
+
+### The manual workaround, and why not to stop there
+
+You *could* keep the history yourself: hold a Python list outside the graph, append each message, and pass the whole list to every `invoke`. That works for a single-user script. But then you're building your own storage layer. You'd have to keep a separate list per user, persist it to a database so it survives restarts, and you'd still lack resuming after crashes, pausing for approval or rewinding to earlier points. LangGraph has a built-in mechanism that does all of this: **persistence**.
+
+## Persistence in two lines
+
+Persistence means: when a run finishes, **save** its state; when the next run starts for the same conversation, **load** it first. LangGraph does this with a **checkpointer**, an object that saves the state as the graph runs. The next lecture covers how checkpointers work inside. Here's the minimum to fix the chatbot:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+checkpointer = InMemorySaver()
+chatbot = builder.compile(checkpointer=checkpointer)
+```
+
+`InMemorySaver` keeps saved states in a Python dict in RAM. It's ideal for learning and tests. Production uses a database-backed checkpointer such as SQLite or Postgres.
+
+### Threads
+
+One chatbot serves many conversations: Nitya's chat, Arjun's chat, Nitya's second chat about a different topic. The checkpointer has to know which saved state belongs to which conversation. That key is the **thread id**: each conversation gets its own id, and state is saved and loaded per thread.
+
+You pass it on every call through the `config` argument:
+
+```python
+config = {"configurable": {"thread_id": "nitya-chat-1"}}
+
+while True:
+    user_text = input("You: ")
+    if user_text.strip().lower() in EXIT_WORDS:
+        break
+
+    result = chatbot.invoke(
+        {"messages": [HumanMessage(content=user_text)]},
+        config=config,
+    )
+    print("Bot:", result["messages"][-1].content)
+```
+
+Note the nesting: `configurable` is a dict inside `config`, and `thread_id` sits inside that. A typo there and LangGraph complains that a checkpointer needs a thread id.
+
+The same conversation now goes:
+
+```
+You: Hi, I'm Nitya.
+Bot: Nice to meet you, Nitya!
+You: What's my name?
+Bot: Your name is Nitya.
+You: What is 10 + 100?
+Bot: 110.
+You: Now multiply that by 2.
+Bot: 110 × 2 = 220.
+```
+
+### What happens behind the scenes
+
+On turn 2, with a checkpointer and `thread_id="nitya-chat-1"`:
+
+1. LangGraph looks up the latest saved state for that thread: 2 messages.
+2. Your input, the new `HumanMessage`, is merged into it by `add_messages`. Now there are 3.
+3. `chat_node` sends all 3 to the model, so it can see the name.
+4. The reply is appended (4 messages), and the checkpointer saves the new state under the same thread.
+
+You still pass **only the new message** to `invoke`. The checkpointer supplies the rest. If you passed the full history yourself, `add_messages` would append copies, unless they carry the same ids.
+
+<LgChatMemory />
+
+## Inspecting a thread
+
+You can read a thread's saved state at any time:
+
+```python
+snapshot = chatbot.get_state(config)
+for m in snapshot.values["messages"]:
+    print(type(m).__name__, "→", m.content)
+```
+
+```
+HumanMessage → Hi, I'm Nitya.
+AIMessage → Nice to meet you, Nitya!
+HumanMessage → What's my name?
+AIMessage → Your name is Nitya.
+...
+```
+
+`get_state` needs the config too, because it has to know *which* thread you mean. A different `thread_id` gives a different, possibly empty, conversation. That's how one deployed bot keeps thousands of users' chats apart.
+
+## Same graph, many conversations
+
+Nothing about the compiled `chatbot` is tied to one user. The graph is a **definition**: nodes, edges and a checkpointer. Each `invoke` names a thread, and the checkpointer keeps every thread's history separate. One process can serve many people at once:
+
+```python
+nitya = {"configurable": {"thread_id": "nitya-chat-1"}}
+arjun = {"configurable": {"thread_id": "arjun-chat-1"}}
+
+chatbot.invoke({"messages": [HumanMessage(content="I'm Nitya, I like jazz.")]}, config=nitya)
+chatbot.invoke({"messages": [HumanMessage(content="I'm Arjun, I like cricket.")]}, config=arjun)
+
+reply = chatbot.invoke({"messages": [HumanMessage(content="What do I like?")]}, config=arjun)
+print(reply["messages"][-1].content)   # You like cricket.
+```
+
+Arjun's question loads only Arjun's thread, so Nitya's jazz never enters his context. That isolation comes entirely from the thread id. Two users who are accidentally given the **same** id will see each other's conversation, a bug you'll meet when the chatbot gets a web UI.
+
+Thread ids are just strings, so you choose the scheme. Common choices are a random UUID per conversation (`str(uuid.uuid4())`), or a composite like `f"{user_id}:{conversation_id}"` when you need to find a user's chats later.
+
+## Common mistakes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Bot forgets everything between turns | No checkpointer, or a new `thread_id` each turn | Compile with a checkpointer and reuse the thread id for the conversation |
+| `ValueError` about a missing thread id | Checkpointer attached but no `config` passed | Pass `config={"configurable": {"thread_id": ...}}` on every call |
+| State holds only the latest message | `messages` has no reducer | `Annotated[list[AnyMessage], add_messages]` |
+| History contains every message twice | Passing the full history **and** using a checkpointer | Send only the new message; the checkpointer adds the rest |
+
+## RAM vs a database
+
+Restart the Python process (or the notebook kernel) and ask "What's my name?" again. The bot has forgotten. `InMemorySaver` stored everything in the process's memory, and the process is gone.
+
+| Checkpointer | Where state lives | Survives restart? | Use it for |
+|---|---|---|---|
+| `InMemorySaver` | Python dict in RAM | No | Learning, notebooks, tests |
+| `SqliteSaver` | A local `.db` file | Yes | Single-machine apps, prototypes |
+| `PostgresSaver` | A Postgres database | Yes | Production, many servers |
+
+Real assistants need the database kind. Close the app on Monday, come back on Friday, and the conversation is still there. A later lecture swaps the in-memory checkpointer for SQLite without changing the graph at all; the checkpointer is the only part that changes.
+
+<Callout kind="warn">
+With persistence, every turn sends the **entire** thread to the model. Long conversations get slower and more expensive and eventually overflow the context window. Trimming and summarising old messages comes in the short-term memory lecture.
+</Callout>
+
+## Testing without a real model
+
+Every test run against a real model costs money, takes seconds, and gives a different answer each time, which makes assertions awkward. For testing the **graph's** behaviour (does the history accumulate, are threads separate), swap in a fake chat model that returns scripted replies:
+
+```python
+from itertools import cycle
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage
+
+fake_llm = GenericFakeChatModel(messages=cycle([AIMessage(content="ok")]))
+
+def chat_node(state: ChatState) -> dict:
+    return {"messages": [fake_llm.invoke(state["messages"])]}
+
+# ...build and compile with InMemorySaver as before...
+cfg = {"configurable": {"thread_id": "test"}}
+chatbot.invoke({"messages": [HumanMessage(content="one")]}, config=cfg)
+chatbot.invoke({"messages": [HumanMessage(content="two")]}, config=cfg)
+
+assert len(chatbot.get_state(cfg).values["messages"]) == 4
+```
+
+The assertion checks exactly what this lecture is about: two turns on one thread leave four messages in the saved state. Run the same two calls with different thread ids and each thread should hold two. These tests are instant, free and deterministic. A cleaner design passes the model into the code that builds the graph, so tests can supply the fake and the app the real one.
+
+## The price of memory
+
+Remembering isn't free. Because the model is stateless, "memory" means resending the conversation on every turn. Suppose each user message and each reply is about 100 tokens:
+
+| Turn | Messages sent to the model | Approx. input tokens |
+|---|---|---|
+| 1 | 1 | 100 |
+| 5 | 9 | 900 |
+| 20 | 39 | 3,900 |
+| 50 | 99 | 9,900 |
+
+Input cost grows with every turn, and the **total** cost of a conversation grows roughly with the square of its length. Latency creeps up too, since the model reads the whole history before writing a word. For short chats this doesn't matter. For long-running assistants it's the reason trimming, summarising and long-term memory exist, all covered later in the course.
+
+Keep this picture in mind as you add features. Tool results, retrieved documents and system prompts all ride along in the same context, so every byte you put in the state's `messages` is paid for again on every later turn.
+
+## Cheat sheet
+
+- A chatbot graph handles **one turn**; the conversation loop lives outside the graph.
+- State: `messages: Annotated[list[AnyMessage], add_messages]`, or subclass `MessagesState`.
+- `add_messages` appends, converts dicts to messages, assigns ids, replaces by id and supports deletion; prefer it to `operator.add` for chat.
+- Nodes return only new messages: `{"messages": [response]}`.
+- Prepend the `SystemMessage` at call time rather than storing it in the state.
+- State lives for one execution; separate `invoke` calls share nothing unless you add a checkpointer.
+- `builder.compile(checkpointer=InMemorySaver())` plus `config={"configurable": {"thread_id": ...}}` gives per-conversation memory.
+- With a checkpointer, pass only the new message; the saved history is loaded for you.
+- `graph.get_state(config).values` shows a thread's saved state.
+- `InMemorySaver` is lost on restart; use SQLite or Postgres checkpointers for real apps.

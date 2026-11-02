@@ -1,0 +1,592 @@
+import { LgFanOutLab } from "@/components/widgets/LgFanOutLab";
+import { LgResearchRouter } from "@/components/widgets/LgResearchRouter";
+
+## What a planning agent is
+
+Most graphs so far in this course react to a request straight away. You hand an essay to a grader and it grades; you ask a chatbot a question and it answers. That works when the task is small enough to do in one go.
+
+Some tasks are too big for that. Ask a model to "build an expense tracker" and let it start typing code immediately, and it will usually forget something: a page, a validation rule, the way two parts connect. A human engineer would first sketch the screens, the data model and the order of work, and only then write code. The sketch is cheap, and it catches problems before they become expensive.
+
+A **planning agent** copies that habit. It works in two phases:
+
+1. **Plan.** Read the task, break it into smaller subtasks, and write the plan down as structured data.
+2. **Execute.** Carry out each subtask, then put the results together.
+
+Separating the phases buys you three things. The plan is **inspectable**: you can log it, show it to a user, or let a human edit it before anything runs. Each subtask is **small and focused**, so the model working on it has one clear job. And independent subtasks can run **in parallel**, so the whole job finishes faster than doing it step by step.
+
+In this lesson you build a planning agent that writes technical blog posts. You give it a topic ("self-attention", "the state of multimodal LLMs this year") and it returns a finished Markdown article, with web research when the topic needs fresh facts and generated diagrams where a picture helps.
+
+## The project at a glance
+
+Here is the final graph you will end up with:
+
+```text
+START
+  └─▶ router ──(needs research?)──┬─ yes ─▶ research ─┐
+                                  └─ no ──────────────┤
+                                                      ▼
+                                              orchestrator  (the planner)
+                                                      │  Send × N
+                              ┌───────────┬───────────┼───────────┐
+                              ▼           ▼           ▼           ▼
+                           worker      worker      worker      worker   (one per section)
+                              └───────────┴─────┬─────┴───────────┘
+                                                ▼
+                                   assemble (subgraph: merge → decide images → generate & place)
+                                                ▼
+                                               END
+```
+
+| Node | Job | Output written to state |
+|---|---|---|
+| **router** | Decide whether the topic needs fresh facts from the web, and if so, which searches to run | `needs_research`, `mode`, `queries` |
+| **research** | Run the searches, clean and de-duplicate the results | `evidence` |
+| **orchestrator** | Design the blog: title, audience, tone and a list of section tasks | `plan` |
+| **worker** (N copies) | Write exactly one section | one entry appended to `sections` |
+| **assemble** | Put sections in order, add images, save the file | `final` |
+
+The whole thing is built in four stages, each adding one capability on top of a working system:
+
+1. A basic planner plus parallel writers, text only.
+2. A router and a research step, so the agent can use current information.
+3. An assembly subgraph that decides where images belong and generates them.
+4. A small web interface that streams the agent's progress.
+
+Building in stages is worth copying in your own projects. Each stage is runnable, so when something breaks you know which addition broke it.
+
+## Why not one big prompt
+
+Before building anything, it's worth asking whether the graph earns its complexity. There are three obvious ways to get a long article out of a model:
+
+| Approach | How it works | What goes wrong |
+|---|---|---|
+| **One prompt** | "Write a 2,500-word blog on X" | Long outputs drift: the middle sections get thin, the model runs out of steam or repeats itself, and you can't see or fix the structure before it's written |
+| **Sequential chain** | Outline, then write section 1, then section 2… each call seeing the previous text | Coherent, but slow (latency adds up per section), and every call carries an ever-growing prompt |
+| **Orchestrator–worker** | Outline as structured data, then all sections at once, then assemble | Sections can't see each other's text, so coherence has to come from the plan |
+
+The orchestrator–worker design wins on speed and control: the plan is a checkpoint you can inspect, each worker has a short, focused prompt, and total time is roughly one planning call plus the slowest section. Its weakness is the last row of the table. Workers never read each other's output, so every bit of coherence (what the intro promised, which section owns which idea, the shared tone) has to be written into the plan and handed to every worker. That's why the schema gets richer as the project grows, and why each worker receives the full outline rather than only its own task.
+
+This trade-off generalises. Any time you split work across parallel model calls, ask what information the parts need to agree on, and put it in the shared plan rather than hoping the parts converge on their own.
+
+## Stage one, a basic planner and writers
+
+The first version has three nodes: an **orchestrator** that writes the plan, **workers** that each write one section, and an **assembler** that joins the sections into a file. This shape is called the **orchestrator–worker pattern**.
+
+### The plan schema
+
+The plan must be data your code can loop over, not prose. So you define it as Pydantic models and force the model to fill them in with structured output.
+
+```python
+from pydantic import BaseModel, Field
+
+class Task(BaseModel):
+    id: int = Field(description="Position of the section in the blog, starting at 1")
+    title: str
+    brief: str = Field(description="What this section must cover, in 1-3 sentences")
+
+class Plan(BaseModel):
+    blog_title: str
+    tasks: list[Task]
+```
+
+A `Plan` is a title plus a list of `Task` objects, one per section. The `id` is not decoration: it is how you will put the sections back in the right order later, after parallel workers have finished in whatever order they happened to finish.
+
+Field descriptions end up in the JSON schema the model sees, so they act as small, targeted prompts. "Position of the section in the blog, starting at 1" is far more reliable than hoping the model guesses what `id` means.
+
+### State and the sections reducer
+
+```python
+import operator
+from typing import Annotated
+from typing_extensions import TypedDict
+
+class State(TypedDict):
+    topic: str
+    plan: Plan
+    sections: Annotated[list[tuple[int, str]], operator.add]
+    final: str
+```
+
+Three of these keys are ordinary: whoever writes them last wins. `sections` is different. Several workers will write to it **in the same step**. Without a reducer, LangGraph rejects that with an `InvalidUpdateError`, because a plain key can take only one value per step. `operator.add` tells LangGraph to concatenate every worker's list onto the accumulated list.
+
+Each worker returns a one-item list containing a `(task_id, markdown)` pair. Storing the id next to the text is a deliberate choice, explained below when you assemble the post.
+
+### The orchestrator node
+
+```python
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import SystemMessage, HumanMessage
+
+llm = init_chat_model("openai:gpt-4.1-mini", temperature=0.3)
+planner = llm.with_structured_output(Plan)
+
+def orchestrator(state: State) -> dict:
+    plan = planner.invoke([
+        SystemMessage("Create a blog plan with 5-7 sections for the topic below."),
+        HumanMessage(f"Topic: {state['topic']}"),
+    ])
+    return {"plan": plan}
+```
+
+`with_structured_output(Plan)` wraps the model so that `invoke` returns a validated `Plan` instance instead of a chat message. If the model's output does not match the schema, you get an error rather than a half-parsed string, which is what you want in a pipeline.
+
+### Fanning out with Send
+
+Now the interesting part. After the orchestrator runs, you need one worker **per task**. But you don't know how many tasks there are until the plan exists: it could be five, it could be seven. Ordinary edges are fixed when you compile the graph, so they can't express "N copies of this node, where N is decided at run time".
+
+LangGraph's answer is the **Send API**. A routing function can return a list of `Send` objects. Each `Send(node_name, payload)` schedules one run of `node_name`, and that run receives `payload` as its input instead of the graph's shared state.
+
+```python
+from langgraph.types import Send
+
+class WorkerState(TypedDict):
+    task: Task
+    topic: str
+    plan: Plan
+    sections: Annotated[list[tuple[int, str]], operator.add]
+
+def fan_out(state: State) -> list[Send]:
+    return [
+        Send("worker", {"task": t, "topic": state["topic"], "plan": state["plan"]})
+        for t in state["plan"].tasks
+    ]
+```
+
+Three things are worth noticing:
+
+- **The payload is private to each worker.** Worker 3 sees its own `task`; it never sees worker 4's. That is how you give each copy a different job without stuffing a "current task index" into shared state.
+- **Every worker also gets the whole plan.** A section written in isolation tends to repeat what the intro already said or to contradict a later section. Showing each writer the full outline lets it stay in its lane.
+- **All the Sends run in the same superstep**, so they execute in parallel. Seven sections take roughly as long as the slowest one, not seven times as long.
+
+<Callout kind="remember">
+A normal edge says "always go there next". A conditional edge says "pick one of these". A list of **Send** objects says "run this node N times, each with its own input", with N decided at run time. That is the tool for map-reduce and orchestrator–worker graphs.
+</Callout>
+
+### The worker node
+
+```python
+def worker(state: WorkerState) -> dict:
+    task, plan = state["task"], state["plan"]
+    outline = "\n".join(f"{t.id}. {t.title}" for t in plan.tasks)
+    md = llm.invoke([
+        SystemMessage("Write one clean Markdown section. Start with a '## ' heading. "
+                      "Return only the section content."),
+        HumanMessage(f"Blog: {plan.blog_title}\nTopic: {state['topic']}\n"
+                     f"Full outline:\n{outline}\n\n"
+                     f"Your section: {task.title}\nBrief: {task.brief}"),
+    ]).content
+    return {"sections": [(task.id, md)]}
+```
+
+The worker does one job and returns a single-item list. Because of the reducer, seven workers returning seven one-item lists produce one seven-item list in the parent state.
+
+The worker writes to `sections`, a key that also exists in the parent `State`. That is how results flow back out of a Send: the worker's return value is applied to the graph's channels just like any other node's update.
+
+<LgFanOutLab />
+
+### Assembling the blog
+
+```python
+from pathlib import Path
+
+def assemble(state: State) -> dict:
+    ordered = [md for _, md in sorted(state["sections"], key=lambda s: s[0])]
+    body = "\n\n".join(ordered)
+    final = f"# {state['plan'].blog_title}\n\n{body}\n"
+    Path("blog.md").write_text(final, encoding="utf-8")
+    return {"final": final}
+```
+
+Why sort? Because LangGraph does not promise any particular order when it applies parallel updates to a reducer key. In practice you often see the plan order, which makes it easy to ship code that silently depends on it. Then one day the conclusion lands in the middle of the article. Sorting by the task id makes assembly independent of timing, which is exactly what a reducer-fed key needs.
+
+The final step concatenates the sections, adds the title as an H1, and writes a Markdown file.
+
+<Callout kind="tip">
+In the source design this last node was called the "reducer". That name clashes with LangGraph's reducers (the functions on state keys, like `operator.add`). Call the node something like **assemble** or **synthesizer** so nobody confuses a node with a state reducer.
+</Callout>
+
+### Wiring the graph
+
+```python
+from langgraph.graph import StateGraph, START, END
+
+builder = StateGraph(State)
+builder.add_node("orchestrator", orchestrator)
+builder.add_node("worker", worker)
+builder.add_node("assemble", assemble)
+
+builder.add_edge(START, "orchestrator")
+builder.add_conditional_edges("orchestrator", fan_out, ["worker"])
+builder.add_edge("worker", "assemble")
+builder.add_edge("assemble", END)
+
+app = builder.compile()
+result = app.invoke({"topic": "Self-attention in transformers"})
+print(result["final"][:300])
+```
+
+Two details matter here.
+
+- **The third argument to `add_conditional_edges`** is the list of nodes the router may send to. `fan_out` returns `Send` objects rather than a node name, so LangGraph can't infer its targets on its own. Listing them keeps the compiled graph (and its diagram) accurate.
+- **`worker → assemble` is a single edge, but it waits for all workers.** LangGraph runs in supersteps: every worker scheduled in one step must finish before the next step starts, so `assemble` runs once, after the last section arrives, with every section already merged into state.
+
+Running this produces a respectable but plain article. It is a working baseline, which is the point of stage one.
+
+### A trap when you add memory
+
+If you later compile with a checkpointer and reuse a `thread_id` for a second blog, the old sections are still in state, and `operator.add` happily appends the new ones to them. The second post comes out with the first post's sections mixed in. Either use a fresh thread per blog (the natural choice: one thread, one article), or give `sections` a reducer that can be reset. Accumulating reducers remember everything for the life of the thread.
+
+## Better prompts and richer schemas
+
+The cheapest quality upgrade is not a new node. It is a more specific plan and more specific instructions. A planner told only "create a blog plan with 5-7 sections" produces generic headings; a planner told *what a good section is* produces an article with a shape.
+
+Make each task carry more of the editor's intent:
+
+```python
+from typing import Literal
+
+class Task(BaseModel):
+    id: int
+    title: str
+    goal: str = Field(description="One sentence: what the reader can do or understand after this section")
+    bullets: list[str] = Field(description="3-5 concrete, non-overlapping points to cover")
+    target_words: int = Field(description="Target length for this section, 120-450")
+    section_type: Literal["intro", "core", "examples", "checklist", "conclusion"]
+    requires_research: bool
+    requires_citations: bool
+    requires_code: bool
+
+class Plan(BaseModel):
+    blog_title: str
+    audience: str
+    tone: str
+    blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison"]
+    tasks: list[Task]
+```
+
+Every new field is a decision the planner now has to make explicitly, and a constraint the worker can follow:
+
+| Field | What it fixes |
+|---|---|
+| `goal` | Sections that wander. A one-sentence outcome gives the writer a finish line. |
+| `bullets` | Overlap between sections. Non-overlapping points split the material cleanly. |
+| `target_words` | Wildly uneven sections (a 60-word core section next to a 700-word intro). |
+| `section_type` | Every section reading the same. An "examples" section should look different from an "intro". |
+| `requires_code` / `requires_citations` / `requires_research` | Whether the worker should include code, cite sources or use research evidence. These flags drive later stages. |
+| `audience` and `tone` | Style drift between workers that never see each other's output. |
+
+Two practical notes on these schemas. First, keep every field required and put ranges in the description ("3-5 points"), rather than relying on validation keywords or default values: some providers' strict structured-output modes reject or ignore them. Second, the flags are cheap to add now and they pay off later, because the research and citation stages can key off them instead of guessing.
+
+The prompts grow the same way. The planner's system prompt describes what a strong technical blog looks like (a concrete intro, at least one worked example, a summary), how many sections to produce and how to set the flags. The worker's prompt says to cover every bullet, stay near the target length, include a runnable code block when `requires_code` is true, and never repeat content owned by another section. The graph is unchanged. Only the instructions and the schema improve, and the articles get noticeably more specific: worked examples appear, code shows up where it helps, sections stop repeating each other.
+
+<Callout kind="remember">
+A schema is a prompt. Every field you add to a Pydantic model is an instruction the model must act on, and every description is a place to say exactly what you want.
+</Callout>
+
+## Stage two, adding research
+
+A model only knows what was in its training data, its **parametric knowledge**. That's plenty for "explain self-attention", which hasn't changed in years. It's useless for "the biggest AI releases this month". Stage two lets the agent look things up, but only when it needs to.
+
+### The router and its three modes
+
+The state grows four keys for this stage:
+
+```python
+class State(TypedDict):
+    topic: str
+    needs_research: bool
+    mode: str
+    queries: list[str]
+    evidence: list[EvidenceItem]   # EvidenceItem is defined in the research section
+    plan: Plan
+    sections: Annotated[list[tuple[int, str]], operator.add]
+    final: str
+```
+
+Searching costs money and time, and it adds noise to topics that don't need it. So the first node is a **router**: a model call that classifies the topic before anything else happens.
+
+```python
+class RouterDecision(BaseModel):
+    needs_research: bool
+    mode: Literal["closed_book", "hybrid", "open_book"]
+    queries: list[str] = Field(description="3-10 specific web search queries; empty if closed_book")
+```
+
+The three modes describe how much the answer depends on recent facts:
+
+| Mode | Meaning | Example topic | Research? |
+|---|---|---|---|
+| **closed_book** | Evergreen; correctness doesn't depend on recent events | "How self-attention works" | No |
+| **hybrid** | Mostly conceptual, but needs current examples, tools or models to be useful | "Open-source LLMs explained" | Yes, a little |
+| **open_book** | Volatile; the whole point is recent facts | "AI news this week" | Yes, heavily |
+
+The router doesn't only answer yes or no. When research is needed it also **writes the search queries**. The system prompt asks for 3 to 10 high-signal, specific queries, and tells it to carry any time constraint in the topic ("this week", "latest") into the queries themselves. A topic like "how ChatGPT evolved from 2022 to now" might yield queries about version releases, new features, performance changes and official announcements.
+
+```python
+router_llm = llm.with_structured_output(RouterDecision)
+
+def router(state: State) -> dict:
+    d = router_llm.invoke([SystemMessage(ROUTER_PROMPT), HumanMessage(state["topic"])])
+    return {"needs_research": d.needs_research, "mode": d.mode, "queries": d.queries}
+
+def route_after_router(state: State) -> Literal["research", "orchestrator"]:
+    return "research" if state["needs_research"] else "orchestrator"
+```
+
+<LgResearchRouter />
+
+### The research node
+
+Research uses **Tavily**, a search API built for LLM applications: you send a query and get back a list of results with a title, URL and a content snippet, already stripped of page clutter. Install `langchain-tavily` and put a `TAVILY_API_KEY` in your environment.
+
+```python
+from langchain_tavily import TavilySearch
+
+search = TavilySearch(max_results=5)
+
+hits = search.invoke({"query": "multimodal LLM releases 2026"})
+for r in hits["results"]:
+    print(r["title"], r["url"])
+```
+
+Raw search results are messy: long snippets, duplicates, the same page reached through two queries, sometimes junk. So the research node turns them into a clean, standard shape:
+
+```python
+class EvidenceItem(BaseModel):
+    title: str
+    url: str
+    published_at: str | None = Field(description="Only if explicitly present in the result; else null")
+    source: str
+    snippet: str = Field(description="Short, relevant excerpt")
+
+class EvidencePack(BaseModel):
+    evidence: list[EvidenceItem]
+```
+
+An `EvidenceItem` is one cleaned search result; an `EvidencePack` is the collection that goes into state. The node runs every query, gathers the raw results, and asks a "research synthesizer" model to turn them into evidence:
+
+```python
+synth = llm.with_structured_output(EvidencePack)
+
+def research(state: State) -> dict:
+    raw = []
+    for q in state["queries"][:10]:
+        raw.extend(search.invoke({"query": q})["results"])
+    pack = synth.invoke([SystemMessage(SYNTH_PROMPT), HumanMessage(str(raw))])
+    seen, unique = set(), []
+    for item in pack.evidence:
+        if item.url and item.url not in seen:
+            seen.add(item.url)
+            unique.append(item)
+    return {"evidence": unique}
+```
+
+The synthesizer's rules are worth copying: keep only items with a real URL; prefer authoritative sources (official docs, company blogs, reputable outlets); keep the publication date only if it is explicitly in the result and **never guess one**; keep snippets short; drop duplicates.
+
+Notice that de-duplication by URL happens **again in code** after the model has supposedly done it. That's the general rule for anything you can check deterministically: let the model do the fuzzy part (judging relevance, trimming snippets), and enforce the hard rules yourself. Code is free and never forgets.
+
+Budget the fan-out too. Five queries times five results is 25 results going into one prompt. That's fine; ten queries times ten results is 100 long snippets, which costs real money on every blog and can push the synthesizer past what it handles well.
+
+### Planning with evidence
+
+The orchestrator is reached from either branch: straight from the router for closed-book topics, or through research. Its code barely changes. It now also receives the evidence, with a note that the list may be empty:
+
+```python
+def orchestrator(state: State) -> dict:
+    evidence = [e.model_dump() for e in state.get("evidence", [])]
+    plan = planner.invoke([
+        SystemMessage(PLANNER_PROMPT),
+        HumanMessage(f"Topic: {state['topic']}\nMode: {state['mode']}\n"
+                     f"Evidence (may be empty): {evidence}"),
+    ])
+    return {"plan": plan}
+```
+
+Evidence changes the plan, not just the prose. For a news topic, the planner can only build sections around things that actually happened, because now it can see them. It also decides which sections need `requires_research` and `requires_citations`, so the workers know whether to lean on the evidence.
+
+### Choosing what each worker sees
+
+Giving workers the evidence raises a design question that comes up in every multi-agent system: how much context does each part get?
+
+- **Everything.** Every worker gets the full evidence pack. Simple, but each prompt grows with the research, most of it irrelevant to that section, and a worker writing the intro may start quoting statistics that belong in a later section.
+- **Nothing unless needed.** Only tasks flagged `requires_research` get evidence. This is the default here, and the flag set by the planner is what makes it possible.
+- **Filtered per task.** The planner (or a cheap extra step) attaches the ids of the evidence items relevant to each task, and `fan_out` sends only those. Prompts stay small and each section cites what it should.
+
+The third option scales best when research is large. Whichever you choose, the decision lives in `fan_out`, the one place that builds each worker's payload, so changing strategy is a few lines of code.
+
+### Workers that cite
+
+`fan_out` adds the evidence to each `Send` payload, and the worker prompt gains rules for using it:
+
+- Use evidence only when the task's `requires_research` is true.
+- When `requires_citations` is true, cite with Markdown links, and **only to URLs from the evidence list**.
+- If the evidence doesn't support a claim, leave the claim out rather than inventing a source.
+
+That last rule needs enforcement, because models will happily produce plausible-looking links. A tiny check in the assembler catches it:
+
+```python
+import re
+
+def invented_links(md: str, evidence: list[EvidenceItem]) -> set[str]:
+    allowed = {e.url for e in evidence}
+    used = set(re.findall(r"\]\((https?://[^)\s]+)\)", md))
+    return used - allowed
+```
+
+If the set isn't empty, strip those links or send the section back for a rewrite. A fabricated citation is worse than none, because it looks trustworthy.
+
+Run the agent on a topic like "the state of multimodal LLMs" and the output now carries working links to recent sources. Run it on "self-attention" and the router skips research entirely, so it costs no more than stage one.
+
+## Stage three, images
+
+A technical post is better with a diagram of the data flow or a table of the steps. Stage three adds generated images. The graph above the assembler stays exactly the same; all the change lives in the last step.
+
+### Assembly as a subgraph
+
+The assembler now has three jobs, so it becomes a **subgraph** of three nodes:
+
+1. **merge_content**: sort and join the sections into one Markdown string (no file yet).
+2. **decide_images**: ask a model where images would genuinely help and what each should show.
+3. **generate_and_place**: generate each image, save it, and put a Markdown image link where it belongs.
+
+```python
+assembly = StateGraph(State)
+assembly.add_node("merge_content", merge_content)
+assembly.add_node("decide_images", decide_images)
+assembly.add_node("generate_and_place", generate_and_place)
+assembly.add_edge(START, "merge_content")
+assembly.add_edge("merge_content", "decide_images")
+assembly.add_edge("decide_images", "generate_and_place")
+assembly.add_edge("generate_and_place", END)
+
+builder.add_node("assemble", assembly.compile())
+```
+
+Because the subgraph uses the same `State` schema, you can add the compiled subgraph directly as a node; it reads and writes the parent's keys. Packaging it this way keeps the main graph readable (one "assemble" box) while the details live in their own small graph you can test alone.
+
+### Deciding where images go
+
+```python
+class ImageSpec(BaseModel):
+    placeholder: str = Field(description="Unique marker like [[IMAGE_1]]")
+    after_heading: str = Field(description="Exact '## ' heading the image goes under")
+    filename: str
+    prompt: str = Field(description="Detailed prompt for the image model")
+    alt: str
+    size: Literal["1024x1024", "1536x1024"]
+
+class GlobalImagePlan(BaseModel):
+    images: list[ImageSpec] = Field(description="At most 3 images")
+```
+
+The decider is prompted as an expert technical editor: decide whether images are needed at all, use **at most three**, and only add one when it materially improves understanding (a flow diagram, an architecture sketch, a table-like visual), never as decoration. For each image it writes a detailed prompt for an image model, a file name and alt text.
+
+Each image is marked in the text with a **placeholder**, a unique token like `[[IMAGE_1]]`, at the spot where the picture should appear. Placeholders split the work into a decision ("an image of X belongs here") and an action ("generate X and swap it in"), so the expensive, failure-prone generation step can run later and independently.
+
+There are two ways to get placeholders into the text. One is to have the model return the whole article rewritten with placeholders in it. That is simple but risky: a model re-emitting 3,000 words can quietly shorten or reword them, and you'd never notice. The safer way is shown in the schema above: the model names the heading each image goes under, and **your code** inserts the placeholder. The article text never passes through the model a second time.
+
+```python
+def decide_images(state: State) -> dict:
+    plan = image_planner.invoke([SystemMessage(IMAGE_PROMPT), HumanMessage(state["merged_md"])])
+    md = state["merged_md"]
+    for spec in plan.images:
+        if spec.after_heading in md:
+            md = md.replace(spec.after_heading, f"{spec.after_heading}\n\n{spec.placeholder}", 1)
+    return {"md_with_placeholders": md, "image_specs": plan.images}
+```
+
+### Generating and placing images
+
+Image generation uses a Gemini image model through the `google-genai` SDK (a `GEMINI_API_KEY` from Google AI Studio). Image calls are billed per image, so a handful of test blogs costs little, but treat the key like money: anyone who has it can spend it.
+
+```python
+from google import genai
+
+client = genai.Client()  # reads GEMINI_API_KEY from the environment
+
+def gemini_image_bytes(prompt: str) -> bytes:
+    resp = client.models.generate_content(model="gemini-2.5-flash-image", contents=[prompt])
+    for part in resp.candidates[0].content.parts:
+        if part.inline_data is not None:
+            return part.inline_data.data
+    raise RuntimeError("model returned no image")
+```
+
+The placing node generates each image, saves it under `images/`, and swaps the placeholder for a Markdown image link. If one image fails, it removes just that placeholder and keeps going:
+
+```python
+def generate_and_place(state: State) -> dict:
+    md = state["md_with_placeholders"]
+    Path("images").mkdir(exist_ok=True)
+    for spec in state["image_specs"]:
+        try:
+            path = Path("images") / spec.filename
+            path.write_bytes(gemini_image_bytes(spec.prompt))
+            md = md.replace(spec.placeholder, f"![{spec.alt}]({path.as_posix()})")
+        except Exception:
+            md = md.replace(spec.placeholder, "")
+    Path("blog.md").write_text(md, encoding="utf-8")
+    return {"final": md}
+```
+
+A missing diagram is a small loss; a crashed run after seven sections were written is a big one. Always ask which failures should stop the graph and which should degrade gracefully.
+
+Generated images have their own failure mode: text inside them is often garbled, and a diagram of a calculation can look right while being wrong. Keep prompts focused on shapes and flow rather than dense labels, and review images before publishing.
+
+## Stage four, a user interface
+
+The last stage puts a small web front end on the agent. Streamlit is the quickest route in Python: a text box for the topic, a "Generate" button, and tabs for the plan, the evidence, the images, a log and the finished post.
+
+The backend doesn't change. Put the graph code in a module, import the compiled `app`, and drive it from the UI. The one LangGraph feature that makes the UI feel alive is **streaming**: instead of `invoke`, which blocks until the end, use `stream` with `stream_mode="updates"`, which yields after every node with that node's state update.
+
+```python
+import streamlit as st
+from blog_agent import app
+
+topic = st.text_input("Blog topic")
+if st.button("Generate") and topic:
+    final = None
+    for update in app.stream({"topic": topic}, stream_mode="updates"):
+        for node, delta in update.items():
+            st.write(f"Finished: {node}")
+            if node == "orchestrator":
+                st.json(delta["plan"].model_dump())
+            if node == "assemble":
+                final = delta["final"]
+    st.markdown(final or "")
+```
+
+The user sees "router", "research", "orchestrator" and the workers tick by, which matters for a job that takes a minute. Updates from inside the assembly subgraph are hidden by default; pass `subgraphs=True` to `stream` if you want to show them too.
+
+Keeping the agent and the UI separate is the important design choice. The graph is the product; the front end is a thin client you can swap for a React app or an API later without touching the agent. Writing the Streamlit layer is also a good place to let a code assistant help, since it is plain UI code around a stable interface.
+
+## Failure modes and how to harden
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Sections out of order | Relying on the order parallel updates are applied | Store `(task_id, text)` and sort when assembling |
+| Old sections appear in a new blog | Accumulating reducer plus a reused `thread_id` | One thread per blog, or a resettable reducer |
+| Sections repeat each other | Workers can't see the outline | Send the whole plan to every worker; use non-overlapping bullets |
+| Research on evergreen topics | No routing, or a vague router prompt | Classify into closed/hybrid/open book with examples in the prompt |
+| Plausible but fake citations | Model invents URLs | Allow only evidence URLs; check links in code |
+| Wrong dates in news posts | Model guesses publication dates | Store dates only when present; null otherwise |
+| Article text silently changed | Model re-emits the whole article to add placeholders | Let the model choose positions; insert placeholders in code |
+| One failed image kills the run | Exceptions in a late node | Catch per image, degrade gracefully |
+| Slow or expensive runs | Too many queries or results | Cap queries and `max_results`; skip research when closed book |
+
+There is plenty of room to push this further: a human approval step on the plan using an interrupt, a critic node that grades each section against its goal and loops it back, or per-customer style guides fed into the planner. Each one is a node or an edge on the graph you already have, which is the real payoff of the planning architecture.
+
+## Cheat sheet
+
+- A planning agent plans first (structured subtasks), then executes; the plan is data you can log, show and edit.
+- Orchestrator–worker: one planner node, N worker runs, one assembler.
+- Use `Send("worker", payload)` from a conditional-edge function to fan out to a number of workers decided at run time; pass the target list as the third argument to `add_conditional_edges`.
+- Each Send payload is private input for that worker run; include the full plan so sections stay coherent.
+- Workers append to a key annotated `Annotated[list, operator.add]`; the next node runs once, after all of them finish.
+- Don't rely on the order of parallel updates; carry an id and sort.
+- Accumulating reducers keep growing across runs on the same thread.
+- Richer Pydantic schemas (goal, bullets, target words, flags) are the cheapest quality upgrade.
+- A router classifies topics as closed book, hybrid or open book and writes the search queries.
+- Normalise search results into evidence items; de-duplicate and validate URLs in code.
+- Package multi-step assembly as a subgraph; let the model choose image positions, let code insert them.
+- Stream with `stream_mode="updates"` to show progress in a UI.

@@ -1,0 +1,432 @@
+import { LgRefineLoop } from "@/components/widgets/LgRefineLoop";
+
+## The fourth workflow shape
+
+So far you've built three shapes of graph:
+
+| Shape | What the edges do | Example |
+|---|---|---|
+| Sequential | One node after another, in a fixed line | Clean text, then summarise it |
+| Parallel | Several nodes run in the same super-step, then merge | Score an essay on three criteria at once |
+| Conditional | A router picks **one** of several next nodes | Send a support ticket to billing or tech |
+| **Iterative** | An edge points **backwards**, so some nodes run again | Draft, critique, redraft until it's good |
+
+An **iterative** (or **looping**) workflow is a graph with a cycle in it. The point of the cycle is to **improve something over several passes**: a piece of writing, a SQL query, a plan, a piece of code. Each pass produces a candidate, something checks it, and if it isn't good enough the graph goes round again.
+
+This is one of the most common patterns in real agents. A tool-calling agent is a loop (call the model, run the tool, call the model again). Self-correcting RAG is a loop. Code generation with tests is a loop. Once you can build one loop cleanly, with a guaranteed way out, you can build all of them.
+
+<Callout kind="remember">
+Plain LangChain chains are directed and acyclic: data flows one way and stops. Cycles are the main thing LangGraph adds. In LangGraph a loop is just an ordinary edge that happens to point at a node that already ran.
+</Callout>
+
+## Why one LLM call isn't enough
+
+Ask a model for "a short, punchy launch post for our dark mode feature" and the first answer is usually *fine*: grammatical, on topic, and forgettable. It reaches for clichés ("Your eyes will thank you!"), adds a pile of hashtags, or runs past the character limit.
+
+You could keep prompting by hand: read it, say what's wrong, ask again. That's exactly the loop we're going to automate. Instead of you being the critic, a second model plays the critic with a written rubric, and a third pass rewrites the draft using the critic's notes.
+
+This is often called the **evaluator–optimizer** pattern. It has three roles:
+
+1. **Generator**: writes the first draft from the topic.
+2. **Evaluator**: judges the current draft against explicit criteria and returns a verdict plus feedback.
+3. **Optimizer**: rewrites the draft using that feedback.
+
+The graph:
+
+```
+START → generate → evaluate ──approved──→ END
+                      ↑    └─needs work─→ optimize
+                      └──────────────────────┘
+```
+
+The edge from `optimize` back to `evaluate` is the loop. The edge out of `evaluate` is conditional: it either leaves the loop or goes round again.
+
+<Callout kind="tip">
+Why a separate optimizer instead of sending the draft back to the generator? The two jobs differ. The generator writes from nothing; the optimizer edits an existing draft against specific notes. Separate prompts keep each one focused, and you can give them different models.
+</Callout>
+
+## Choosing the models
+
+Each role wants something different from a model:
+
+| Role | What matters | Typical choice |
+|---|---|---|
+| Generator | Writing quality, creativity | A strong general model, moderate temperature |
+| Evaluator | Following a rubric exactly, consistency | A reliable instruction-follower at **temperature 0** |
+| Optimizer | Applying feedback without losing what worked | Strong writer, moderate temperature |
+
+A cheaper model often makes a perfectly good evaluator, because checking against a list is easier than writing. Keep the evaluator deterministic (temperature 0), otherwise the same draft can pass on one run and fail on the next, and your loop becomes noisy.
+
+```python
+from langchain.chat_models import init_chat_model
+
+# API keys come from environment variables (e.g. OPENAI_API_KEY), never from code.
+writer_llm = init_chat_model("openai:gpt-4.1", temperature=0.8)
+judge_llm = init_chat_model("openai:gpt-4.1-mini", temperature=0)
+editor_llm = init_chat_model("openai:gpt-4.1", temperature=0.6)
+```
+
+`init_chat_model` takes a `"provider:model"` string, so you can switch any role to another vendor by changing one line.
+
+## Designing the state
+
+Before any node, decide what data the loop needs to carry. Walk through one full pass and ask what each node reads and writes:
+
+- The **topic** the user asked for. Read by every node.
+- The **current post**. Written by the generator and the optimizer, read by the evaluator.
+- The evaluator's **verdict**: exactly one of two values, approved or needs improvement.
+- The evaluator's **feedback**, read by the optimizer.
+- An **iteration counter**, so we know how many drafts we've made.
+- A **maximum** number of iterations, so the loop can't run forever.
+
+```python
+from typing import Literal, TypedDict
+
+class PostState(TypedDict):
+    topic: str
+    post: str
+    evaluation: Literal["approved", "needs_improvement"]
+    feedback: str
+    iteration: int
+    max_iterations: int
+```
+
+`Literal` documents that `evaluation` can only take those two strings. Python won't enforce it at runtime, but your editor will flag typos like `"aproved"`, and the router can rely on it.
+
+Putting `max_iterations` in the state (rather than hard-coding it in the router) lets each caller choose: a quick preview might allow 2 rounds, a scheduled job 5.
+
+## The generator node
+
+The generator builds a prompt from the topic and returns the draft. Using a `SystemMessage` for the persona and a `HumanMessage` for the task keeps the rules separate from the request.
+
+```python
+from langchain_core.messages import SystemMessage, HumanMessage
+
+def generate_post(state: PostState) -> dict:
+    messages = [
+        SystemMessage(content="You write short, witty product announcements for a notes app."),
+        HumanMessage(content=f"""Write one announcement post about: {state['topic']}
+
+Rules:
+- At most 280 characters.
+- Open with a concrete, relatable situation, not a slogan.
+- No question-and-answer format, no hashtags, no emoji walls.
+- Plain everyday English."""),
+    ]
+    draft = writer_llm.invoke(messages).content
+    return {"post": draft, "iteration": 1}
+```
+
+The node returns only the keys it changes. Setting `iteration` to 1 here means callers don't have to remember to pass it in.
+
+## The evaluator node and structured output
+
+The evaluator has to hand back two things the graph can act on: a verdict and feedback. If you let it answer in free text ("Overall pretty good, though I'd maybe...") the router has nothing reliable to branch on. So we force the shape with **structured output**: describe the response as a Pydantic model and let the model fill it in.
+
+```python
+from pydantic import BaseModel, Field
+
+class Review(BaseModel):
+    evaluation: Literal["approved", "needs_improvement"] = Field(
+        description="Final verdict on the post."
+    )
+    feedback: str = Field(
+        description="One paragraph: what works, what doesn't, and the single most important fix."
+    )
+
+reviewer = judge_llm.with_structured_output(Review)
+```
+
+`with_structured_output` returns a new runnable whose `.invoke()` gives you a `Review` object instead of a message. The field descriptions are sent to the model as part of the schema, so they're instructions too.
+
+Now the rubric. The more precise it is, the better the loop works, because the optimizer can only fix what the evaluator names.
+
+```python
+def evaluate_post(state: PostState) -> dict:
+    messages = [
+        SystemMessage(content="You are a strict social-media editor. You approve only posts you'd publish today."),
+        HumanMessage(content=f"""Evaluate this post:
+
+{state['post']}
+
+Criteria:
+1. Hook: does the first line make a reader stop scrolling?
+2. Specificity: does it say something only this product could say?
+3. Clarity: would a non-technical user understand it?
+4. Format: 280 characters or fewer, no hashtags, no Q&A format.
+
+Auto-reject if it breaks any rule in criterion 4.
+Only approve if all four criteria are clearly met."""),
+    ]
+    review = reviewer.invoke(messages)
+    return {"evaluation": review.evaluation, "feedback": review.feedback}
+```
+
+<Callout kind="tip">
+Some checks don't need a model at all. "At most 280 characters" is `len(post) <= 280`. Checking it in Python first is free, exact and instant; save the LLM judge for the subjective criteria (hook, humour, clarity).
+</Callout>
+
+### What makes a rubric work
+
+The evaluator is the steering wheel of the loop. Three properties separate a rubric that converges from one that wanders:
+
+- **Checkable criteria.** "Is it engaging?" invites a coin flip. "Does the first line describe a specific situation a user would recognise?" can actually be judged. Turn each quality you want into a question with a yes or no answer.
+- **Explicit auto-reject rules.** Hard constraints (length, banned formats, missing required facts) should fail a draft no matter how charming it is. Listing them separately stops the judge being won over by style.
+- **Feedback that names one fix.** The optimizer can act on "The hook is generic; open with the 2 a.m. scenario instead." It can't act on "Could be punchier." Asking for "the single most important fix" in the feedback description keeps rewrites focused, so each round changes one thing.
+
+You may be tempted to ask for a numeric score (1 to 10) instead of a binary verdict. Scores are useful for logging and for spotting a plateau, but a threshold on an LLM's score is fuzzy: is a 7 on one run the same as a 7 on the next? A common compromise is to ask for both: per-criterion scores for your logs, and a binary `evaluation` field that the router actually uses.
+
+| Feedback | Optimizer can act on it? |
+|---|---|
+| "Not funny enough." | Barely: funnier how? |
+| "Too long." | Partly: by how much, and what to cut? |
+| "312 characters; cut the second sentence, which repeats the first." | Yes |
+| "Generic opener. Lead with the specific moment: notes glowing at 2 a.m." | Yes |
+
+## The optimizer node
+
+The optimizer gets the topic, the current draft and the feedback, and returns a better draft. It also bumps the counter, because every rewrite is a new iteration.
+
+```python
+def optimize_post(state: PostState) -> dict:
+    messages = [
+        SystemMessage(content="You revise posts using an editor's feedback. Keep what works; fix what doesn't."),
+        HumanMessage(content=f"""Topic: {state['topic']}
+
+Current post:
+{state['post']}
+
+Editor feedback:
+{state['feedback']}
+
+Rewrite the post. At most 280 characters, no hashtags, no Q&A format."""),
+    ]
+    revised = editor_llm.invoke(messages).content
+    return {"post": revised, "iteration": state["iteration"] + 1}
+```
+
+`post` and `iteration` have no reducer, so these values **overwrite** the old ones. That's what we want for the "current" draft and the counter.
+
+## The router and the stop condition
+
+The router runs after every evaluation and returns a label. It has to answer one question: **is there any reason to stop?** There are two:
+
+- the draft was approved, **or**
+- we've already made `max_iterations` drafts.
+
+```python
+def route_after_review(state: PostState) -> Literal["done", "revise"]:
+    if state["evaluation"] == "approved" or state["iteration"] >= state["max_iterations"]:
+        return "done"
+    return "revise"
+```
+
+The word that matters is **or**. With `and`, the graph would stop only when a draft was approved *and* the cap was reached at the same moment. An approved draft on round 2 would be sent back for more editing, and a draft that never gets approved would loop until something else stops it. That is the classic infinite-loop bug in this pattern.
+
+Why do you need a cap at all if the evaluator will eventually approve? Because "eventually" isn't guaranteed:
+
+- the rubric may be stricter than the model can satisfy;
+- the optimizer may oscillate, fixing one criterion and breaking another;
+- a malformed feedback string may give the optimizer nothing to act on.
+
+Every round costs two model calls. A loop with no cap is an unbounded bill.
+
+<Callout kind="warn">
+Hitting the cap is not success. It means "best effort". In production, route that case somewhere visible: flag it for a human, log the scores, or store the draft as unapproved, rather than publishing it silently.
+</Callout>
+
+## Wiring the loop
+
+With the four functions written, the graph is a handful of lines. The loop is the last edge.
+
+```python
+from langgraph.graph import StateGraph, START, END
+
+builder = StateGraph(PostState)
+
+builder.add_node("generate", generate_post)
+builder.add_node("evaluate", evaluate_post)
+builder.add_node("optimize", optimize_post)
+
+builder.add_edge(START, "generate")
+builder.add_edge("generate", "evaluate")
+builder.add_conditional_edges(
+    "evaluate",
+    route_after_review,
+    {"done": END, "revise": "optimize"},
+)
+builder.add_edge("optimize", "evaluate")   # the backwards edge: this makes it a loop
+
+workflow = builder.compile()
+```
+
+The mapping dict in `add_conditional_edges` translates the router's labels into node names. It keeps the router readable ("done", "revise") and lets LangGraph draw the possible branches in a diagram. You can check the shape before running anything:
+
+```python
+print(workflow.get_graph().draw_mermaid())
+# In a notebook: from IPython.display import Image; Image(workflow.get_graph().draw_mermaid_png())
+```
+
+You'll see `optimize` pointing back at `evaluate`, and two dashed edges leaving `evaluate`.
+
+### Counting the passes
+
+Trace `max_iterations = 5` with a draft that is never approved:
+
+| Super-step | Node | iteration after |
+|---|---|---|
+| 1 | generate | 1 |
+| 2 | evaluate (rejects) | 1 |
+| 3 | optimize | 2 |
+| 4 | evaluate (rejects) | 2 |
+| ... | ... | ... |
+| 9 | optimize | 5 |
+| 10 | evaluate, router sees 5 ≥ 5 | 5 |
+
+So a cap of 5 means at most **5 drafts, 5 evaluations and 4 rewrites**. If the evaluator approves draft 2, it stops after super-step 4. Being able to work this out matters: it's how you estimate the worst-case cost and latency of the workflow.
+
+<LgRefineLoop />
+
+## Running it
+
+```python
+result = workflow.invoke({
+    "topic": "dark mode is now available in our notes app",
+    "max_iterations": 5,
+})
+
+print(result["iteration"], result["evaluation"])
+print(result["post"])
+```
+
+A typical run looks like:
+
+```
+2 approved
+2 a.m. notes shouldn't glow like a stadium. Dark mode is live: Settings → Appearance.
+```
+
+The first draft was rejected as generic, the optimizer used the feedback, and the second draft passed. If every run approves on the first try, your evaluator is too lenient (or your generator is very good). A quick way to see the loop working is to tighten the rubric or use a weaker generator model.
+
+## Keeping a history of drafts
+
+The final state only shows the **last** draft and the **last** feedback, because those keys overwrite. For debugging and tuning you want the whole story: what each draft looked like and why it was rejected.
+
+That's a job for a **reducer**. Add two list keys with `operator.add`, so each node's update is appended instead of replacing the list:
+
+```python
+import operator
+from typing import Annotated
+
+class PostState(TypedDict):
+    topic: str
+    post: str
+    evaluation: Literal["approved", "needs_improvement"]
+    feedback: str
+    iteration: int
+    max_iterations: int
+    post_history: Annotated[list[str], operator.add]
+    feedback_history: Annotated[list[str], operator.add]
+```
+
+Then every node that produces a draft or feedback also writes it to the history, **wrapped in a list**, because `operator.add` concatenates lists:
+
+```python
+# in generate_post
+return {"post": draft, "iteration": 1, "post_history": [draft]}
+
+# in optimize_post
+return {"post": revised, "iteration": state["iteration"] + 1, "post_history": [revised]}
+
+# in evaluate_post
+return {
+    "evaluation": review.evaluation,
+    "feedback": review.feedback,
+    "feedback_history": [review.feedback],
+}
+```
+
+If you returned the bare string, `operator.add` would try `list + str` and fail. Returning `[draft]` gives `old_list + [draft]`.
+
+```python
+result = workflow.invoke({"topic": "dark mode is now available", "max_iterations": 5})
+
+for i, (post, note) in enumerate(zip(result["post_history"], result["feedback_history"]), 1):
+    print(f"--- draft {i}\n{post}\n> {note}\n")
+```
+
+Now you can read the loop like a conversation between writer and editor. That's how you tune it. If feedback repeats itself round after round, the optimizer isn't using it. If scores jump around, the evaluator isn't deterministic enough.
+
+<Callout kind="tip">
+Passing the history to the optimizer can stop it oscillating ("draft 3 was cut for being too long; don't make it longer again"). Do this with care: the prompt grows each round.
+</Callout>
+
+## The recursion limit as a safety net
+
+LangGraph has its own guard against runaway graphs: the **recursion limit**, the maximum number of super-steps one run may take. If a run exceeds it, LangGraph raises `GraphRecursionError`. The default is generous (1000 in current LangGraph; older versions used 25), and you can set it per call:
+
+```python
+from langgraph.errors import GraphRecursionError
+
+try:
+    workflow.invoke(
+        {"topic": "dark mode is now available", "max_iterations": 5},
+        config={"recursion_limit": 12},
+    )
+except GraphRecursionError:
+    print("Loop ran away; check the router.")
+```
+
+`recursion_limit` sits at the top level of `config`, not inside `configurable`.
+
+Treat this as a seatbelt, not as your stop condition. It raises an exception and throws away the result, while your own `max_iterations` check ends the run cleanly with a usable draft. Size the limit a little above your worst case. Here that's 10 super-steps, so 12 works.
+
+If a node needs to know how close it is to the limit (to bail out gracefully), LangGraph offers a managed `RemainingSteps` value you can declare in the state. It's filled in automatically.
+
+## How refinement loops go wrong
+
+Once a loop runs, watch for these patterns in the draft and feedback histories:
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Every draft approved on round 1 | Evaluator too lenient, or it's grading its own style | Tighten the rubric; use a different model (or at least a different prompt) for judging |
+| Never approved, always hits the cap | Rubric stricter than the writer can meet, or criteria contradict each other | Check the feedback history for impossible demands; relax or reorder criteria |
+| Feedback alternates: "too long", then "too thin" | The optimizer only sees the latest note | Pass a short history of feedback to the optimizer |
+| Drafts drift away from the topic | The optimizer prompt doesn't repeat the topic | Always include the original topic, not just the draft |
+| Same feedback every round | The optimizer ignores it, or it's not actionable | Make the feedback name one concrete change |
+
+One subtle trap: if the **same model** writes and judges with similar prompts, it tends to like its own style and approve too easily. Using a different model for the evaluator, or at least a sharply different persona and temperature 0, keeps the judgement more independent.
+
+## Other loops you'll build
+
+The generate-evaluate-revise shape shows up throughout agent design, with different nodes plugged into the same structure:
+
+| Loop | Produces | Checks | Exits when |
+|---|---|---|---|
+| Content refinement (this lecture) | A draft | LLM judge with a rubric | Approved or cap |
+| Code generation | Code | Run the tests | Tests pass or cap |
+| Tool-calling agent | A model turn that may request tools | Did the model request a tool? | The model answers without a tool |
+| Corrective retrieval | Retrieved documents | Relevance grader | Documents are relevant, or it falls back to web search |
+
+The code-generation row has a useful property: the evaluator is a program, not a model, so its verdict is exact. Whenever part of your evaluation can be done in code, do it in code.
+
+## Where this goes next
+
+In a real publishing pipeline the approved post wouldn't go straight to `END`. Two improvements come later in this course:
+
+- **Human in the loop**: pause after approval, show the post to a person, and only publish when they confirm. That needs persistence and interrupts, covered in later lectures.
+- **Tools**: a final node that calls the platform's API to publish, once a human has said yes.
+
+The loop itself stays the same. Every refinement loop you build will have these parts: something that produces, something that judges with a structured verdict, something that revises, and a router with an explicit way out.
+
+## Cheat sheet
+
+- A loop in LangGraph is an ordinary `add_edge` pointing back at an earlier node; the exit is a conditional edge.
+- Evaluator–optimizer: generate, evaluate with a rubric, rewrite from feedback, repeat.
+- Give the evaluator explicit criteria and temperature 0; vague rubrics give vague feedback.
+- Use `with_structured_output(PydanticModel)` so the verdict is a value the router can branch on.
+- Router: stop when approved **or** `iteration >= max_iterations`. Using `and` is the infinite-loop bug.
+- With a cap of N: at most N drafts, N evaluations, N − 1 rewrites.
+- Keys without a reducer overwrite; use `Annotated[list[str], operator.add]` and return `[item]` to keep a history.
+- `recursion_limit` (top-level config key) raises `GraphRecursionError`; it's a safety net, not your stop condition.
+- Hitting the cap means best effort: flag it rather than publishing silently.

@@ -1,0 +1,337 @@
+import { LgAssistantLadder } from "@/components/widgets/LgAssistantLadder";
+
+## About this course
+
+This course teaches you to build **agentic AI applications** with **LangGraph**, the orchestration framework from the LangChain team. By the end you should be able to design an agent on paper, express it as a graph, give it tools and memory, put a human in charge of the risky parts, and run it in production with tracing.
+
+The aim is understanding that outlives the library. Frameworks in this space change every few months. If you understand *why* an agent needs state, checkpoints, routing and human approval, you can pick up whatever replaces LangGraph in an afternoon. So every lesson explains the problem first and the API second.
+
+### How the course is organised
+
+The material moves from ideas to code to production, in roughly six blocks:
+
+| Block | What you learn |
+|---|---|
+| Foundations | What agentic AI is, how it differs from generative AI, the parts of an agent, and why LangGraph exists |
+| LangGraph fundamentals | Graphs, state, nodes, edges, reducers; sequential, parallel, conditional and looping workflows |
+| Advanced LangGraph | Persistence and checkpoints, streaming, time travel, human-in-the-loop, subgraphs, short and long-term memory |
+| Agents | Tool calling, MCP servers, common agent patterns, multi-agent systems |
+| Agentic RAG | Retrieval as a tool, then architectures that check their own retrieval, such as Corrective RAG and Self-RAG |
+| Production | A chat UI, observability and evaluation with LangSmith, and a full project |
+
+This first block is deliberately light on code. You'll get a mental model now, and the next lessons turn it into graphs.
+
+### Prerequisites
+
+You'll be comfortable if you have three things:
+
+- **Intermediate Python.** Classes and objects, type hints and the `typing` module (`TypedDict`, `Annotated`, `Literal`), Pydantic models, and a working idea of `async`/`await`. LangGraph state is defined with type hints, so these aren't optional extras.
+- **Hands-on time with LLMs.** You've called a chat model from code, written prompts and looked at the response object.
+- **LangChain basics.** LangGraph runs on top of LangChain's building blocks: chat models, prompt templates, retrievers, tools. Lesson 3 recaps them, but it helps to have used them.
+
+### Why learn this now
+
+Generative AI went from a research curiosity to everyday software in about three years, starting with ChatGPT's release in late 2022. The models are now good enough at reasoning and following instructions that the industry's attention has moved from "generate a good answer" to "**get a job done**". That shift is what "agentic" means, and it's where most new AI engineering work is happening. The next two lessons make that shift concrete.
+
+## What generative AI is
+
+**Generative AI** is the branch of AI that builds models which **create new content**: text, images, audio, code or video, in a style that resembles what a human would produce.
+
+Two parts of that definition matter:
+
+- **New content.** The output didn't exist before. A summariser writes a summary nobody wrote; an image model paints a picture nobody painted.
+- **Human-like.** The output is fluent enough to pass as human work. That quality is what made the field explode.
+
+Today's well-known generative products fall into a few families:
+
+| Family | What it does | Examples |
+|---|---|---|
+| LLM chat assistants | Converse, write, explain, reason in text | ChatGPT, Gemini, Claude, Grok |
+| Image generators | Turn a text description into an image | DALL·E, Midjourney, Stable Diffusion |
+| Code models | Complete, write and explain code | Code Llama, coding assistants in editors |
+| Text-to-speech | Turn text into natural-sounding speech | ElevenLabs |
+| Video generators | Turn a description into a short clip | Sora, Runway |
+
+### Traditional AI vs generative AI
+
+To see what is genuinely new, compare generative models with what came before: classical machine learning and most deep learning, collectively "traditional AI" here.
+
+**Traditional AI learns a mapping from inputs to outputs.** You give it labelled examples and it finds the relationship between them:
+
+- **Classification**: emails labelled spam or not spam, so it can label a new email; chest X-rays labelled cancer or no cancer, so it can screen a new scan.
+- **Regression**: past weather to predict tomorrow's temperature; past prices to predict a stock's price.
+
+The model's job is to *predict a label or a number* for a new input. It never produces anything you'd call content.
+
+**Generative AI learns what the data itself looks like**, its *distribution*, so it can **sample new examples** from it. Show a generative image model millions of cat photos and it learns what cats look like in general: shapes, fur, poses, lighting. It can then produce a new cat photo that belongs with the others but appears in none of them.
+
+| | Traditional (discriminative) | Generative |
+|---|---|---|
+| Learns | The relationship between input and output | The structure of the data itself |
+| Typical question | "Which class is this? What value comes next?" | "What would a new example look like?" |
+| Output | A label, a score, a number | New text, images, audio, code |
+
+<Callout kind="tip">
+The line is less sharp than the table suggests. An LLM is trained on a prediction task: given the text so far, predict the next token. But doing that well across the whole internet forces it to model the distribution of language, and sampling from that model one token at a time is what produces new text. So "it predicts" and "it generates" are both true. The useful distinction is the **job**: traditional models score or label things, generative models produce things.
+</Callout>
+
+### How an LLM produces text
+
+Since LLMs are the engine of everything in this course, it's worth being precise about what one call does.
+
+1. Your prompt is split into **tokens**: word pieces, roughly three-quarters of a word each on average in English.
+2. The model reads all the tokens and outputs a **probability for every possible next token**. After "The capital of France is", the token " Paris" gets almost all the probability.
+3. One token is **sampled** from that distribution and appended to the text.
+4. Steps 2 and 3 repeat until the model emits a stop token or hits a length limit.
+
+Two consequences shape how you build with LLMs:
+
+- **Sampling makes output variable.** A setting called **temperature** controls how adventurous the sampling is. Near zero, the model almost always picks the most likely token, so output is close to deterministic, which is good for extraction and routing decisions. Higher values give more varied, creative text. Agents usually want low temperature for decisions.
+- **The model only sees what's in the call.** Everything it "knows" about your situation must be in the prompt: instructions, retrieved documents, previous messages, tool results. Its training data gives it general knowledge, not knowledge of your company, your user or what happened yesterday. Much of agent engineering is deciding what goes into each call.
+
+The amount of text a model can read in one call is its **context window**, measured in tokens. It's large for modern models (hundreds of thousands of tokens is common) but finite and not free: you pay per token, and very long prompts are slower and can dilute the model's attention. Managing it is a recurring theme in the memory lessons.
+
+### Where generative AI is used
+
+Because the output reads like human work, generative AI has been absorbed into almost every field that produces text, images or code:
+
+- **Writing.** Drafting blog posts from an outline, rewriting a rough email into a formal one, summarising long threads. Email clients now summarise messages and draft replies inline.
+- **Software development.** Autocomplete that writes whole functions, explaining a stack trace, generating tests and boilerplate.
+- **Customer support.** A support bot answers common questions at a scale no human team could match, and hands the hard cases to a person. Most large consumer apps now run one.
+- **Education.** Asking for a simpler explanation of a confusing passage, a personalised study plan, or help with a doubt from a lecture.
+- **Design and media.** Thumbnails, infographics, ad concepts and short video clips generated from a description and refined over a few iterations.
+
+The models also keep improving quickly. Early image generators couldn't spell the text inside an image; recent ones usually can. That pace is part of why people expect them to appear in nearly every app.
+
+## The running example: hiring a backend engineer
+
+The best way to feel the difference between generative and agentic AI is to solve one problem several times, each time with a more capable assistant, and watch what changes.
+
+Imagine you're an **HR recruiter**. Your company needs a **remote backend engineer with 2 to 4 years of experience**. Getting from "we need someone" to "they've started" involves a sequence of steps:
+
+1. **Draft a job description (JD):** responsibilities, required skills, eligibility, salary, expectations.
+2. **Post the JD** on job platforms.
+3. **Wait and monitor** applications. If too few people apply, do something about it.
+4. **Shortlist**: read the resumes and pick, say, the top 5 to 25.
+5. **Schedule interviews** with the shortlisted candidates.
+6. **Interview** them, with good questions ready.
+7. **Send an offer letter** to the chosen candidate and follow up until they reply.
+8. **Onboard** them: contract, email account, laptop, first-week sessions.
+
+Before generative AI, you'd do all of it by hand. Now let's give you an assistant, and upgrade it three times.
+
+## Level 1: a plain LLM chatbot
+
+Your company gives you a chat assistant backed by a general-purpose LLM. You use it at every step:
+
+- *"Write a JD for a backend engineer, 2 to 4 years, remote."* It produces a competent, generic JD in seconds.
+- *"Where should I post this?"* It names well-known job boards from its training data. You go and post on each one yourself.
+- *"I got 8 applications. How should I screen them?"* It offers sensible general advice: look for Python, cloud experience, project ownership. You read the 8 resumes yourself.
+- *"Draft an interview invitation."* Done. You copy it into your email client and send it.
+- *"Give me interview questions for this role."* It produces a question bank.
+- *"Draft an offer letter."* Done. You send it.
+
+This is genuinely useful. Every piece of writing got faster and probably better. But look at who is doing the actual *work*.
+
+```python
+# Every interaction is one request, one response. You drive; the model answers.
+reply = llm.invoke("Draft an interview invite for two shortlisted candidates.")
+print(reply.content)  # you still copy this, open your mail client, and send it
+```
+
+### What still goes wrong
+
+Five problems remain, and every upgrade below is about removing some of them:
+
+1. **It's reactive.** It only does something when you ask. It never says "the JD is done, shall I post it?" You hold the whole plan in your head and drive every step.
+2. **It has no memory of the task.** Come back three days later and ask "how's that JD doing?" and it has no idea which JD you mean. You paste the context back in each time.
+3. **Its advice is generic.** The JD could belong to any company. It doesn't know your stack, your salary bands, your tone or which platforms worked for you.
+4. **It can't act.** It can write the email but can't send it; it can write the JD but can't post it.
+5. **It can't adapt.** If only two people apply, it won't notice. Even after you tell it, it only answers the question you asked. It doesn't re-plan.
+
+<Callout kind="remember">
+A raw LLM is **stateless**: each call sees only the messages you send in that call. Chat products that "remember" are adding memory around the model, by resending history or storing facts. That's an engineering layer, and building it yourself is a big part of this course.
+</Callout>
+
+## Level 2: a RAG chatbot
+
+Fix the generic-advice problem first. Connect the chatbot to your company's **knowledge base**, so it answers from your documents rather than only its training data. What would you load?
+
+- **Past JDs**, especially ones that attracted lots of applicants, plus their variations (remote vs office, junior vs senior).
+- **The hiring playbook**: which platforms worked best, internal salary bands per experience level, what to look for when shortlisting, the bank of questions asked in past interviews.
+- **Onboarding material**: offer-letter and welcome-email templates, employee policies.
+
+The technique is **retrieval-augmented generation (RAG)**. When you ask a question, the system first **retrieves** the most relevant chunks from these documents (usually by embedding similarity in a vector store), then gives them to the LLM alongside your question, so the answer is **grounded** in your company's facts.
+
+Run the hiring task again:
+
+- *"Hire a backend engineer, 2 to 4 years."* The JD now names your actual stack (say Python and Django), uses the right salary band, and sounds like your company. You didn't have to say any of that.
+- *"Where should I post?"* "Based on past hires, these three platforms performed best for us."
+- *"Help me shortlist."* It applies criteria drawn from your previous successful hires.
+- Interview invites, question banks and offer letters all come out in **your** templates.
+
+That fixed problem 3. But the assistant is still reactive, still forgets between sessions, still can't act and still can't adapt. You're still copying, pasting, posting and sending.
+
+## Level 3: a tool-augmented chatbot
+
+Next, let it **act**. Give the chatbot **tools**: functions it can call to reach outside systems.
+
+| Tool | What it unlocks |
+|---|---|
+| Job board APIs | Post, edit and boost a job; read application counts |
+| Resume parser | Read PDFs and extract skills and experience |
+| Calendar API | See when the recruiter is free |
+| Email API | Send and read emails |
+| HR management system | Generate contracts, create accounts, request laptops |
+
+The model doesn't run these systems itself. It decides that a tool is needed and with what arguments, the application executes the call, and the result goes back to the model. That mechanism, **tool calling**, gets a full lesson later.
+
+Now the flow changes:
+
+- *"Post the JD."* It calls the job board APIs and confirms the posting.
+- *"How many applications so far?"* It checks: "Only one." You ask what to do; it suggests widening the role to full-stack and boosting the post, drawn from the playbook. You say yes, and it edits the posting and starts the boost.
+- *"Shortlist them."* It downloads and parses the resumes, scores each against the JD, and emails you the top two.
+- *"Schedule interviews."* It checks your calendar, proposes Friday, and sends the invites.
+- *"Send the offer."* Sent. When the candidate accepts, *"start onboarding"* triggers the contract, account and laptop requests.
+
+Problems 3 and 4 are solved. But notice the pattern in every bullet: **you** asked first. You noticed the low applicant count. You knew shortlisting came next. It's still reactive, still forgets between sessions, and it adapted only after you pointed out the problem.
+
+## Level 4: an agentic system
+
+The last upgrade changes the relationship rather than adding a feature. You stop issuing instructions and **give it a goal**:
+
+> Hire a remote backend engineer with 2 to 4 years of experience.
+
+An agentic system then does three things a chatbot doesn't:
+
+1. **Understands the goal** and its constraints (remote, 2 to 4 years, your stack, your budget).
+2. **Plans**: breaks the goal into steps. Draft JD, post it, monitor applications, adjust if needed, screen, schedule, interview support, offer, onboarding.
+3. **Executes the plan step by step**, watching what happens and adjusting, while checking in with you only where approval is needed.
+
+Here's the same task again, now driven by the system:
+
+- "I'm starting with the JD, using our past JDs and salary bands. Here's the draft. Any changes?" You approve.
+- "Posting on the two platforms that worked best for us. I'll monitor applications."
+- *Three days later, unprompted:* "Only 2 applications, well below what we usually get. I suggest broadening the title to full-stack and boosting the post with a small budget. Shall I?" You approve. It does both.
+- "8 applications in. I've screened them: 2 strong, 3 partial, 3 weak matches. Shall I schedule the 2 strong ones?" Yes.
+- "You're free on Friday afternoon. I've sent invites to both candidates and you." On Friday: "Reminder: two interviews today. I've emailed you a question doc from past interviews for this role."
+- You pick a candidate. "Here's the offer letter in our template. Send it?" Yes. It sends and **tracks** the reply.
+- "They accepted. I've sent a welcome email, requested IT access and a laptop. Shall I set up an intro meeting on their first day?"
+
+You went from operator to **supervisor**. The system did the heavy lifting; you made the judgement calls.
+
+<LgAssistantLadder />
+
+### How the problems disappear
+
+| Problem | Plain LLM | RAG | Tools | Agentic |
+|---|---|---|---|---|
+| Generic advice | yes | fixed | fixed | fixed |
+| Can't act | yes | yes | fixed | fixed |
+| Reactive | yes | yes | yes | fixed: it drives the plan |
+| No memory of the task | yes | yes | yes | fixed: it tracks the goal, progress and history |
+| Can't adapt | yes | yes | yes | fixed: it notices problems and re-plans |
+
+Notice that the agent **reuses** every earlier upgrade. It still drafts with an LLM, still grounds answers with RAG, still acts through tools. What's new is the layer on top: a **goal, a plan, memory of progress, and a loop** that keeps observing and deciding until the goal is met. Here's that loop as a sketch (not real LangGraph code; that comes later):
+
+```python
+# Conceptual sketch of an agent loop
+goal = "Hire a remote backend engineer, 2-4 years"
+memory = {"goal": goal, "done": [], "notes": []}
+plan = llm_plan(goal, memory)                 # break the goal into steps
+
+while not goal_met(memory):
+    step = next_step(plan, memory)            # decide what to do now
+    if needs_approval(step):
+        ask_human(step)                       # pause for the supervisor
+    result = run(step)                        # often a tool call
+    memory["done"].append((step, result))     # remember what happened
+    if surprising(result):                    # e.g. only 2 applicants
+        plan = llm_replan(goal, memory)       # adapt
+```
+
+Everything in this course is about building that loop properly: where the state lives, how the next step is chosen, how it pauses for a human, how it survives a crash.
+
+## The four architectures side by side
+
+It helps to see the four levels as data flows, because each one is a recognisable architecture you'll build in this course.
+
+**Plain LLM chatbot.** The user's message goes to the model, and the model's text comes back. One call per turn. If it's a chat, the app resends earlier messages each time so the model can see the conversation.
+
+```text
+user message ──▶ LLM ──▶ reply
+```
+
+**RAG chatbot.** Before calling the model, the app embeds the question, searches a vector store for the closest document chunks, and pastes them into the prompt. Still one model call per turn, with a retrieval step in front.
+
+```text
+user message ──▶ retriever ──▶ (question + relevant chunks) ──▶ LLM ──▶ reply
+```
+
+**Tool-augmented chatbot.** The model is told which tools exist (name, description, argument schema). Instead of a final answer, it may reply with a **tool call**. The app runs the tool and sends the result back, and the model then answers or calls another tool.
+
+```text
+user message ──▶ LLM ──▶ tool call ──▶ app runs tool ──▶ result ──▶ LLM ──▶ reply
+```
+
+**Agentic system.** The input is a goal. A loop runs: the model decides the next action, tools execute it, results and progress are written to memory, and the loop continues, possibly for days, until the goal is met. Approval points pause the loop for a human. Something has to keep track of where the loop is, what's been done and what to do after each result: that's the **orchestrator**, and building orchestrators is what LangGraph is for.
+
+```text
+goal ──▶ plan ──▶ ┌▶ choose next step ──▶ act (tools) ──▶ observe ──▶ update memory ─┐
+                  └──────────────── until goal met (pause for approvals) ◀───────────┘
+```
+
+Read the four diagrams again and notice how much of the work moves from the human's head into the system. In the first, the human is the orchestrator. In the last, the software is.
+
+## Generative AI vs agentic AI
+
+Pulling it together, three differences matter.
+
+**1. Content vs goals.** Generative AI's end product is **content**: a paragraph, an image, a function. Agentic AI's end product is a **goal achieved**: an engineer hired, a bug fixed, a trip booked. Content is produced along the way, as a means.
+
+**2. Reactive vs proactive.** With generative AI, the human directs every step and the model responds. With agentic AI, the human provides the goal, and the system works out and executes the steps **autonomously**, bringing the human in mainly for approvals and judgement calls.
+
+**3. Building block vs system.** Generative AI is a **component** of agentic AI. An agentic system uses an LLM as its reasoning engine, to interpret the goal, plan, choose tools and write messages, and surrounds it with tools, memory, planning and control logic. Agentic AI is the broader system; generative AI is one capability inside it.
+
+| | Generative AI | Agentic AI |
+|---|---|---|
+| Input | A prompt | A goal (plus constraints) |
+| Output | Content | A completed outcome |
+| Who plans the steps | The human | The system |
+| Initiative | Reactive: waits for the next prompt | Proactive: acts, monitors, follows up |
+| Memory | Only what's in the current prompt | Goal, progress, history, preferences |
+| Acting on the world | No (it writes about actions) | Yes, through tools |
+| When something goes wrong | Doesn't notice | Detects it and re-plans |
+| Human's role | Operator | Supervisor and approver |
+
+<Callout kind="remember">
+A neat way to hold it: **generative AI is a capability; agentic AI is a behaviour.** The capability is producing good text and reasoning. The behaviour is pursuing a goal over many steps, using that capability along with tools and memory.
+</Callout>
+
+### Agentic doesn't mean unsupervised
+
+It's tempting to read "autonomous" as "no humans". In the hiring example the agent asked before posting, before spending money on a boost, before sending invites and before sending an offer. That's by design. Actions that cost money, can't be undone, or carry legal risk (rejecting candidates, making offers) should pass through a person. Good agentic systems are built with **approval points** for exactly those steps, and LangGraph has first-class support for pausing a run to wait for a human, which you'll use later.
+
+### Not every problem needs an agent
+
+Agents are slower, cost more (many model calls per task) and are harder to test than a single prompt. If the steps are always the same and known in advance, a fixed **workflow** that calls an LLM at certain points is often the better engineering choice. Lesson 3 makes the difference between workflows and agents precise. The point of the evolution above isn't "always build an agent"; it's knowing **which upgrade fixes which problem**, so you add only what the task needs.
+
+A quick way to decide:
+
+- The answer depends on **your private data**? Add retrieval.
+- The user needs something **done** in another system, not just written? Add tools.
+- The **steps can't be known in advance**, because they depend on what happens along the way, or the task runs over days and needs monitoring? That's when a goal-driven agent pays for itself.
+- None of the above? A single well-written prompt is probably enough.
+
+## Cheat sheet
+
+- Generative AI creates new content (text, images, audio, code, video) that resembles human work.
+- Traditional ML mostly labels or predicts values; generative models learn the data's structure and produce new samples.
+- A plain LLM chatbot is reactive, stateless, generic, can't act and can't adapt.
+- RAG grounds answers in your own documents: it fixes generic advice.
+- Tools let the model act on external systems: it fixes "can't act".
+- An agentic system takes a goal, plans, executes step by step, remembers progress and adapts: it fixes reactivity, memory and adaptation.
+- Generative AI's output is content; agentic AI's output is a completed goal.
+- Generative AI is a building block inside agentic AI: the LLM is the agent's reasoning engine.
+- Autonomy comes with approval points for risky actions; the human moves from operator to supervisor.
+- Use the smallest upgrade that solves the problem; a fixed workflow often beats a full agent.

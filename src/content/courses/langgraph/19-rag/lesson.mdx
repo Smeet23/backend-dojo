@@ -1,0 +1,323 @@
+import { LgRetrieverLab } from "@/components/widgets/LgRetrieverLab";
+
+## Giving the chatbot your documents
+
+The chatbot can chat, call tools and use MCP servers. This lesson gives it one more power: answering questions about **documents you upload**. Drop a PDF into the sidebar (a company handbook, a textbook, your own notes) and ask "according to this document, what is X?". The bot finds the relevant passages and answers from them.
+
+The technique is **retrieval-augmented generation (RAG)**. The plan:
+
+1. A short recap of why RAG exists and how it works.
+2. A standalone RAG agent in LangGraph, built from scratch, where retrieval is just another tool.
+3. The same idea wired into the multi-utility chatbot, with per-conversation documents.
+
+## Why models need retrieval
+
+Three limitations of a plain LLM push you toward RAG.
+
+**Outdated knowledge.** A model learns from data up to its training cutoff. Anything after that (this week's news, last month's release notes) simply isn't in its weights. Chat apps that seem to know today's news are searching the web behind the scenes and feeding results to the model, which is itself a form of RAG.
+
+**Private data.** The model never saw your company's financial reports, your internal wiki or your personal expense sheet. No amount of prompting makes it know facts it was never shown. This is the most common reason teams build RAG: chatting with *their own* data.
+
+**Hallucination.** Asked something it doesn't know, a model often produces a fluent, confident, wrong answer: invented citations, plausible but fake links. Giving it the relevant source text and instructing it to answer *from that text* **grounds** the answer and makes errors much rarer and easier to check.
+
+## In-context learning
+
+RAG rests on a simple property of LLMs called **in-context learning**: a model can use information you put in the prompt, even if it never saw that information in training.
+
+A model answers from two sources:
+
+- **Parametric knowledge**: what's baked into its weights from training.
+- **Context**: whatever is in the current prompt.
+
+So the naive approach to "chat with my expense sheet" is to paste the whole sheet into the prompt and ask your question. For a small file, that genuinely works.
+
+It breaks down at scale. The **context window** (the number of tokens a model can take in at once) is finite, and cost and latency grow with every token you send. A folder of a hundred e-books or a codebase with a million lines won't fit, and even when a large chunk technically fits, burying the answer among thousands of irrelevant pages makes answers worse.
+
+The fix is to **filter the context**: send only the few passages relevant to *this* question. If someone asks "what is overfitting?", you send the three pages about overfitting, not the whole book. Finding those passages quickly and reliably is what the rest of RAG is about.
+
+## How RAG works
+
+RAG has two phases.
+
+### Indexing, done once per document
+
+1. **Load** the source (a PDF, web pages, a database export) into text documents.
+2. **Split** it into **chunks**, small enough to be precise, large enough to carry meaning.
+3. **Embed** each chunk: an **embedding model** turns text into a vector (a list of numbers) such that texts with similar *meaning* get vectors that point in similar directions. "How do I reset my password?" and "steps to recover account access" share few words but land close together.
+4. **Store** each vector, along with its chunk text and metadata, in a **vector store** (FAISS, Chroma, pgvector, a managed service...), a database built for finding nearest vectors fast.
+
+### Querying, done for every question
+
+1. **Retrieve**: a **retriever** embeds the question with the *same* embedding model and asks the vector store for the `k` chunks whose vectors are most similar.
+2. **Augment**: put those chunks' text into the prompt next to the question.
+3. **Generate**: the LLM reads the question and the retrieved passages and writes the answer, using its parametric knowledge mainly for language and reasoning.
+
+The vector store keeps the original text next to each vector precisely so step 2 has something to paste. Vectors are for searching; text is for reading.
+
+### What similarity means
+
+An embedding is a point in a space with hundreds or thousands of dimensions. You can't picture that, but you can picture the idea in two: imagine one axis for "about trees" and one for "about overfitting". A chunk on pruning decision trees sits high on both; a chunk on neural network layers sits near neither.
+
+Retrieval compares the question's vector with each chunk's vector, usually by **cosine similarity**: how closely the two vectors point in the same direction, from 1 (same direction, same meaning) down through 0 (unrelated). The top `k` scores win. Two practical consequences:
+
+- **Meaning beats wording.** "Why does my model ace training but fail on new data?" retrieves a chunk titled "Overfitting" even though they share almost no words. Keyword search would miss it.
+- **Same model on both sides.** Vectors from different embedding models live in different spaces and can't be compared. Index and query with the same model, and re-index everything if you switch models.
+
+Vector stores use approximate nearest-neighbour indexes so this comparison stays fast across millions of chunks, rather than scoring every chunk one by one.
+
+<LgRetrieverLab />
+
+## Retrieval as a tool
+
+There are several ways to put RAG into a LangGraph graph. You could run retrieval on every message as a fixed step (`START → retrieve → generate → END`). That's simple, but wasteful and sometimes harmful: "hi" doesn't need a vector search, and retrieved book passages can distract the model from a question about stock prices.
+
+The approach used here, and the standard template for agentic apps, is to **wrap the retriever in a tool**. The model then decides *when* to retrieve and *what query* to send, exactly as it decides when to call a calculator. If you already know how to build a tool-calling graph, RAG is one more tool.
+
+| | Fixed retrieve-then-generate | Retrieval as a tool |
+|---|---|---|
+| When retrieval runs | Every message | Only when the model decides it's needed |
+| Search query | The raw user message | Written by the model, can be rephrased from chat history |
+| Multiple searches | One per message | The model can search again with a better query, or search twice for a comparison |
+| Mixing with other tools | Awkward | Natural: retrieval sits next to search, calculator and stock tools |
+| Predictability | High: always the same path | Lower: the model can skip retrieval when it shouldn't |
+
+The last row is the honest trade-off. A model can occasionally answer from memory when it should have checked the document. Clear tool descriptions and a system prompt ("for questions about the uploaded document, always use rag_tool") keep that rare, and the fixed pipeline remains a good choice for single-purpose apps where every question is about the documents.
+
+## Building the index
+
+Install the pieces (the PDF loader lives in the community package; splitters have their own package):
+
+```bash
+pip install -U langgraph langchain langchain-openai langchain-community langchain-text-splitters pypdf faiss-cpu python-dotenv
+```
+
+Load a PDF. `PyPDFLoader` returns one `Document` per page, each with `page_content` and `metadata` (source file, page number, and PDF properties like author when present):
+
+```python
+from langchain_community.document_loaders import PyPDFLoader
+
+docs = PyPDFLoader("intro-to-ml.pdf").load()
+len(docs)                  # e.g. 214 pages
+docs[0].metadata["page"]   # 0
+```
+
+Split the pages into chunks:
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+chunks = splitter.split_documents(docs)
+```
+
+`RecursiveCharacterTextSplitter` tries to split on paragraph breaks first, then lines, then sentences, then words, so chunks end at natural boundaries where possible. Two knobs:
+
+- **`chunk_size`** (in characters): too large and each chunk mixes several topics, so retrieval gets fuzzy and you waste context; too small and a chunk loses the surrounding meaning.
+- **`chunk_overlap`**: consecutive chunks share this many characters, so a sentence or idea that straddles a boundary still appears whole in at least one chunk.
+
+Embed and store. An in-memory FAISS index is fine for a single document:
+
+```python
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+vector_store = FAISS.from_documents(chunks, embeddings)
+```
+
+`from_documents` runs the embedding model over every chunk and builds the index in one call. (If you'd rather avoid the FAISS dependency while experimenting, `InMemoryVectorStore(embeddings)` from `langchain_core.vectorstores` plus `add_documents(chunks)` does the same job.)
+
+<Callout kind="warn">
+Indexing calls the embedding model once per chunk, so it costs money and time. Do it once per document and keep the index (FAISS has `save_local` / `load_local`; hosted stores persist by design). Never re-embed the same file on every question.
+</Callout>
+
+## The retriever
+
+A **retriever** is the query-side interface: string in, relevant documents out. Get one from the vector store:
+
+```python
+retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})
+
+results = retriever.invoke("What is a decision tree?")
+len(results)                     # 4
+results[0].page_content[:80]     # 'A decision tree is a flowchart-like structure in which ...'
+results[0].metadata              # {'source': 'intro-to-ml.pdf', 'page': 87, ...}
+```
+
+`search_type="similarity"` means plain nearest-neighbour search, and `k` is how many chunks come back. Behind `invoke`, the retriever embeds the question, compares it with every stored vector, and returns the top `k` as `Document` objects. Each has an `id`, `metadata` and `page_content`; the answer lives in `page_content`, and `metadata` is how you'll cite pages.
+
+## Wrapping the retriever in a tool
+
+```python
+from langchain_core.tools import tool
+
+@tool
+def rag_tool(query: str) -> dict:
+    """Search the uploaded PDF (an introductory machine learning textbook) for passages
+    relevant to the query. Use this whenever the user asks about the document or its topics."""
+    results = retriever.invoke(query)
+    return {
+        "query": query,
+        "context": [doc.page_content for doc in results],
+        "metadata": [doc.metadata for doc in results],
+    }
+```
+
+Three details matter:
+
+- The **docstring** tells the model what the document is about and when to call the tool. "Use this whenever the user asks about the document" is what makes the model reach for it on "based on the PDF, explain...".
+- The model writes the `query`. It can rephrase a vague follow-up ("and how do I pick k for it?") into a standalone search ("choosing k in k-nearest neighbours") using the chat history.
+- Returning **metadata** alongside the text lets the model cite pages ("see page 87") and lets you show sources in the UI.
+
+## The RAG graph
+
+The graph is the tool-calling loop from the tools lesson, unchanged:
+
+```python
+from typing import Annotated, TypedDict
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AnyMessage, HumanMessage
+from langgraph.graph import StateGraph, START
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+
+llm = init_chat_model("openai:gpt-4.1-mini")
+tools = [rag_tool]
+llm_with_tools = llm.bind_tools(tools)
+
+class ChatState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+def chat_node(state: ChatState):
+    return {"messages": [llm_with_tools.invoke(state["messages"])]}
+
+builder = StateGraph(ChatState)
+builder.add_node("chat_node", chat_node)
+builder.add_node("tools", ToolNode(tools))
+builder.add_edge(START, "chat_node")
+builder.add_conditional_edges("chat_node", tools_condition)
+builder.add_edge("tools", "chat_node")
+chatbot = builder.compile()
+```
+
+```python
+out = chatbot.invoke({"messages": [HumanMessage(
+    "Using the PDF notes, explain how to choose the value of k in k-nearest neighbours."
+)]})
+print(out["messages"][-1].content)
+```
+
+Retrieval questions take a few seconds longer than plain chat (an embedding call, a search, and a second model call with a bigger prompt), which is expected.
+
+### What the trace shows
+
+In LangSmith, a document question produces the familiar three steps:
+
+1. **chat_node**: the model sees the question and the tool schema and requests `rag_tool` with a query such as "how to split a node in a decision tree".
+2. **tools**: `rag_tool` runs; you can see the four retrieved chunks and their metadata in its output.
+3. **chat_node** again: its input holds the question, its own tool request and the retrieved chunks; its output is the grounded answer, and the route goes to the end.
+
+When a RAG answer is wrong, the trace tells you which half failed. If the right passage isn't among the retrieved chunks, it's a **retrieval** problem (chunking, `k`, the query the model wrote, the embedding model). If it's there and the answer still misstates it, it's a **generation** problem (the prompt, the model).
+
+<Callout kind="tip">
+Add a system message such as "Answer document questions only from the rag_tool results; if they don't contain the answer, say so." Grounding works best when the model is told it's allowed to say "the document doesn't cover that".
+</Callout>
+
+## Tuning retrieval
+
+The defaults above (1,000-character chunks, 200 overlap, `k=4`) are a reasonable start, not a law. Retrieval quality depends on your documents, so tune by looking at what actually comes back for real questions:
+
+| Knob | Too low | Too high |
+|---|---|---|
+| `chunk_size` | Chunks lose context; a definition is split from its explanation | Chunks mix topics; similarity gets fuzzy and prompts fill with noise |
+| `chunk_overlap` | Ideas cut at chunk boundaries are never retrieved whole | Many near-duplicate chunks; wasted storage and context |
+| `k` | The answer is spread over more chunks than you return | Irrelevant chunks dilute the prompt and cost tokens |
+
+A practical loop: write ten questions you know the answers to, run `retriever.invoke` on each, and check whether the right passage is in the results. If it isn't, fix retrieval before touching prompts. Structured documents also benefit from splitting along their structure (headings, sections, functions in code) rather than raw character counts.
+
+Two further improvements are worth knowing by name. **Metadata filtering** restricts the search to, say, one source file or one thread (`search_kwargs={"k": 4, "filter": {...}}` on stores that support it). **MMR** (maximal marginal relevance, `search_type="mmr"`) picks chunks that are relevant *and* different from each other, which helps when a document repeats itself. Later lessons on corrective and self-reflective RAG go further, grading retrieved chunks and retrying when they're poor.
+
+## Showing sources
+
+Grounded answers are most useful when users can check them. Because `rag_tool` returns metadata, the final answer can cite pages, and the UI can list them:
+
+```python
+from langchain_core.messages import SystemMessage
+
+SYSTEM = SystemMessage(
+    "When you use rag_tool, answer only from its context and cite pages like (p. 87). "
+    "If the context doesn't contain the answer, say the document doesn't cover it."
+)
+
+def chat_node(state: ChatState):
+    return {"messages": [llm_with_tools.invoke([SYSTEM, *state["messages"]])]}
+```
+
+The system message is prepended at call time rather than stored in state, so it doesn't pile up in the history. In a chat UI you can go one step further and render the tool's `metadata` list under the answer as "Sources: intro-to-ml.pdf, pages 87 and 89", read straight from the `ToolMessage` in the thread's state.
+
+## RAG in the multi-utility chatbot
+
+The production chatbot now combines everything: plain chat, search, calculator, stock prices, MCP tools, and RAG over an uploaded PDF. Two changes make RAG fit a multi-conversation app.
+
+### Ingest on upload
+
+Indexing becomes a function the UI calls when a file is uploaded, so the expensive part happens once per document:
+
+```python
+import tempfile
+
+_retrievers: dict[str, object] = {}   # thread_id -> retriever
+
+def ingest_pdf(file_bytes: bytes, thread_id: str, filename: str) -> dict:
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(file_bytes)
+        path = f.name
+    docs = PyPDFLoader(path).load()
+    chunks = splitter.split_documents(docs)
+    store = FAISS.from_documents(chunks, embeddings)
+    _retrievers[thread_id] = store.as_retriever(search_kwargs={"k": 4})
+    return {"filename": filename, "pages": len(docs), "chunks": len(chunks)}
+```
+
+In Streamlit, a `st.sidebar.file_uploader("Upload a PDF", type="pdf")` passes the bytes and the current thread id to `ingest_pdf`, and shows the page and chunk counts so the user knows it worked.
+
+### One document per conversation
+
+Each conversation (thread) can have its own PDF, so the tool must search **this thread's** retriever. You don't want the model inventing thread ids, so read the id from the run's config instead. A tool that declares a `RunnableConfig` parameter receives the config automatically, and that parameter is hidden from the model's schema:
+
+```python
+from langchain_core.runnables import RunnableConfig
+
+@tool
+def rag_tool(query: str, config: RunnableConfig) -> dict:
+    """Search the PDF the user uploaded in this conversation for passages relevant to the query."""
+    thread_id = config["configurable"]["thread_id"]
+    retriever = _retrievers.get(thread_id)
+    if retriever is None:
+        return {"error": "No document has been uploaded in this conversation yet."}
+    results = retriever.invoke(query)
+    return {
+        "query": query,
+        "context": [d.page_content for d in results],
+        "metadata": [d.metadata for d in results],
+    }
+```
+
+The rest of the backend is unchanged: `rag_tool` joins the tool list, the graph is the same loop with the checkpointer, and the frontend still streams only AI message chunks. Ask "what's Apple's stock price?" and the bot uses the stock tool; ask "based on the document, what were Google Brain's main achievements?" and it uses `rag_tool`. The model routes between capabilities by reading tool descriptions, which is why those docstrings deserve care.
+
+<Callout kind="warn">
+The `_retrievers` dict lives in memory: restart the app and uploaded documents are forgotten even though the chat history survives in SQLite. For a real deployment, persist the index (save FAISS to disk keyed by thread, or use a persistent vector store and filter by a `thread_id` metadata field).
+</Callout>
+
+## Cheat sheet
+
+- RAG addresses outdated knowledge, private data and hallucination by putting relevant source text into the prompt.
+- It relies on in-context learning, but the context window is finite, so you send only the relevant chunks.
+- Indexing: load, split (chunk_size, chunk_overlap), embed, store vectors plus text in a vector store.
+- Querying: embed the question, retrieve the top k similar chunks, augment the prompt, generate.
+- `vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 4})`; `retriever.invoke(q)` returns `Document`s with `page_content` and `metadata`.
+- Wrap the retriever in a `@tool` so the model decides when to retrieve and writes the search query.
+- The RAG agent is the standard tool loop: chat_node, ToolNode, tools_condition, tools back to chat_node.
+- Return metadata from the tool so answers can cite pages.
+- In LangSmith, check retrieved chunks first: missing passage = retrieval problem; misread passage = generation problem.
+- Index once per upload; key retrievers by thread, and read the thread id from an injected `RunnableConfig`.

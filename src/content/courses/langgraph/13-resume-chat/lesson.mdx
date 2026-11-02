@@ -1,0 +1,509 @@
+import { LgThreadSidebar } from "@/components/widgets/LgThreadSidebar";
+
+## What we are building
+
+Open any modern chat assistant and you get two things side by side. The main pane holds the conversation you're having right now. A sidebar lists your earlier conversations: a recipe question from yesterday, a coding session from last week. You can click **New chat** to start fresh, or click an old conversation and carry on exactly where you stopped. The assistant still remembers what was said in that conversation, and only that conversation.
+
+By the end of this lesson our LangGraph chatbot will do the same:
+
+- A sidebar with a title, a **New chat** button and a **My conversations** list.
+- Every conversation gets its own identity, generated automatically.
+- Starting a new chat never loses the old ones.
+- Clicking an old conversation loads its full history and resumes it, memory included.
+
+The surprising part: **the LangGraph backend doesn't change at all.** Everything we need is already there. The work is in the Streamlit front end, which has to manage which conversation is "current" and ask the backend for history when the user switches.
+
+## Threads are the whole trick
+
+Recall how memory works in LangGraph. A graph compiled with a checkpointer saves a snapshot of the state after every step. Each snapshot is filed under a **thread id**, which you pass in the config on every call:
+
+```python
+config = {"configurable": {"thread_id": "abc-123"}}
+chatbot.invoke({"messages": [HumanMessage(content="Hi, I'm Asha")]}, config=config)
+```
+
+When the next call arrives with the same thread id, the checkpointer loads that thread's latest state, the `add_messages` reducer appends the new message to the stored ones, and the model sees the whole conversation. A different thread id means a different, empty history.
+
+So a thread id **is** a conversation. "Multiple chats like ChatGPT" boils down to three front-end jobs:
+
+| User action | What the front end must do with thread ids |
+|---|---|
+| Starts a new chat | Create a brand-new thread id and make it current |
+| Sends a message | Send it with the **current** thread id |
+| Clicks an old chat | Make that chat's thread id current and fetch its stored messages |
+
+The checkpointer already keeps every thread's messages separate. Our job is bookkeeping: remember which thread ids exist, which one is active, and what to draw on screen.
+
+<Callout kind="remember">
+The checkpointer is the source of truth for conversation content. The front end only tracks **which** thread is active and **which** threads exist, then asks the graph for the content when it needs it.
+</Callout>
+
+## Plan the feature in small steps
+
+A feature like this is easy to get tangled in if you code it in one go. Break it into small, testable steps, and run the app after each one:
+
+1. Draw the sidebar: title, New chat button, My conversations header.
+2. Replace the hard-coded thread id with a generated one stored in the session.
+3. Make New chat start a fresh conversation.
+4. Keep a list of every thread id so old chats don't vanish.
+5. Show each thread as a clickable button.
+6. On click, load that thread's history from the graph and resume it.
+
+Each step leaves the app working, which makes it obvious which step broke something.
+
+## The starting point
+
+Here's the backend. It's the plain chat graph from earlier lessons, compiled with an in-memory checkpointer:
+
+```python
+# chatbot_backend.py
+from typing import Annotated, TypedDict
+
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AnyMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+
+llm = init_chat_model("openai:gpt-4.1-mini")  # reads OPENAI_API_KEY from the environment
+
+
+class ChatState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+
+def chat_node(state: ChatState):
+    response = llm.invoke(state["messages"])
+    return {"messages": [response]}
+
+
+builder = StateGraph(ChatState)
+builder.add_node("chat_node", chat_node)
+builder.add_edge(START, "chat_node")
+builder.add_edge("chat_node", END)
+
+chatbot = builder.compile(checkpointer=InMemorySaver())
+```
+
+And here's the streaming front end we finish with today's work removed. Notice the problem on the config line: every conversation is crammed into one thread called `"thread-1"`.
+
+```python
+# app.py (before)
+import streamlit as st
+from langchain_core.messages import HumanMessage
+from chatbot_backend import chatbot
+
+if "message_history" not in st.session_state:
+    st.session_state["message_history"] = []
+
+for message in st.session_state["message_history"]:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+user_input = st.chat_input("Type here")
+if user_input:
+    st.session_state["message_history"].append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    config = {"configurable": {"thread_id": "thread-1"}}  # one thread for everything
+    with st.chat_message("assistant"):
+        reply = st.write_stream(
+            chunk.content
+            for chunk, metadata in chatbot.stream(
+                {"messages": [HumanMessage(content=user_input)]},
+                config=config,
+                stream_mode="messages",
+            )
+        )
+    st.session_state["message_history"].append({"role": "assistant", "content": reply})
+```
+
+Two lists of messages exist here, and it's worth being clear about why:
+
+- The **checkpointer** holds LangChain message objects (`HumanMessage`, `AIMessage`) per thread. That's what the model sees.
+- `st.session_state["message_history"]` holds simple `role`/`content` dictionaries for **drawing the screen**. Streamlit re-runs the whole script on every interaction, so anything not in session state is forgotten between reruns.
+
+## Step 1 the sidebar skeleton
+
+Anything you call on `st.sidebar` is drawn in the collapsible left panel instead of the main area:
+
+```python
+st.sidebar.title("LangGraph Chatbot")
+new_chat_clicked = st.sidebar.button("New chat")
+st.sidebar.header("My conversations")
+```
+
+Run `streamlit run app.py`. The sidebar appears; the button does nothing yet, and chatting still works. That's a good checkpoint.
+
+## Step 2 generating thread ids
+
+A hard-coded `"thread-1"` can't work, because you don't know in advance how many conversations a user will start. Every new conversation needs a fresh id generated by code. A UUID is the standard choice: random, effectively collision-free, and no central counter to coordinate.
+
+```python
+import uuid
+
+def generate_thread_id() -> str:
+    return str(uuid.uuid4())  # e.g. "3f2b8c1e-5d7a-4c2f-9b1e-8a6d0f4e2c91"
+```
+
+Why not a simple counter (chat-1, chat-2, …)? A counter has to live somewhere and be incremented safely. Kept in session state, two browser tabs would both create "chat-1"; kept globally, it resets when the server restarts and starts colliding with old ids once threads are stored in a database. A random UUID needs no coordination at all.
+
+Return it as a **string**, not a `UUID` object. Thread ids end up as button labels, dictionary keys and, in the next lesson, database values; a plain string works everywhere, while a raw `UUID` object will be rejected by widgets that expect text.
+
+Now set up the session so a thread id exists from the very first run:
+
+```python
+if "message_history" not in st.session_state:
+    st.session_state["message_history"] = []
+
+if "thread_id" not in st.session_state:
+    st.session_state["thread_id"] = generate_thread_id()
+```
+
+The `if ... not in st.session_state` guard matters. Streamlit re-runs the script top to bottom after every click and every message. Without the guard you'd mint a new thread id on every rerun, and the chatbot would forget everything after each reply.
+
+Finally, use the session's thread id when calling the graph:
+
+```python
+config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
+```
+
+To confirm it works, show the current id in the sidebar for now: `st.sidebar.text(st.session_state["thread_id"])`.
+
+## Step 3 the new chat button
+
+Clicking **New chat** should give the user a blank conversation. Behind the scenes that's three things:
+
+1. Generate a new thread id.
+2. Store it as the current thread id in the session.
+3. Empty `message_history`, so the main pane clears.
+
+Wrap them in a function:
+
+```python
+def reset_chat():
+    st.session_state["thread_id"] = generate_thread_id()
+    st.session_state["message_history"] = []
+```
+
+And call it when the button is clicked. In Streamlit, `st.button` returns `True` on exactly the rerun triggered by the click:
+
+```python
+if st.sidebar.button("New chat"):
+    reset_chat()
+```
+
+Notice that we never "delete" anything from the backend. The old conversation is still sitting in the checkpointer under its thread id. We simply stopped pointing at it.
+
+### The disappearing thread bug
+
+Try it: chat about idli, click New chat, and the screen clears and a new id appears. But the old id is gone from the sidebar. The idli conversation still exists in the checkpointer, yet nothing in the UI remembers its thread id, so there's no way back to it. We need a list.
+
+## Step 4 remembering every thread
+
+Keep a list of every thread id in session state, next to the current one. Because it lives in session state, it survives reruns and isn't touched when a new chat starts.
+
+When does a thread id need adding to the list? In exactly two places:
+
+- On the very first run, for the thread id created at startup.
+- Every time New chat creates another one.
+
+Anything done in two places deserves a helper:
+
+```python
+def add_thread(thread_id: str):
+    if thread_id not in st.session_state["chat_threads"]:
+        st.session_state["chat_threads"].append(thread_id)
+```
+
+The membership check keeps the list free of duplicates; the startup code runs on every rerun, and without the check the same id would be appended over and over.
+
+Wire it into both places:
+
+```python
+if "chat_threads" not in st.session_state:
+    st.session_state["chat_threads"] = []
+
+add_thread(st.session_state["thread_id"])  # the startup thread
+
+
+def reset_chat():
+    thread_id = generate_thread_id()
+    st.session_state["thread_id"] = thread_id
+    add_thread(thread_id)  # the new thread
+    st.session_state["message_history"] = []
+```
+
+Then show the whole list instead of only the current id:
+
+```python
+for thread_id in st.session_state["chat_threads"]:
+    st.sidebar.text(thread_id)
+```
+
+Now each New chat adds a line, and the earlier ones stay put.
+
+## Step 5 turning ids into buttons
+
+Plain text can't be clicked. Swap `st.sidebar.text` for `st.sidebar.button`:
+
+```python
+for thread_id in st.session_state["chat_threads"]:
+    if st.sidebar.button(thread_id, key=f"thread-{thread_id}"):
+        ...  # load this conversation (next step)
+```
+
+Two details:
+
+- The label must be a string, which is why `generate_thread_id` returns `str(uuid.uuid4())`.
+- Give each button a unique `key`. Streamlit identifies widgets by their label and parameters; two buttons with the same label (say, two chats both titled "New chat" later on) would clash. Keying by thread id avoids that.
+
+## Step 6 loading a conversation
+
+When a thread button is clicked, the plan is:
+
+1. Make that thread id the **current** one in the session.
+2. Ask LangGraph for every message stored under it.
+3. Convert those messages into the `role`/`content` format the screen uses.
+4. Put the result into `message_history`; the existing drawing loop does the rest.
+
+### Reading a thread's messages
+
+A compiled graph with a checkpointer can tell you the latest state of any thread with `get_state`. It returns a `StateSnapshot`; the state itself is in `.values`, a dictionary keyed by your state fields:
+
+```python
+snapshot = chatbot.get_state({"configurable": {"thread_id": "abc-123"}})
+print(snapshot.values["messages"])
+# [HumanMessage(content="Hi, I'm Asha", ...), AIMessage(content="Hello Asha! ...", ...)]
+```
+
+Wrap that in a helper. Use `.get` with a default: a thread that was created but never used (New chat, then nothing typed) has no checkpoint yet, so `.values` is an empty dictionary and indexing `["messages"]` would crash.
+
+```python
+def load_conversation(thread_id: str):
+    snapshot = chatbot.get_state({"configurable": {"thread_id": thread_id}})
+    return snapshot.values.get("messages", [])
+```
+
+### Converting messages for the UI
+
+The checkpointer stores message objects; the screen wants dictionaries. Convert by checking each message's type:
+
+```python
+from langchain_core.messages import AIMessage, HumanMessage
+
+def to_ui_messages(messages):
+    ui_messages = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            ui_messages.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage) and msg.content:
+            ui_messages.append({"role": "assistant", "content": msg.content})
+    return ui_messages
+```
+
+Being explicit about both types (rather than "human, else assistant") pays off later. Once the chatbot gets tools, threads will also contain `ToolMessage`s and AI messages whose only content is a tool call. Those are internal plumbing, not something a user wants in the transcript, so they're skipped.
+
+### Wiring the click
+
+```python
+for thread_id in st.session_state["chat_threads"]:
+    if st.sidebar.button(thread_id, key=f"thread-{thread_id}"):
+        st.session_state["thread_id"] = thread_id  # switch first!
+        messages = load_conversation(thread_id)
+        st.session_state["message_history"] = to_ui_messages(messages)
+```
+
+The first line is easy to forget, and forgetting it produces a nasty bug. The screen would show the old conversation, because `message_history` was refreshed, but the session's thread id would still point at whichever chat was active before. The next message would be appended to the **wrong** thread. Ask "what's my name?" in Asha's chat and the bot answers "Rahul", because that question actually went into Rahul's thread. Screen and backend would silently disagree.
+
+Try that bug yourself below: turn on the faulty switch, load an old chat, and ask its name.
+
+<LgThreadSidebar />
+
+## How Streamlit reruns shape this code
+
+Streamlit's execution model explains why the code is ordered the way it is. Every interaction (a click, a submitted message) re-runs the script from the top, with `st.session_state` carried over:
+
+1. Session setup runs first, but the `not in` guards make it a no-op after the first run.
+2. The sidebar is drawn, and the clicked button returns `True` during this rerun. Its handler updates `thread_id` and `message_history` **before** the main pane is drawn.
+3. The main pane loops over `message_history`, so it already shows the newly selected conversation.
+4. If the user typed something, it's sent with the now-current `thread_id`.
+
+Put the history-drawing loop **above** the sidebar handlers and every switch would appear one click late, because the screen would be drawn before the handler changed what to draw.
+
+<Callout kind="tip">
+In Streamlit, "state changes, then draw" must happen in that order within one run. Handle buttons before drawing anything that depends on what they change.
+</Callout>
+
+## Newest chats first
+
+Chat apps show the most recent conversation at the top. Our list is in creation order, oldest first. The fix is purely presentational, so reverse it when drawing and leave the stored list alone:
+
+```python
+for thread_id in reversed(st.session_state["chat_threads"]):
+    ...
+```
+
+## Giving chats a title
+
+A sidebar full of UUIDs is functional but ugly. Real assistants show a short title. The simplest decent approach needs no extra storage: use the start of the first thing the user said in that thread, which the checkpointer already has.
+
+```python
+def thread_title(thread_id: str) -> str:
+    for msg in load_conversation(thread_id):
+        if isinstance(msg, HumanMessage):
+            text = msg.content.strip().replace("\n", " ")
+            return text[:30] + ("…" if len(text) > 30 else "")
+    return "New chat"
+```
+
+Use it as the button label, keeping the thread id as the key:
+
+```python
+for thread_id in reversed(st.session_state["chat_threads"]):
+    if st.sidebar.button(thread_title(thread_id), key=f"thread-{thread_id}"):
+        ...  # same switching code as before
+```
+
+Two refinements you might add later. You can ask the model for a 3–5 word summary of the first exchange and cache it (in session state now, or in a database once you have one). And since `thread_title` calls `get_state` for every thread on every rerun, cache the titles once there are dozens of chats instead of recomputing them each time.
+
+## Two copies of the conversation
+
+The front end now keeps the conversation in two places: `message_history` in session state, and the messages in the checkpointer. That duplication is deliberate, but it's worth knowing the trade-off, because it's a common source of subtle bugs.
+
+**Why keep a UI copy at all?** Streamlit redraws the whole page on every rerun. Reading the dictionary list from session state is instant, while calling `get_state` means asking the checkpointer to load and deserialise the latest snapshot. With an in-memory saver that's cheap; with a database it's a query on every keystroke-triggered rerun. The UI copy is a cache of what's on screen.
+
+**What can go wrong?** Any cache can drift from its source. If a node ever edits or removes messages (trimming long histories, say, which comes in a later lesson), the checkpointer's list changes but `message_history` doesn't. The screen then shows messages the model no longer sees. Forgetting to switch `thread_id` on a click, as shown above, is another way for the two to disagree.
+
+**The simpler alternative.** Drop `message_history` and render straight from the graph on each rerun:
+
+```python
+for message in to_ui_messages(load_conversation(st.session_state["thread_id"])):
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+```
+
+Now there's one source of truth and nothing to keep in sync, and switching threads is just a matter of changing `thread_id`. The cost is a `get_state` call per rerun, which is negligible for small apps. A good rule: start with the single source of truth, and add a UI cache only when you measure that the extra reads matter.
+
+## The full front end
+
+Everything together, in the order Streamlit needs:
+
+```python
+# app.py
+import uuid
+
+import streamlit as st
+from langchain_core.messages import AIMessage, HumanMessage
+
+from chatbot_backend import chatbot
+
+
+# ---------- utilities ----------
+def generate_thread_id() -> str:
+    return str(uuid.uuid4())
+
+
+def add_thread(thread_id: str):
+    if thread_id not in st.session_state["chat_threads"]:
+        st.session_state["chat_threads"].append(thread_id)
+
+
+def reset_chat():
+    thread_id = generate_thread_id()
+    st.session_state["thread_id"] = thread_id
+    add_thread(thread_id)
+    st.session_state["message_history"] = []
+
+
+def load_conversation(thread_id: str):
+    snapshot = chatbot.get_state({"configurable": {"thread_id": thread_id}})
+    return snapshot.values.get("messages", [])
+
+
+def to_ui_messages(messages):
+    ui = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            ui.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AIMessage) and msg.content:
+            ui.append({"role": "assistant", "content": msg.content})
+    return ui
+```
+
+```python
+# ---------- session setup ----------
+if "message_history" not in st.session_state:
+    st.session_state["message_history"] = []
+if "thread_id" not in st.session_state:
+    st.session_state["thread_id"] = generate_thread_id()
+if "chat_threads" not in st.session_state:
+    st.session_state["chat_threads"] = []
+add_thread(st.session_state["thread_id"])
+
+# ---------- sidebar ----------
+st.sidebar.title("LangGraph Chatbot")
+if st.sidebar.button("New chat"):
+    reset_chat()
+
+st.sidebar.header("My conversations")
+for thread_id in reversed(st.session_state["chat_threads"]):
+    if st.sidebar.button(thread_id, key=f"thread-{thread_id}"):
+        st.session_state["thread_id"] = thread_id
+        st.session_state["message_history"] = to_ui_messages(load_conversation(thread_id))
+```
+
+```python
+# ---------- main pane ----------
+for message in st.session_state["message_history"]:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+user_input = st.chat_input("Type here")
+if user_input:
+    st.session_state["message_history"].append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    config = {"configurable": {"thread_id": st.session_state["thread_id"]}}
+    with st.chat_message("assistant"):
+        reply = st.write_stream(
+            chunk.content
+            for chunk, metadata in chatbot.stream(
+                {"messages": [HumanMessage(content=user_input)]},
+                config=config,
+                stream_mode="messages",
+            )
+        )
+    st.session_state["message_history"].append({"role": "assistant", "content": reply})
+```
+
+A quick test script: say "My name is Asha" in the first chat. Click New chat and say "My name is Rahul". Click the first chat and ask "What's my name?": Asha. Switch to the second and ask again: Rahul. Each thread's memory is independent because each has its own checkpoint history.
+
+## What is still missing
+
+Refresh the browser tab, or restart the Streamlit server, and every conversation disappears. There are two separate reasons:
+
+- **The thread list** lives in `st.session_state`, which belongs to one browser session. A new session starts with an empty list.
+- **The messages** live in `InMemorySaver`, which keeps checkpoints in the Python process's RAM. When the process stops, they're gone.
+
+Even if you kept the thread ids somewhere, an in-memory checkpointer would have nothing left to load. The fix is to store checkpoints in a database and to rebuild the thread list from that database at startup. That's the next lesson.
+
+<Callout kind="warn">
+This design has no notion of **users**. Every browser session sees only the threads it created, and once threads live in a shared database, anyone who knows a thread id could load it. A real multi-user app must map thread ids to an authenticated user and check that mapping before calling `get_state`.
+</Callout>
+
+## Cheat sheet
+
+- One conversation is one `thread_id`; the checkpointer keeps each thread's messages separate.
+- The backend needs no changes for multi-chat; the front end manages which thread is current.
+- Generate ids with `str(uuid.uuid4())`, and guard session setup with `if key not in st.session_state`.
+- New chat means: new id, make it current, add it to `chat_threads`, clear `message_history`.
+- Keep every id in `st.session_state["chat_threads"]`, deduplicated by a small `add_thread` helper.
+- Use `st.sidebar.button(label, key=...)` with a unique key per thread.
+- Load history with `chatbot.get_state(config).values.get("messages", [])`.
+- Convert `HumanMessage` and `AIMessage` to `role`/`content` dicts, and skip tool plumbing.
+- On switch, update `st.session_state["thread_id"]` first, or new messages land in the wrong thread.
+- Handle sidebar clicks before drawing the main pane, and reverse the list to show newest first.
+- `InMemorySaver` plus session state means everything is lost on restart; persistence fixes that.

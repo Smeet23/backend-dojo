@@ -1,0 +1,384 @@
+import { LgStreamlitRerun } from "@/components/widgets/LgStreamlitRerun";
+
+## From terminal to browser
+
+The chatbot from the last two lectures works: it has a chat graph, `add_messages`, and a checkpointer that gives it memory. But you talk to it through `input()` in a terminal or a notebook cell. Nobody outside your laptop can use it, and it doesn't look like a chat app.
+
+This lecture puts a web interface on it, the familiar layout from every AI assistant:
+
+- a text box pinned to the bottom of the page;
+- messages stacked above it, each with an icon showing who sent it (you or the assistant);
+- the page scrolling as the conversation grows.
+
+We'll build it with **Streamlit**, a Python library that turns a script into a web app. No HTML, CSS or JavaScript needed, which makes it the fastest way to put a UI on a Python backend. You'd pick something else (React, Next.js) for a polished public product. For demos, internal tools and learning, Streamlit is hard to beat.
+
+## Split the app into backend and frontend
+
+Before writing UI code, separate responsibilities into two files:
+
+| File | Contains | Knows about |
+|---|---|---|
+| `chat_backend.py` | State, nodes, graph, checkpointer, the compiled `chatbot` | LangGraph, the model |
+| `chat_frontend.py` | Rendering messages, reading user input, calling the backend | Streamlit, and only `chatbot.invoke` |
+
+The flow of one turn: the user types in the **frontend**, the frontend calls the **backend** graph, the graph returns the reply, and the frontend displays it.
+
+Why bother splitting? Your graph will keep growing over the coming lectures (tools, retrieval, a database), and none of that should be tangled up with layout code. It also means you can swap the UI later, say to a FastAPI server with a React client, without touching the graph. And you can test the backend on its own, with no browser involved.
+
+The backend is the chatbot you already built, moved into its own module:
+
+```python
+# chat_backend.py
+from typing import Annotated, TypedDict
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AnyMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import InMemorySaver
+
+llm = init_chat_model("openai:gpt-4.1-mini")
+
+class ChatState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+def chat_node(state: ChatState) -> dict:
+    return {"messages": [llm.invoke(state["messages"])]}
+
+builder = StateGraph(ChatState)
+builder.add_node("chat_node", chat_node)
+builder.add_edge(START, "chat_node")
+builder.add_edge("chat_node", END)
+
+chatbot = builder.compile(checkpointer=InMemorySaver())
+```
+
+Setup, once:
+
+```bash
+pip install -U langgraph langchain langchain-openai streamlit python-dotenv
+export OPENAI_API_KEY=...        # or put it in a .env file and call load_dotenv()
+```
+
+## The two chat building blocks
+
+Streamlit has two elements made for chat interfaces. Learn them first; the whole UI is built from them.
+
+### Message containers
+
+`st.chat_message(name)` creates a message container with an avatar. Whatever you write inside the `with` block appears in that bubble:
+
+```python
+# chat_frontend.py
+import streamlit as st
+
+with st.chat_message("user"):
+    st.markdown("Hi!")
+
+with st.chat_message("assistant"):
+    st.markdown("Hello! How can I help?")
+```
+
+Run it with:
+
+```bash
+streamlit run chat_frontend.py
+```
+
+Streamlit opens a browser tab showing two bubbles, with a person icon for `"user"` and a bot icon for `"assistant"`. The name decides the default avatar (`"user"`/`"human"` and `"assistant"`/`"ai"` get built-in icons), and you can override it with `avatar=` (an emoji or an image).
+
+Use `st.markdown` inside the bubble rather than `st.text`. Models reply in Markdown, so lists, bold text and code blocks render properly. `st.text` shows raw fixed-width text.
+
+### The input box
+
+`st.chat_input(placeholder)` draws the input box pinned to the bottom of the page. It returns the submitted text on the run right after the user presses Enter, and `None` otherwise:
+
+```python
+user_input = st.chat_input("Type your message")
+
+if user_input:
+    with st.chat_message("user"):
+        st.markdown(user_input)
+```
+
+Type "Hello" and press Enter: a user bubble appears with your text. Type something else and the bubble shows the new text.
+
+## Streamlit's execution model
+
+Before going further you need to understand how Streamlit runs your code, because it causes every bug in the next section.
+
+**Every interaction reruns your entire script from top to bottom.** Pressing Enter in the chat input, clicking a button, moving a slider: Streamlit executes the whole file again and redraws the page from what that run produces. There's no event handler and no "on submit" callback by default. Your script simply runs again, and this time `st.chat_input` returns the submitted text.
+
+That model is what makes Streamlit simple: the page is just "what the script draws". But ordinary Python variables are recreated on every run, so they can't remember anything between interactions.
+
+It helps to compare this with how you'd normally think about an app. In a typical web framework, a page loads once and then event handlers update pieces of it. In Streamlit there are no pieces to update. Each rerun produces the **whole** page again, and Streamlit compares the result with what the browser already shows so that only the differences are sent. So you never "add a bubble to the page". You make sure that, on every run, the script draws every bubble that should be there. Keep that sentence in mind and the rest of this lecture is straightforward: the script needs somewhere to keep the conversation between runs, and it needs to redraw it each time.
+
+## Building an echo bot
+
+To learn the UI mechanics without the model getting in the way, first build a bot that repeats whatever you type.
+
+### Version 1 renders only the current turn
+
+```python
+user_input = st.chat_input("Type here")
+
+if user_input:
+    with st.chat_message("user"):
+        st.markdown(user_input)
+    with st.chat_message("assistant"):
+        st.markdown(user_input)          # echo
+```
+
+Type "Hi": you see two bubbles. Type "Hello": the "Hi" bubbles **vanish** and only "Hello" is shown. The second Enter reran the script, and this run only drew the current turn. Nothing told it about "Hi".
+
+### Version 2 keeps a plain list
+
+The obvious fix is to keep a list of messages and draw all of them. Each message is a dict with a `role` (who sent it) and `content` (the text), the same shape chat APIs use:
+
+```python
+message_history = []                     # problem: runs on every rerun
+
+for message in message_history:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+user_input = st.chat_input("Type here")
+if user_input:
+    message_history.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    message_history.append({"role": "assistant", "content": user_input})
+    with st.chat_message("assistant"):
+        st.markdown(user_input)
+```
+
+The order is right: draw the old history, then the new turn. But it behaves exactly like version 1. The first line, `message_history = []`, runs on **every** rerun, so the list is recreated empty before you draw it. Whatever you appended last time is already gone.
+
+You need storage that **survives reruns**.
+
+### Version 3 uses session state
+
+`st.session_state` is a dictionary-like object that Streamlit keeps alive across reruns, one per browser session. Values you put in it are still there on the next run. It's cleared when the session ends: closing the tab, or refreshing the page, starts a fresh session.
+
+The pattern is to **initialise once, then use**:
+
+```python
+import streamlit as st
+
+if "message_history" not in st.session_state:
+    st.session_state["message_history"] = []
+
+# 1. Redraw the conversation so far
+for message in st.session_state["message_history"]:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# 2. Handle the new turn
+user_input = st.chat_input("Type here")
+if user_input:
+    st.session_state["message_history"].append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    reply = user_input                    # echo for now
+    st.session_state["message_history"].append({"role": "assistant", "content": reply})
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+```
+
+Trace two turns:
+
+1. **First load.** The key doesn't exist, so it's set to `[]`. The loop draws nothing. `chat_input` returns `None`. You see an empty page with an input box.
+2. **User sends "Hi".** Rerun. The key exists, so the `if` is skipped and the list is kept. The loop draws nothing yet (the list is still empty). `chat_input` returns `"Hi"`, so both messages are appended **and** drawn.
+3. **User sends "Hello".** Rerun. The loop draws the two "Hi" bubbles from session state, then the new "Hello" turn is appended and drawn below them.
+
+The conversation now accumulates. Notice why the new turn is drawn directly as well as stored: the history loop ran *before* `chat_input` returned the new text, so on this run the loop didn't include it. On the next rerun it will.
+
+<LgStreamlitRerun />
+
+<Callout kind="remember">
+In Streamlit, plain variables last for one run. `st.session_state` lasts for one browser session. A LangGraph checkpointer lasts as long as its storage. Choose based on how long the data must live.
+</Callout>
+
+## Connecting the LangGraph backend
+
+The echo bot already has the complete UI loop. Turning it into a real assistant changes only one thing: where the reply comes from. Instead of `reply = user_input`, call the graph.
+
+```python
+# chat_frontend.py
+import streamlit as st
+from langchain_core.messages import HumanMessage
+from chat_backend import chatbot
+
+CONFIG = {"configurable": {"thread_id": "thread-1"}}
+
+if "message_history" not in st.session_state:
+    st.session_state["message_history"] = []
+
+for message in st.session_state["message_history"]:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+user_input = st.chat_input("Type here")
+if user_input:
+    st.session_state["message_history"].append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    result = chatbot.invoke({"messages": [HumanMessage(content=user_input)]}, config=CONFIG)
+    reply = result["messages"][-1].content
+
+    st.session_state["message_history"].append({"role": "assistant", "content": reply})
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+```
+
+Three changes:
+
+- **Import the compiled graph** from the backend module. The frontend never builds a graph; it only calls one.
+- **Wrap the text in a `HumanMessage`** and invoke with only the new message. The checkpointer loads the earlier turns, so the model still sees the whole conversation.
+- **Pass the config with a thread id.** The backend was compiled with a checkpointer, so every call needs one. Leave it out and LangGraph raises an error saying a `thread_id` is required. That's the most common first bug when wiring a UI to a persistent graph.
+
+Run `streamlit run chat_frontend.py`, tell it your name, ask about a few other things, then ask for your name. It remembers, because the graph's checkpoint for `thread-1` holds every turn.
+
+## Two kinds of memory
+
+There are now **two copies** of the conversation, kept for different reasons:
+
+| Store | Holds | Purpose | Lifetime |
+|---|---|---|---|
+| `st.session_state["message_history"]` | Plain dicts: role and content | Redrawing the page on each rerun | One browser session |
+| The checkpointer, thread `thread-1` | `HumanMessage` / `AIMessage` objects | Giving the model its context | As long as the checkpointer's storage |
+
+They can drift apart. Refresh the browser and session state is wiped, so the page is empty. But the backend module was imported once and stays loaded while the Streamlit server runs, so its `InMemorySaver`, and `thread-1`, still exist. Ask "what's my name?" on the fresh-looking page, and the bot may still know.
+
+A cleaner design keeps **one source of truth**: draw the page from the checkpointer instead of a separate list.
+
+```python
+state = chatbot.get_state(CONFIG)
+for msg in state.values.get("messages", []):
+    role = "user" if msg.type == "human" else "assistant"
+    with st.chat_message(role):
+        st.markdown(msg.content)
+```
+
+`msg.type` is `"human"` for user messages and `"ai"` for model replies. This is how the multi-conversation lecture renders old chats when you switch threads.
+
+## The shared thread problem
+
+`CONFIG` hard-codes `thread_id = "thread-1"`. The `chatbot` object, and its `InMemorySaver`, live in the server process and are **shared by every browser tab**. Open the app in two tabs, or let two colleagues use it, and they all write into the same thread. One person's name leaks into the other's answers.
+
+The fix is to give each session its own thread id, stored in session state so it survives reruns:
+
+```python
+import uuid
+
+if "thread_id" not in st.session_state:
+    st.session_state["thread_id"] = str(uuid.uuid4())
+
+CONFIG = {"configurable": {"thread_id": st.session_state["thread_id"]}}
+```
+
+Now each browser session gets a separate conversation, and a page refresh starts a new one, matching what the user sees. Keeping a list of thread ids and switching between them gives you a sidebar of past chats, which is the next step for this chatbot.
+
+<Callout kind="warn">
+Imported modules run once per server process, not once per rerun. That's good, because you don't want to rebuild the graph on every keystroke. But anything created at module level (the graph, the checkpointer, a database connection) is shared by **all** users. Keep per-user data in session state or keyed by a per-user thread id. For resources you create inside the script itself, `@st.cache_resource` gives the same build-once behaviour.
+</Callout>
+
+## Polishing the page
+
+A few small Streamlit features make the app feel finished. None of them change the graph.
+
+### Title, layout and a spinner
+
+```python
+st.set_page_config(page_title="Notes Assistant", page_icon="💬")
+st.title("Notes Assistant")
+```
+
+`st.set_page_config` sets the browser tab title and icon. Call it once, near the top of the script. `st.title` adds a heading above the conversation.
+
+While the model is thinking, show that something is happening:
+
+```python
+with st.chat_message("assistant"):
+    with st.spinner("Thinking…"):
+        result = chatbot.invoke({"messages": [HumanMessage(content=user_input)]}, config=CONFIG)
+    reply = result["messages"][-1].content
+    st.markdown(reply)
+```
+
+The spinner appears inside the assistant's bubble and disappears when `invoke` returns. It doesn't make anything faster, but a visible "Thinking…" is much better than a frozen page. Streaming, next lecture, goes further.
+
+### A new-chat button
+
+With a per-session thread id, starting over means a new id and an empty history. Put the button in the sidebar:
+
+```python
+with st.sidebar:
+    if st.button("New chat"):
+        st.session_state["thread_id"] = str(uuid.uuid4())
+        st.session_state["message_history"] = []
+        st.rerun()
+```
+
+`st.button` returns `True` on the run triggered by the click. The handler swaps in a fresh thread id and clears the visible history, then `st.rerun()` immediately redraws the page with the new state. The old thread still exists in the checkpointer. Keeping a list of old thread ids in session state and showing them as sidebar buttons is how a chat-history sidebar works, the subject of a later lecture.
+
+### Handling failures
+
+Model calls fail: rate limits, network errors, expired keys. Without handling, Streamlit shows a red traceback in the middle of the chat. Catch the error and show a friendly message instead:
+
+```python
+try:
+    result = chatbot.invoke({"messages": [HumanMessage(content=user_input)]}, config=CONFIG)
+    reply = result["messages"][-1].content
+except Exception as exc:          # narrow this to your provider's errors in real code
+    st.error("The assistant couldn't answer just now. Please try again.")
+    st.stop()
+```
+
+`st.stop()` ends this run of the script cleanly. The user's message is already in session state, so it stays on screen and they can try again.
+
+## Working with Streamlit day to day
+
+A few habits save a lot of confusion while building:
+
+- **Edit and rerun.** Streamlit watches your file. After you save, the page offers "Rerun" (and "Always rerun"). Changes to the frontend show up immediately. Changes to `chat_backend.py` may need a full restart (Ctrl+C, then `streamlit run` again), because the imported module was loaded once and isn't always reloaded.
+- **`print` goes to the terminal.** Output from `print()` appears in the terminal running `streamlit run`, not on the page. To see something on the page, use `st.write(...)`.
+- **Inspect session state.** Temporarily adding `st.write(st.session_state)` at the bottom of the script shows exactly what survives between reruns. That's the fastest way to debug history problems.
+- **Restarting the server resets everything in memory.** Session state, the module-level graph and its `InMemorySaver` all start fresh. Don't mistake that for your persistence code working or failing; test persistence with a database checkpointer.
+- **Other ports and machines.** `streamlit run chat_frontend.py --server.port 8502` runs a second copy, and the "Network URL" Streamlit prints lets other devices on your network open the app.
+
+## One turn through both layers
+
+Putting it all together, here is what happens between pressing Enter and seeing the reply:
+
+| # | Layer | What happens |
+|---|---|---|
+| 1 | Browser | User presses Enter; Streamlit sends the text to the server |
+| 2 | Streamlit | The whole script reruns from the top |
+| 3 | Streamlit | Session state still holds the history; every old message is redrawn |
+| 4 | Streamlit | `st.chat_input` returns the new text; it's appended and drawn |
+| 5 | LangGraph | `invoke` loads the thread's checkpoint, appends the `HumanMessage` |
+| 6 | LangGraph | `chat_node` sends the full history to the model and gets a reply |
+| 7 | LangGraph | The reply is appended and a new checkpoint is saved |
+| 8 | Streamlit | The reply text is appended to session state and drawn |
+
+Steps 2 to 4 belong to the UI, and steps 5 to 7 to the graph. When something goes wrong, this table tells you where to look. A message missing from the page is a session-state problem. A bot that forgets is a thread or checkpointer problem.
+
+## What's still missing
+
+Ask the bot for a 500-word essay and you'll notice the page sits blank for several seconds, then the whole answer appears at once. `invoke` only returns when the model has finished generating. Showing the reply token by token as it's produced is called **streaming**, and it's the next lecture. The good news: the frontend structure stays the same, and only the line that produces the reply changes.
+
+## Cheat sheet
+
+- Split the app: `chat_backend.py` builds and compiles the graph; `chat_frontend.py` only renders and calls `chatbot.invoke`.
+- `streamlit run chat_frontend.py` starts the app.
+- `with st.chat_message("user" | "assistant"):` draws a bubble; write inside it with `st.markdown`.
+- `st.chat_input("...")` returns the submitted text on the run after Enter, otherwise `None`.
+- Streamlit reruns the whole script on every interaction; plain variables reset each time.
+- Initialise once with `if "key" not in st.session_state:`, then read and append to `st.session_state["key"]`.
+- Redraw the history first, then append and draw the new turn.
+- Invoke with only the new `HumanMessage` plus `config={"configurable": {"thread_id": ...}}`; the checkpointer supplies the rest.
+- Session state is per browser session; the module-level graph and `InMemorySaver` are shared by all sessions.
+- Give each session its own thread id (`uuid4` in session state) so users don't share a conversation.

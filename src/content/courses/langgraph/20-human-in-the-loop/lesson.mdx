@@ -1,0 +1,302 @@
+import { LgInterruptFlow } from "@/components/widgets/LgInterruptFlow";
+
+## Autonomy and its limits
+
+Agents exist to do work on their own. A food-delivery company gets an enormous number of support messages a day, and most are repetitive ("my order is late", "an item is missing"). An agent can resolve those end to end with no person involved. That autonomy is the whole point.
+
+But some steps are too important to hand over completely. Picture a travel assistant: it searches flights from Delhi to Mumbai, filters to cheap morning departures, and picks one. All fine to automate. Then the user says "book it", and the next step charges a card. Here you want the agent to stop and ask: "I'm about to book flight 6E-512 on Friday for ₹4,850. Go ahead?" Only after a person says yes does the payment happen.
+
+That pause is **human in the loop (HITL)**.
+
+## What human in the loop means
+
+Human in the loop is a design approach where a person takes part at **critical points** of an AI workflow, to supervise, approve, correct or guide what the model produces. Think of it as a **human checkpoint** inside the pipeline, so that important decisions aren't made by the model alone.
+
+It isn't the opposite of autonomy. A well-designed agent runs autonomously for the routine 95% and asks for a human only where a mistake would be expensive, irreversible or ambiguous. In practice, almost every agent that touches money, messages, files or customers ends up with at least one such checkpoint.
+
+## Why agents need it
+
+### Models are not reliable enough yet
+
+Models misread goals, miss ambiguity and occasionally hallucinate. Take "book flight tickets for next Friday" said on a Monday: does that mean the Friday four days away, or the one eleven days away? A model will silently pick one. An agent with HITL asks instead. The same goes for a model that has misunderstood the goal or invented a detail: a human glance at the critical step catches it before it causes damage.
+
+### Someone has to be accountable
+
+However capable AI gets, it can't be **accountable**. If an assistant drafts and sends an email reply on its own and the reply is wrong or offensive, "the AI did it" satisfies nobody: the user and the company take the blame. That's why mail assistants draft a reply and let you press send. The person who approves owns the outcome. The same logic applies to payments, deletions and anything else with consequences.
+
+## What you gain
+
+| Benefit | Example |
+|---|---|
+| **Accuracy** | The agent reads an invoice as ₹12,000; it asks "pay ₹12,000?", and the human spots that the real amount is ₹1,200. |
+| **Safety** | Asked to delete files untouched for 30 days, the agent lists them first; the human notices ten belong to the current project and excludes them. |
+| **Ethical and brand alignment** | A support agent's reply to an angry customer is correct but cold; the human edits in some empathy before it goes out. |
+| **User experience** | Users trust an agent that confirms before acting, and they stay in control of decisions that matter to them. |
+
+## Common HITL patterns
+
+Four patterns cover most real systems:
+
+| Pattern | When the human is involved | Example |
+|---|---|---|
+| **Action approval** | Before a consequential action runs | Approve a payment, an email send, a file deletion, a trade |
+| **Output review and edit** | After the agent drafts something, before it's used | Review a blog post or social media post before publishing |
+| **Ambiguity clarification** | When the agent isn't sure what was meant | "This Friday or next Friday?" |
+| **Escalation** | When the agent decides it can't handle the case | "Would you like to talk to a human agent?" in customer support |
+
+Action approval is by far the most common, and it's the one built in code below. The others use the same mechanism with a different question.
+
+## How interrupts work in LangGraph
+
+LangGraph implements HITL with two pieces from `langgraph.types`:
+
+- **`interrupt(payload)`**, called inside a node (or a tool), pauses the graph and hands `payload` to whoever called it.
+- **`Command(resume=value)`**, passed to the next `invoke`, continues the paused graph; inside the node, `interrupt(...)` then returns `value`.
+
+Walk through it with a small social-media agent: the user types a topic on a web page, the agent researches and drafts a post, and a `post` node publishes it. The graph is `START → research → post → END`, and the `post` node contains:
+
+```python
+decision = interrupt({"draft": state["draft"], "question": "Post this?"})
+if decision == "yes":
+    publish(state["draft"])
+```
+
+Here's what happens, step by step:
+
+1. **First invoke.** The user submits "GenAI". The frontend calls `graph.invoke({"topic": "GenAI"}, config)`. `research` fills `state["draft"]`.
+2. **Pause.** Execution reaches `interrupt(...)` in `post`. LangGraph stops right there: the rest of `post` doesn't run, and `END` isn't reached.
+3. **Save.** The current state (topic and draft) and the fact that `post` is pending are written to the **checkpointer**, under this thread's id.
+4. **Surface.** `invoke` returns, and the result carries the interrupt payload under the `__interrupt__` key: the draft and the question.
+5. **Ask the human.** The frontend shows the draft with Yes and No buttons. This can take seconds or days; nothing is running in the meantime.
+6. **Resume.** On a click, the frontend calls `graph.invoke(Command(resume="yes"), config)` with the **same thread id**.
+7. **Continue.** LangGraph loads the checkpoint and re-enters `post`. This time `interrupt(...)` doesn't pause: it returns `"yes"`. The post is published, and the graph reaches `END`.
+
+<Callout kind="remember">
+A normal graph is invoked once. A graph with HITL is invoked once **plus once per human decision**: the first call runs until it pauses; each `Command(resume=...)` call carries the human's answer back in.
+</Callout>
+
+Because the run is genuinely stopped and saved, interrupts **require a checkpointer** and a `thread_id`. Without somewhere to store the paused state, there's nothing to resume. Use `InMemorySaver` while developing and a durable saver (SQLite, Postgres) in production, where a decision may arrive hours later, after a restart.
+
+<LgInterruptFlow />
+
+## A minimal approval graph
+
+A deliberately tiny example makes the mechanics clear: before the model answers a question, ask the user to confirm they really want to send it. Pointless as a product, perfect for seeing every moving part.
+
+```python
+from typing import Annotated, TypedDict
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.types import Command, interrupt
+
+load_dotenv()
+llm = init_chat_model("openai:gpt-4.1-mini")
+
+class ChatState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+def chat_node(state: ChatState):
+    decision = interrupt({
+        "type": "approval",
+        "reason": "The model is about to answer the user's question.",
+        "question": state["messages"][-1].content,
+        "instruction": "Approve this question? yes/no",
+    })
+    if decision["approved"] != "yes":
+        return {"messages": [AIMessage(content="Not approved.")]}
+    return {"messages": [llm.invoke(state["messages"])]}
+
+builder = StateGraph(ChatState)
+builder.add_node("chat", chat_node)
+builder.add_edge(START, "chat")
+builder.add_edge("chat", END)
+graph = builder.compile(checkpointer=InMemorySaver())
+```
+
+The payload is a dict designed for the frontend: what kind of request this is, why, the details, and what answer is expected. It must be JSON-serialisable, because it's stored in the checkpoint and sent to a client.
+
+### Reading the interrupt
+
+```python
+config = {"configurable": {"thread_id": "demo-1"}}
+
+result = graph.invoke(
+    {"messages": [HumanMessage("Explain gradient descent in very simple terms.")]},
+    config,
+)
+result["__interrupt__"]
+# [Interrupt(value={'type': 'approval', 'reason': '...', 'question': 'Explain gradient descent ...',
+#                   'instruction': 'Approve this question? yes/no'}, id='...')]
+
+payload = result["__interrupt__"][0].value
+```
+
+The state so far contains the human message but no AI reply, because `chat_node` never finished. You can also inspect a paused thread at any time with `graph.get_state(config)`: its `next` field shows `('chat',)`, the node waiting to finish.
+
+### Resuming with Command
+
+A real frontend would render the payload as a dialog. In a notebook, `input()` stands in for it:
+
+```python
+answer = input(f"{payload['instruction']} ")          # the human types "no"
+
+final = graph.invoke(Command(resume={"approved": answer}), config)
+final["messages"][-1].content
+# 'Not approved.'
+```
+
+Run it again on a new thread and answer "yes", and `chat_node` re-enters, `interrupt` returns `{"approved": "yes"}`, the model is called, and you get the explanation. The shape of the resume value is a contract between node and frontend: this node expects a dict with an `approved` key, so that's what the frontend sends.
+
+## Rules for writing interrupt nodes
+
+How resuming works has consequences you need to design around.
+
+**The node restarts from the top.** On resume, LangGraph doesn't jump back to the middle of the function; it runs the node again from its first line, and this time `interrupt(...)` returns the resume value instead of pausing. Any code before the `interrupt` runs **twice**.
+
+**So keep side effects after the interrupt, or make them idempotent.** If a node charges a card, sends an email or inserts a row *before* calling `interrupt`, that happens again on resume. Put side effects after the human's answer, or in a separate node, or make them safe to repeat (upserts, idempotency keys).
+
+**Don't swallow the interrupt.** `interrupt` works by raising a special exception that LangGraph catches. A bare `try: ... except Exception:` around it will catch that instead and break the pause. Keep `interrupt` outside broad `try` blocks, or catch only specific exception types.
+
+**Keep interrupt calls in a stable order.** If a node calls `interrupt` more than once, resume values are matched by position. Don't call it conditionally in ways that change between the first run and the resume.
+
+**One question per node invocation.** To validate an answer and re-ask, don't loop inside the node; store the follow-up question in state and loop with a conditional edge back to the same node.
+
+<Callout kind="warn">
+The most common HITL bug: resuming with a **different** `thread_id` than the one that paused. The paused run lives under its thread; a new thread has nothing waiting, so the human's answer never reaches it.
+</Callout>
+
+## Approve, reject or edit
+
+Two variations cover most approval UIs.
+
+**Route on the decision.** Return a `Command` with `goto` so the human's choice picks the next node:
+
+```python
+from typing import Literal
+
+def approval_node(state: State) -> Command[Literal["send_email", "cancelled"]]:
+    approved = interrupt({"question": "Send this email?", "draft": state["draft"]})
+    return Command(goto="send_email" if approved else "cancelled")
+```
+
+**Let the human edit.** Use the resume value as the new content, the core of the output-review pattern:
+
+```python
+def review_node(state: State):
+    edited = interrupt({"instruction": "Edit the post if needed", "content": state["draft"]})
+    return {"draft": edited}
+```
+
+Note that `Command(resume=...)` is the input you pass to `invoke`; `Command(goto=...)` is what a node returns. Don't mix them up.
+
+## Approval inside a tool
+
+Back to the realistic case. Take the tool-calling chatbot and give it two stock tools: `get_stock_price` (from earlier lessons) and a new `purchase_stock`. The purchase is a dummy here; in a real system it would call a broker or payment API.
+
+Without HITL, the conversation goes like this: "What's Apple's price?", "$229". "Buy 10." And it's done: *Your order for 10 shares of Apple has been placed.* No confirmation. If the user had been discussing three companies, the model could just as easily have bought the wrong one.
+
+The fix is to put the checkpoint **inside the risky tool**. `interrupt` works in tools too, because a tool runs inside the `tools` node:
+
+```python
+from langchain_core.tools import tool
+from langgraph.types import interrupt
+
+@tool
+def purchase_stock(symbol: str, quantity: int) -> dict:
+    """Buy `quantity` shares of the company with ticker `symbol` for the user."""
+    decision = interrupt(f"Approve buying {quantity} shares of {symbol}? (yes/no)")
+    if isinstance(decision, str) and decision.strip().lower() == "yes":
+        return {"status": "success", "message": f"Purchase order placed for {quantity} shares of {symbol}."}
+    return {"status": "cancelled", "message": f"Purchase of {quantity} shares of {symbol} was declined by the user."}
+```
+
+The decision now lives in the tool, not in a node: `get_stock_price` runs freely, and only buying needs approval. The graph is the standard loop compiled with a checkpointer:
+
+```python
+from langgraph.prebuilt import ToolNode, tools_condition
+
+tools = [get_stock_price, purchase_stock]
+llm_with_tools = llm.bind_tools(tools)
+
+def chat_node(state: ChatState):
+    return {"messages": [llm_with_tools.invoke(state["messages"])]}
+
+builder = StateGraph(ChatState)
+builder.add_node("chat_node", chat_node)
+builder.add_node("tools", ToolNode(tools))
+builder.add_edge(START, "chat_node")
+builder.add_conditional_edges("chat_node", tools_condition)
+builder.add_edge("tools", "chat_node")
+chatbot = builder.compile(checkpointer=InMemorySaver())
+```
+
+A command-line frontend handles the pause with an inner loop, so it works however many approvals a turn needs:
+
+```python
+config = {"configurable": {"thread_id": "cli-1"}}
+
+while True:
+    user = input("You: ")
+    if user.strip().lower() in {"exit", "quit"}:
+        break
+    result = chatbot.invoke({"messages": [HumanMessage(user)]}, config)
+    while "__interrupt__" in result:                  # paused for approval
+        question = result["__interrupt__"][0].value
+        answer = input(f"HITL: {question} ")
+        result = chatbot.invoke(Command(resume=answer), config)
+    print("Bot:", result["messages"][-1].content)
+```
+
+Now "Buy 10" prints *HITL: Approve buying 10 shares of AAPL? (yes/no)*. Answer yes and the order is placed; ask to buy 50 Google shares and answer no, and the tool returns `cancelled`, which the model relays: the purchase was declined. Either way the decision, and the accountability, sit with the user.
+
+<Callout kind="tip">
+Return a clear message when a human declines, as `purchase_stock` does. The `ToolMessage` goes back to the model, which can then explain the outcome or offer alternatives instead of pretending the action happened.
+</Callout>
+
+### Interrupts and parallel tool calls
+
+Remember that `ToolNode` runs every tool call in the model's message, and that on resume the interrupted node runs again. Two situations follow:
+
+- The model requests `get_stock_price` and `purchase_stock` in the same message. When the purchase interrupts and is later resumed, the `tools` node runs again, so the price lookup **runs a second time**. That's harmless for a read-only tool and a real problem for anything with side effects, which is one more reason to keep side-effecting work after the `interrupt` call.
+- The model requests **two** purchases at once. Each tool calls `interrupt`, so the result can carry more than one `Interrupt` object. When several are pending, a single plain resume value is ambiguous; ask the human about each one and resume with a dict mapping every interrupt's `id` to its answer, for example `Command(resume={i.id: answers[i.id] for i in result["__interrupt__"]})`. A production CLI or UI should handle that case rather than assume one approval per turn.
+
+The same flow works behind a web UI: the backend returns the interrupt payload to the browser, the browser shows Approve and Reject buttons, and the click becomes the `Command(resume=...)` call on the same thread.
+
+## Designing the approval step
+
+Getting the mechanics right is half the job. The other half is deciding what to ask, and how.
+
+**Make the payload decision-ready.** The human should be able to decide from the payload alone, without digging through logs. For a purchase that means symbol, company name, quantity, the latest price, the estimated total, and which account. For an email: recipient, subject and the full body. A good payload has a `type` (so the frontend knows which dialog to render), the details, and the allowed responses.
+
+**Offer more than yes and no where it helps.** Many approval UIs have three buttons: approve, reject, and edit. The edit path sends back corrected arguments (`{"action": "edit", "quantity": 5}`), and the tool uses them instead of the model's. That turns a rejection-and-retry conversation into a single click.
+
+**Don't ask too often.** If every step needs approval, people stop reading and click "approve" by reflex, which is worse than no checkpoint because it looks safe. Gate only actions that are irreversible, expensive, external (they leave your system) or ambiguous. Read-only tools like price lookups and searches almost never need approval.
+
+**Record decisions.** Who approved what, and when, is exactly the accountability trail HITL exists for. Write it after the interrupt returns (never before, since that code re-runs), alongside the thread id.
+
+## HITL in a web app
+
+In a notebook the human answers within seconds through `input()`. In a real product, the request and the answer are separate HTTP requests, possibly hours apart, possibly handled by different server processes. The pattern:
+
+1. `POST /chat` with the user's message and a `thread_id`. The server calls `graph.invoke(...)`. If the result contains `__interrupt__`, it responds with the payload and a status like `"awaiting_approval"` instead of a chat reply.
+2. The frontend renders the approval dialog from the payload (or a separate approver gets a notification).
+3. `POST /chat/resume` with the `thread_id` and the decision. The server calls `graph.invoke(Command(resume=decision), config)` and returns the final reply, or the next interrupt if there is one.
+
+Because the paused run lives in the checkpointer, step 3 can land on any server instance, as long as they share a durable checkpointer such as Postgres or SQLite on shared storage. `InMemorySaver` breaks here: a restart or a second process loses every pending approval. Before showing a chat thread, the frontend can also call `graph.get_state(config)` and check whether it's waiting on an interrupt, so a user who reloads the page sees the pending approval again instead of an empty box.
+
+## Cheat sheet
+
+- HITL puts a human checkpoint at critical points: approve, review/edit, clarify or escalate.
+- It exists because models still misinterpret and hallucinate, and because only humans can be accountable.
+- `interrupt(payload)` pauses inside a node or tool; the payload must be JSON-serialisable.
+- The paused result carries `result["__interrupt__"]`, a list of `Interrupt` objects with `.value`.
+- Resume with `graph.invoke(Command(resume=value), config)` using the **same** `thread_id`; `interrupt` returns `value`.
+- Interrupts require a checkpointer; use a durable one in production.
+- On resume the node runs again from its first line: keep side effects after the interrupt or make them idempotent.
+- Don't wrap `interrupt` in a bare `try/except`, and keep multiple interrupts in a stable order.
+- Route on a decision by returning `Command(goto=...)`; implement edits by returning the resumed value as new state.
+- For agents, put `interrupt` inside the risky tool so only that action needs approval.

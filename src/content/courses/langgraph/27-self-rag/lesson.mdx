@@ -1,0 +1,532 @@
+import { LgSupportCheck } from "@/components/widgets/LgSupportCheck";
+import { LgSelfRagStepper } from "@/components/widgets/LgSelfRagStepper";
+
+## Three problems with plain RAG
+
+Corrective RAG fixed one weakness of the standard pipeline: trusting whatever retrieval returns. Self-RAG goes further and questions **every** step. To see why, look at three distinct ways a plain RAG system goes wrong.
+
+### Retrieving when nothing needs retrieving
+
+Imagine a homework helper for children, backed by a stack of encyclopedias. A child asks "how many seconds are in a minute?" Any LLM knows the answer. But a RAG pipeline always retrieves first, so it fetches the three nearest chunks:
+
+- "A minute is a unit of time equal to 60 seconds."
+- "In some contexts, a minute can colloquially mean a short period of time."
+- "The concept of time units evolved historically across cultures."
+
+Now the model has to reconcile all three, and the answer comes out hedged: "A minute typically consists of about 60 seconds, depending on context." Extra context made a confident answer less confident. You also paid for an embedding call, a vector search and a longer prompt to answer a question that needed none of it.
+
+Retrieving for every query regardless of need is called **indiscriminate retrieval**. It wastes compute and can actively hurt answers the model would have got right on its own.
+
+### Trusting whatever comes back
+
+A user asks "what causes diabetes?" Retrieval returns a chunk that is clearly about diabetes: "Diabetes is a chronic condition that affects how the body processes blood sugar." It's on topic, which is why semantic search ranked it highly, but it describes the **effect**, not the cause. Told to answer from this context, the model produces "Diabetes is caused by problems in how the body processes blood sugar". That is circular and misleading.
+
+Semantic similarity measures "about the same subject", not "answers this question". Plain RAG never checks the difference.
+
+### Never checking the answer
+
+Even with good context, the model can add things. Asked about the side effects of "drug X", with context saying "clinical trials report mild dizziness and nausea", the model writes: "Drug X may cause dizziness, nausea, fatigue and headaches, especially in older patients." Dizziness and nausea came from the context. Fatigue, headaches and the remark about older patients came from the model's general sense of what drug side effects usually look like. That's a hallucination dressed up as a grounded answer, and plain RAG ships it, because nothing checks the answer against the evidence after generation.
+
+There is also a subtler version: an answer can be completely grounded and still not answer the question. Ask "why does ice float on water?" with context "ice is the solid form of water", and the model may say "ice is the solid form of water that forms at low temperatures". Every word is supported; the question is untouched.
+
+## What Self-RAG is
+
+**Self-RAG (self-reflective RAG)** is a RAG design where the system judges its own decisions, its retrieved evidence and its answers, instead of trusting each step. At each stage it asks itself a question and changes course based on the answer.
+
+### Four reflection questions
+
+| Question | When it's asked | Possible answers | Problem it fixes |
+|---|---|---|---|
+| **Retrieve?** Does this query need external documents at all? | Before retrieval | yes / no | Indiscriminate retrieval |
+| **IsRel** Is this retrieved document relevant to the question? | After retrieval, per document | relevant / irrelevant | Blind trust in retrieval |
+| **IsSup** Is every claim in the answer supported by the documents? | After generation | fully / partially / no support | Hallucinated additions |
+| **IsUse** Does the answer actually address the question? | After the answer is grounded | useful / not useful | Grounded but useless answers |
+
+The names come from the original paper, where they are **reflection tokens**: special tokens the model emits as part of its output. Keep the table in mind; the whole graph below is these four questions plus what to do with each answer.
+
+### How the original paper does it
+
+In the 2023 Self-RAG paper, reflection is built into the model itself. The authors first trained a **critic** model to label a large training set with reflection tokens, then fine-tuned a **generator** (Llama 2, 7B and 13B) on that data so it learned to emit tokens like `[Retrieve]`, `[IsRel]`, `[IsSup]` and `[IsUse]` inline while generating. At inference time the generator decides **per segment** of its output whether to retrieve, processes several retrieved passages in parallel, and uses the probabilities of the reflection tokens to score and pick the best continuation. In the paper, IsUse is a 1-to-5 score rather than a yes/no.
+
+That requires a specially trained model. The version you build here keeps the architecture and the four questions but implements each reflection as a **separate grader call** to an ordinary chat model with structured output, wired together as a LangGraph. It is coarser (one decision per question, not per sentence) but it runs with any model, and every decision is visible in state and in traces.
+
+## The architecture
+
+Here is the graph you will build, for a chatbot that answers questions about a company from its internal documents:
+
+```text
+START ─▶ decide_retrieval ─┬─ no ─▶ generate_direct ─▶ END
+                           └─ yes ─▶ retrieve ◀───────────────────────────────┐
+                                        │                                     │
+                                        ▼                                     │
+                                   is_relevant ─(none relevant)─▶ no_answer_found ─▶ END
+                                        │ (≥1 relevant)                ▲      │
+                                        ▼                              │      │
+                               generate_from_context                   │      │
+                                        │                              │      │
+                                        ▼                              │      │
+                         ┌──────────▶ is_sup ─(not fully, retries spent)┘      │
+                         │              │ partially / no support               │
+                         │              ▼                                     │
+                         └──────── revise_answer                              │
+                                        │ (fully supported)                   │
+                                        ▼                                     │
+                                     is_use ─(not useful)─▶ rewrite_question ─┘
+                                        │ useful        (rewrites spent → no_answer_found)
+                                        ▼
+                                       END
+```
+
+### Deciding whether to retrieve
+
+"How many paid leave days do employees get here?" needs the company's documents. "What is paid leave?" doesn't: it's a definition the model knows. The first node classifies the question. If no retrieval is needed, the model answers directly and the run ends after two nodes. The cheapest retrieval is the one you skip.
+
+### Filtering for relevance
+
+When retrieval runs, each document is judged on its own. For "how many paid leave days do employees get per year?", retrieval might return:
+
+- "The company observes 12 public holidays each year."
+- "Employees may work remotely up to two days per week."
+- "Leave requests must be approved by the reporting manager."
+
+All three are about time off or work arrangements, so they're semantically close. None says how many paid leave days there are. Every one fails IsRel, so the graph stops with "no answer found" rather than inventing a number. If instead one chunk said "all full-time employees are entitled to 24 paid leaves per calendar year", that chunk alone would survive, and the answer would be built from it.
+
+### Checking support
+
+After generating from the relevant documents, the answer is graded against them. Suppose the context contains three facts: 24 paid leaves per year; leave types include sick and casual leave; leave is managed through the HR portal.
+
+| Answer | IsSup |
+|---|---|
+| "Full-time employees get 24 paid leaves per calendar year." | **Fully supported**: every claim is in the context |
+| "Employees get 24 leaves a year, which include sick and casual leave, managed through the HR portal." | **Partially supported**: each fact is there, but "the 24 include sick and casual leave" is a link the model invented |
+| "Employees get 30 paid leaves with carry-forward benefits." | **No support**: neither claim appears anywhere |
+
+The middle row is the important one. Partial support is the typical hallucination in RAG: real facts glued together with an unstated relationship. A check that only looks for the presence of keywords would pass it.
+
+<LgSupportCheck />
+
+A fully supported answer moves on. Anything less goes to a **revise** node, which rewrites the answer under strict instructions to keep only what the context states, and sends the result back to the support check. That forms a loop: check, revise, check again.
+
+### Checking usefulness
+
+A grounded answer can still miss the point. With the same three facts, the model might answer: "Employees can take different types of leave, such as sick and casual leave, and requests are managed through the HR portal." Every word is supported. It doesn't say how many days, which was the question. IsUse catches exactly this.
+
+If the answer is useful, you're done. If not, the problem is usually the evidence, not the wording, so the graph **rewrites the retrieval query** and goes back to retrieval to try a different angle, then runs the whole chain (relevance, generation, support, usefulness) again.
+
+### Two loops and their brakes
+
+The design has two loops:
+
+- **The revise loop** (is_sup → revise_answer → is_sup) fixes how the answer is written.
+- **The retrieval loop** (is_use → rewrite_question → retrieve → … → is_use) fixes what the answer is based on.
+
+Either could spin forever: the model may never produce a fully supported answer, or no rewrite may ever find useful documents. Each loop therefore gets a **counter and a maximum**. When the revise budget is spent, or the rewrite budget is spent, the graph exits to "no answer found". An honest "I couldn't find this" is the correct output when the evidence isn't there.
+
+## The corpus and setup
+
+The example bot serves a fictional company, NexaAI Solutions, with three PDFs: a company profile (founding, headquarters, headcount, mission, values, founder and leadership), company policies (HR, leave, workplace conduct, disciplinary actions) and products and pricing. Notably, there is **no refund policy and no mention of a free trial** anywhere, which makes those good test questions.
+
+```python
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain.chat_models import init_chat_model
+
+pages = []
+for f in ["company_profile.pdf", "company_policies.pdf", "products_and_pricing.pdf"]:
+    pages.extend(PyPDFLoader(f"docs/{f}").load())
+
+chunks = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=150).split_documents(pages)
+store = InMemoryVectorStore.from_documents(chunks, OpenAIEmbeddings(model="text-embedding-3-small"))
+retriever = store.as_retriever(search_kwargs={"k": 4})
+
+llm = init_chat_model("openai:gpt-4.1-mini", temperature=0)
+```
+
+Chunks are smaller than in the textbook example (600 characters) because these documents are dense lists of short facts; smaller chunks keep unrelated facts apart. These numbers are a starting point found by trying a few values; tune them on your own documents.
+
+The full state, which the following steps fill in one piece at a time:
+
+```python
+from typing import Literal
+from typing_extensions import TypedDict
+from langchain_core.documents import Document
+
+class State(TypedDict):
+    question: str
+    retrieval_query: str
+    need_retrieval: bool
+    docs: list[Document]
+    relevant_docs: list[Document]
+    context: str
+    answer: str
+    issup: Literal["fully_supported", "partially_supported", "no_support"]
+    evidence: list[str]
+    retries: int          # revise loop counter
+    isuse: Literal["useful", "not_useful"]
+    use_reason: str
+    rewrite_tries: int    # retrieval loop counter
+
+MAX_RETRIES = 3
+MAX_REWRITES = 2
+```
+
+`question` is what the user asked and never changes. `retrieval_query` is what gets sent to the vector store, and it may be rewritten. Keeping them separate is essential: graders must always judge against the user's real question, not a keyword soup.
+
+## Step one, decide whether to retrieve
+
+```python
+from pydantic import BaseModel, Field
+
+class RetrieveDecision(BaseModel):
+    should_retrieve: bool = Field(description="True if external documents are needed to answer reliably")
+
+DECIDE_PROMPT = """Decide whether retrieval from the company's documents is needed.
+should_retrieve = true if answering needs specific facts, names, numbers, policies,
+or anything unlikely to be in general knowledge.
+should_retrieve = false for general explanations, definitions or reasoning.
+If unsure, choose true."""
+
+decider = llm.with_structured_output(RetrieveDecision)
+
+def decide_retrieval(state: State) -> dict:
+    d = decider.invoke([("system", DECIDE_PROMPT), ("human", state["question"])])
+    return {"need_retrieval": d.should_retrieve}
+```
+
+"If unsure, choose true" sets the failure direction. Retrieving when you didn't need to costs a little; skipping retrieval when you needed it produces a confident answer about your company from general knowledge, which is exactly the hallucination this system exists to prevent.
+
+The direct-answer node is told plainly that it has no documents:
+
+```python
+def generate_direct(state: State) -> dict:
+    msg = llm.invoke([
+        ("system", "Answer using your general knowledge. You do not have access to company documents. "
+                   "If the question needs company-specific facts, reply: I don't know based on my general knowledge."),
+        ("human", state["question"]),
+    ])
+    return {"answer": msg.content}
+
+def retrieve(state: State) -> dict:
+    query = state.get("retrieval_query") or state["question"]
+    return {"docs": retriever.invoke(query)}
+
+def route_after_decide(state: State) -> Literal["retrieve", "generate_direct"]:
+    return "retrieve" if state["need_retrieval"] else "generate_direct"
+```
+
+With just these nodes, "Who is the CEO of NexaAI?" routes to retrieval (`need_retrieval` is true and `docs` contains the leadership chunk), while "What is machine learning?" is answered directly with `docs` never set. The escape hatch in the direct prompt is a second safety net in case the decider gets it wrong.
+
+## Step two, relevance filtering
+
+```python
+class Relevance(BaseModel):
+    is_relevant: bool = Field(description="True if the document helps answer the question")
+
+relevance_llm = llm.with_structured_output(Relevance)
+
+REL_PROMPT = ("You judge document relevance. A document is relevant only if it contains "
+              "information useful for answering the question, not merely the same topic.")
+
+def is_relevant(state: State) -> dict:
+    results = relevance_llm.batch([
+        [("system", REL_PROMPT), ("human", f"Question: {state['question']}\n\nDocument:\n{d.page_content}")]
+        for d in state["docs"]
+    ])
+    return {"relevant_docs": [d for d, r in zip(state["docs"], results) if r.is_relevant]}
+```
+
+This is the IsRel reflection: one yes/no judgement **per document**, run concurrently with `batch`. "Not merely the same topic" is the phrase that separates it from what the vector store already did.
+
+On "Who is the CEO of NexaAI?" the retriever returns four chunks: the leadership section, plus a few that mention the company name or roles. Only the leadership chunk passes. Everything downstream works from that one chunk, so the noise never reaches the generator.
+
+Note the grader sees the original `question`, even after the retrieval query has been rewritten. Relevance means relevance to what the user asked.
+
+## Step three, answering from context or giving up
+
+```python
+def generate_from_context(state: State) -> dict:
+    context = "\n\n---\n\n".join(d.page_content for d in state["relevant_docs"])
+    msg = llm.invoke([
+        ("system", "You are a business RAG assistant. Answer the question using only the provided context."),
+        ("human", f"Question: {state['question']}\n\nContext:\n{context}"),
+    ])
+    return {"answer": msg.content, "context": context}
+
+def no_answer_found(state: State) -> dict:
+    return {"answer": "No answer found in the company documents."}
+
+def route_after_relevance(state: State) -> Literal["generate_from_context", "no_answer_found"]:
+    return "generate_from_context" if state["relevant_docs"] else "no_answer_found"
+```
+
+The router checks whether **at least one** document survived. (Writing `len(...) > 1` here is an easy off-by-one that throws away every question answered by a single chunk, like the CEO question.)
+
+The context is saved to state because the next two checks need it: support is judged against exactly the text the answer was written from.
+
+"What is NexaAI's refund policy?" now ends cleanly. Retrieval returns pricing chunks; none passes IsRel; the user gets "no answer found" instead of a plausible invented policy.
+
+### Why a node that only returns a string
+
+`no_answer_found` could have been a direct edge to END. It's a node because it's a natural **extension point**. Swap it for a web-search node (rewrite the query for the web, search, then send the results back through `is_relevant`) and the bot can fall back to outside sources, much like CRAG's Incorrect branch. Whether that's appropriate depends on the deployment: for an internal policy bot, "not in our documents" is usually the right answer, and sending internal questions to a search API may be a privacy problem.
+
+## Step four, the support check
+
+```python
+class SupportCheck(BaseModel):
+    issup: Literal["fully_supported", "partially_supported", "no_support"]
+    evidence: list[str] = Field(description="Short quotes from the context that support the answer")
+
+ISSUP_PROMPT = """You verify whether an answer is supported by the context.
+- fully_supported: every factual claim in the answer is stated in the context.
+- partially_supported: some claims are in the context, but others are not. This includes
+  added details, numbers, or relationships between facts that the context does not state.
+- no_support: the answer's claims are not in the context.
+Judge only against the context, never against your own knowledge.
+Put short quotes of the supporting context in evidence."""
+
+support_llm = llm.with_structured_output(SupportCheck)
+
+def is_sup(state: State) -> dict:
+    r = support_llm.invoke([
+        ("system", ISSUP_PROMPT),
+        ("human", f"Question: {state['question']}\n\nAnswer: {state['answer']}\n\nContext:\n{state['context']}"),
+    ])
+    return {"issup": r.issup, "evidence": r.evidence}
+```
+
+"Never against your own knowledge" is the crucial line. The grader is itself an LLM, and if it thinks "most SaaS products have a 14-day trial, sounds right", it will pass a hallucination because it agrees with it. The check is about **grounding**, not truth. A true statement that isn't in the context is still unsupported.
+
+The `evidence` list is optional but very useful while debugging: it shows which context sentences the grader matched to the answer, so you can see why it reached its verdict.
+
+Three runs show the three outcomes:
+
+- "How many employees does NexaAI have?" gives "NexaAI has over 85 employees", fully supported, with evidence "Employees: 85+".
+- "Describe NexaAI's company culture" gives a pleasant paragraph that embellishes the listed core values with claims the documents don't make: partially supported.
+- "Does NexaAI offer a free trial? How long?" Retrieval finds pricing chunks that pass relevance (they're about plans), but none mentions a trial. Under pressure to answer, the model writes "Yes, plans include a 14-day free trial", a common pattern from its training data. Evidence is empty: no support.
+
+## Step five, revising unsupported answers
+
+```python
+REVISE_PROMPT = """You are a strict reviser. Rewrite the answer so that every claim is directly
+supported by the context. Remove anything the context does not state. Do not add new information.
+If the context does not answer the question, say that the documents do not contain this information."""
+
+def revise_answer(state: State) -> dict:
+    msg = llm.invoke([
+        ("system", REVISE_PROMPT),
+        ("human", f"Question: {state['question']}\n\nCurrent answer: {state['answer']}\n\nContext:\n{state['context']}"),
+    ])
+    return {"answer": msg.content, "retries": state.get("retries", 0) + 1}
+
+def route_after_issup(state: State) -> Literal["is_use", "revise_answer", "no_answer_found"]:
+    if state["issup"] == "fully_supported":
+        return "is_use"
+    if state.get("retries", 0) < MAX_RETRIES:
+        return "revise_answer"
+    return "no_answer_found"
+```
+
+The reviser gets the question, the current answer and the same context. It doesn't start from scratch; it edits by deletion, which is a much easier task for a model than "write a better answer". Each pass increments `retries`, and the router reads that counter to decide whether another attempt is allowed.
+
+Wire `revise_answer → is_sup` and the loop is complete. On the company-culture question, one revision is usually enough: the embellishments are removed, the answer shrinks to the stated values, and the second check returns fully supported.
+
+Why exit to "no answer found" when retries run out, rather than showing the last answer? Because after several failed revisions, the last answer is by definition still not grounded. You could instead show it with a clear "unverified" label. That is a product decision, but silently shipping it defeats the purpose of the check.
+
+<Callout kind="warn">
+Revision has a side effect: it makes answers **safe but possibly empty**. "The documents do not mention a free trial" is fully supported, and it still doesn't answer "how long is the free trial?" That's why the next check exists.
+</Callout>
+
+## Step six, the usefulness check
+
+```python
+class Usefulness(BaseModel):
+    isuse: Literal["useful", "not_useful"]
+    reason: str
+
+ISUSE_PROMPT = """Decide whether the answer actually addresses the user's question.
+useful: it directly answers what was asked.
+not_useful: it is off-target, too generic, or only says the information is unavailable.
+Do not judge factual accuracy; that was checked already."""
+
+use_llm = llm.with_structured_output(Usefulness)
+
+def is_use(state: State) -> dict:
+    r = use_llm.invoke([("system", ISUSE_PROMPT),
+                        ("human", f"Question: {state['question']}\n\nAnswer: {state['answer']}")])
+    return {"isuse": r.isuse, "use_reason": r.reason}
+```
+
+The usefulness grader deliberately sees only the question and the answer, not the context. Support was already verified; now the only question is whether a reader who asked this would be satisfied. Keeping the two checks separate keeps each prompt simple and each verdict interpretable.
+
+"Who is the CEO of NexaAI?" returns "The CEO is Aarav Mehta": useful, reason "directly names the CEO". The free-trial question, after revision, returns "the documents don't mention a free trial": grounded, not useful.
+
+## Step seven, rewriting the query and retrying
+
+When an answer is grounded but not useful, the evidence was the problem. Maybe the relevant chunk exists but the original phrasing didn't retrieve it. So rewrite the retrieval query and go round again:
+
+```python
+class RewrittenQuery(BaseModel):
+    retrieval_query: str
+
+REWRITE_PROMPT = """Rewrite the user's question into a query optimised for vector retrieval over
+internal company PDFs. Keep it short, preserve key entities, add 2-5 high-signal keywords.
+Use the previous query and the unhelpful answer to try a different angle."""
+
+rewriter = llm.with_structured_output(RewrittenQuery)
+
+def rewrite_question(state: State) -> dict:
+    r = rewriter.invoke([
+        ("system", REWRITE_PROMPT),
+        ("human", f"Question: {state['question']}\nPrevious query: {state.get('retrieval_query')}\n"
+                  f"Unhelpful answer: {state['answer']}"),
+    ])
+    return {"retrieval_query": r.retrieval_query,
+            "rewrite_tries": state.get("rewrite_tries", 0) + 1,
+            "retries": 0}
+
+def route_after_isuse(state: State) -> Literal["__end__", "rewrite_question", "no_answer_found"]:
+    if state["isuse"] == "useful":
+        return END
+    if state.get("rewrite_tries", 0) < MAX_REWRITES:
+        return "rewrite_question"
+    return "no_answer_found"
+```
+
+Three details make this loop behave:
+
+- **The previous query and the failed answer go into the rewrite.** Without them, the rewriter tends to produce the same query again, and the loop retrieves the same chunks every time.
+- **`retries` is reset to 0.** A new set of documents produces a new answer, which deserves its own revise budget. Forget this and the second round may have no revisions left at all.
+- **`retrieve` reads `retrieval_query`, but every grader still reads `question`.** The rewrite changes where you look, never what you're judged against.
+
+The rewrite targets **vector retrieval over your PDFs**, not a web search engine. Adding "pricing plans, subscription tiers, evaluation period" can pull in a chunk the literal question missed. If the information truly isn't in the documents (like the free trial), the loop runs out of rewrites and ends in "no answer found", which is the honest result.
+
+## The complete graph
+
+```python
+from langgraph.graph import StateGraph, START, END
+
+builder = StateGraph(State)
+for name, fn in [("decide_retrieval", decide_retrieval), ("generate_direct", generate_direct),
+                 ("retrieve", retrieve), ("is_relevant", is_relevant),
+                 ("generate_from_context", generate_from_context), ("no_answer_found", no_answer_found),
+                 ("is_sup", is_sup), ("revise_answer", revise_answer),
+                 ("is_use", is_use), ("rewrite_question", rewrite_question)]:
+    builder.add_node(name, fn)
+
+builder.add_edge(START, "decide_retrieval")
+builder.add_conditional_edges("decide_retrieval", route_after_decide)
+builder.add_edge("generate_direct", END)
+builder.add_edge("retrieve", "is_relevant")
+builder.add_conditional_edges("is_relevant", route_after_relevance)
+builder.add_edge("generate_from_context", "is_sup")
+builder.add_conditional_edges("is_sup", route_after_issup)
+builder.add_edge("revise_answer", "is_sup")
+builder.add_conditional_edges("is_use", route_after_isuse)
+builder.add_edge("rewrite_question", "retrieve")
+builder.add_edge("no_answer_found", END)
+
+app = builder.compile()
+```
+
+The `Literal[...]` return types on each router tell LangGraph the possible destinations, so the compiled graph knows its edges without a mapping dict (and draws correctly). `route_after_isuse` returns the `END` constant, whose value is the string `"__end__"`, which is why that appears in its `Literal`.
+
+```python
+q = "Describe NexaAI's company culture."
+out = app.invoke(
+    {"question": q, "retrieval_query": q, "retries": 0, "rewrite_tries": 0},
+    config={"recursion_limit": 60},
+)
+print(out["need_retrieval"], len(out["docs"]), len(out["relevant_docs"]))
+print(out["issup"], out["retries"], out["isuse"], out["rewrite_tries"])
+print(out["answer"])
+```
+
+Initialise the counters explicitly and seed `retrieval_query` with the question. The `recursion_limit` is a safety backstop, not the loop control. Your own counters decide when to stop and route to a sensible ending; the recursion limit only raises `GraphRecursionError` if your counters have a bug. Size it above the worst case: one full round is about seven steps plus two per revision, times the number of rewrite rounds.
+
+<LgSelfRagStepper />
+
+## A full trace, step by step
+
+The free-trial question exercises almost every part of the graph, so follow it end to end with `MAX_RETRIES = 3` and `MAX_REWRITES = 2`.
+
+1. **decide_retrieval**: the question is about one company's offer, so `need_retrieval` is true.
+2. **retrieve** with the original question returns four chunks: the pricing table, a plan comparison, the product overview and a support page.
+3. **is_relevant** keeps the pricing table and the plan comparison. They're about plans, and plans are where a trial would be mentioned, so a careful grader reasonably calls them relevant.
+4. **generate_from_context** writes "Yes, plans include a 14-day free trial." Nothing in the context says this.
+5. **is_sup** returns `no_support` with empty evidence. `retries` is 0, so the router sends it to revision.
+6. **revise_answer** produces "NexaAI offers several pricing plans, likely with a trial period". Better, but "likely with a trial period" is still speculation. `retries` becomes 1.
+7. **is_sup** returns `partially_supported`; back to revision.
+8. **revise_answer** produces "The documents list the pricing plans but do not mention a free trial." `retries` becomes 2.
+9. **is_sup** returns `fully_supported`. The answer is now honest.
+10. **is_use** returns `not_useful`: the user asked how long the trial is, and the answer doesn't say. `rewrite_tries` is 0, so the graph tries again.
+11. **rewrite_question** sets `retrieval_query` to something like "NexaAI free trial evaluation period pricing plans subscription", increments `rewrite_tries` to 1, and resets `retries` to 0.
+12. The second round retrieves, filters, generates and checks again. The new chunks still don't mention a trial, so it ends grounded and not useful, and a second rewrite tries a different angle ("trial demo onboarding sign-up offer").
+13. After the third round is also not useful, `rewrite_tries` equals `MAX_REWRITES`, and the router sends the run to **no_answer_found**.
+
+That run took nearly 30 model calls to reach "no answer found". For this question that's the right outcome: the information doesn't exist in the documents, and every alternative (the invented 14 days, the vague "likely") was caught. It also shows the cost profile you're signing up for. Questions that are answerable usually finish in one round; questions that aren't are the expensive ones, because the system keeps looking before it gives up. If unanswerable questions are common in your traffic, lower `MAX_REWRITES`, or stop early when a rewrite retrieves the same chunks as the previous round.
+
+## Self-RAG versus CRAG
+
+Both are "don't trust retrieval" designs, and they combine well, but they make different trade-offs.
+
+| | CRAG | Self-RAG |
+|---|---|---|
+| Skips retrieval when not needed | No | Yes (Retrieve?) |
+| Judges retrieved documents | Scores 0–1 per document, three verdicts by threshold | Relevant / irrelevant per document |
+| When retrieval fails | Web search fallback | No answer, or rewrite and retry |
+| Cleans context | Sentence-level knowledge refinement | No (keeps whole relevant chunks) |
+| Checks the answer | No | Support (IsSup) and usefulness (IsUse) |
+| Loops | None: one pass | Revise loop and retrieval loop |
+| Cost and latency | Predictable | Variable; worst case several times a single pass |
+
+A common production blend: Self-RAG's retrieve decision and answer checks, CRAG's graded retrieval and refinement, and a web fallback only where policy allows it.
+
+## Failure modes and costs
+
+**Cost multiplies.** A simple answered question costs a decision, the retrieval, one relevance call per chunk, a generation, a support check and a usefulness check: around eight model calls instead of one. A bad case with revisions and rewrites can reach thirty. Use a small, fast model for the graders, keep `k` modest, and set budgets you can afford.
+
+**Graders agree with plausible fiction.** An LLM grader that uses its own knowledge will pass invented-but-typical facts ("14-day trial"). Say explicitly that only the context counts, and test the grader on answers you've deliberately salted with unsupported claims.
+
+**Revision hollows answers out.** A strict reviser can remove so much that the answer becomes vague. The usefulness check catches that, which is why both checks exist.
+
+**Loops that never progress.** If the rewriter doesn't see the previous query, it repeats itself and every round retrieves the same chunks. Pass the history and consider stopping early when the new query's results match the old ones.
+
+**Counters that don't reset.** Carrying `retries` across rewrite rounds silently removes the revise loop from later rounds.
+
+**Over-eager retrieval decisions.** If the decider says "no retrieval" for company questions, answers come from general knowledge with no checks at all, because the direct path skips every grader. Bias it toward retrieving, and log its decisions.
+
+**Latency hides from users.** A run with two rewrites can take many seconds. Stream node updates so the UI can show "checking the answer against the documents…" rather than a frozen spinner.
+
+### Choosing models for each role
+
+Nothing forces every node to use the same model. The roles have different needs:
+
+| Role | Needs | Good choice |
+|---|---|---|
+| Retrieve decision, IsRel, IsUse | Fast, cheap classification with a constrained output | A small model; these are yes/no judgements |
+| IsSup | Careful claim-by-claim comparison against long context | A stronger model; this is the check that catches hallucinations |
+| Generation and revision | Good writing that follows strict instructions | Your main model |
+| Query rewrite | Short, keyword-rich text | A small model |
+
+Because each node builds its own structured-output runnable, switching is one line per node: `init_chat_model("openai:gpt-4.1-nano").with_structured_output(Relevance)` for the relevance grader, for example. Measure the grader on a labelled sample before downgrading it. A cheap IsRel that drops a relevant chunk now and then is tolerable, because the loop can recover; a cheap IsSup that passes hallucinations defeats the design.
+
+<Callout kind="remember">
+Each reflection question guards against one specific failure. Retrieve? stops wasted or harmful retrieval, IsRel stops noisy evidence, IsSup stops invented claims, and IsUse stops answers that are true but beside the point. The loops give the system a second chance, and the counters make sure it eventually gives up honestly.
+</Callout>
+
+## Cheat sheet
+
+- Plain RAG retrieves for every query, trusts what it gets, and never checks its answer.
+- Self-RAG asks four questions: Retrieve?, IsRel, IsSup, IsUse.
+- The paper trains a model to emit reflection tokens inline; a LangGraph version uses one grader call per question.
+- Decide retrieval first; bias toward retrieving when unsure, and let general questions skip straight to a direct answer.
+- Grade relevance per document against the user's question, not the topic; route on "at least one relevant".
+- IsSup has three levels: fully, partially and no support. Partial support (invented links between real facts) is the common case.
+- Graders judge grounding against the context only, never their own knowledge.
+- Revise loop: is_sup → revise_answer → is_sup, with a `retries` counter.
+- Retrieval loop: is_use → rewrite_question → retrieve, with a `rewrite_tries` counter; reset `retries` on each rewrite.
+- Keep `question` fixed and rewrite only `retrieval_query`.
+- Exhausted budgets end in an honest "no answer found"; `recursion_limit` is only a backstop.
+- Expect several times the cost of plain RAG; use cheap graders and stream progress.

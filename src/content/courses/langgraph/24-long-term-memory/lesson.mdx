@@ -1,0 +1,760 @@
+import { LgMemoryStore } from "@/components/widgets/LgMemoryStore";
+import { LgMemoryExtractor } from "@/components/widgets/LgMemoryExtractor";
+
+## Why long-term memory
+
+Short-term memory, the checkpointer from the previous lesson, makes a single conversation coherent. It can't make an assistant **know its user**, because everything it holds is locked inside one thread.
+
+Users reveal themselves a little at a time, in different conversations. In a debugging chat Asha mentions she writes Python. In a travel chat she says she's moving to Bengaluru in two months. In a late-night chat about careers she says she teaches backend engineering. No single thread contains the full picture.
+
+So LLM products add a **memory store**: a database that sits outside all threads. As the user chats, the system asks a model "is there anything in this message worth remembering about the user?", extracts those facts, and saves them. Later, in any thread, before answering, the system looks up what it knows and puts the relevant facts into the prompt. Ask "write a Fibonacci function" and the assistant answers in Python without being told, because "prefers Python" was saved weeks ago.
+
+That cross-thread, persistent store is **long-term memory**. This lesson builds it in LangGraph in two parts:
+
+1. Work with a **store** directly: namespaces, writing, reading, listing and semantic search.
+2. Connect a store to a **graph**: a chatbot that reads memories to personalise replies, a node that writes new memories (without duplicates), then both together, persisted in Postgres.
+
+```bash
+pip install -U langgraph langchain "langchain[openai]"
+export OPENAI_API_KEY=sk-...
+```
+
+## Stores in LangGraph
+
+LangGraph models long-term memory as a **store**. The interface is an abstract base class, `BaseStore`, that defines what any store can do:
+
+| Method | Does |
+|---|---|
+| `put(namespace, key, value)` | Create a memory, or overwrite the one with that key |
+| `get(namespace, key)` | Fetch exactly one memory |
+| `search(namespace_prefix, ...)` | List or search memories under a namespace |
+| `delete(namespace, key)` | Remove a memory |
+
+(Each has an async twin: `aput`, `aget`, `asearch`, `adelete`.)
+
+Several concrete classes implement it:
+
+| Implementation | Keeps data in | Use it for |
+|---|---|---|
+| `InMemoryStore` | A Python dict in RAM | Learning, prototypes, tests |
+| `PostgresStore` | Postgres (with pgvector for semantic search) | Production |
+| `RedisStore` | Redis (from the `langgraph-checkpoint-redis` package) | Production, when you already run Redis |
+
+Because they share one interface, you prototype with `InMemoryStore` and switch to `PostgresStore` later without touching your nodes.
+
+Don't confuse the two persistence features:
+
+| | Checkpointer | Store |
+|---|---|---|
+| Memory type | Short-term | Long-term |
+| Organised by | `thread_id` | Namespaces you choose (usually per user) |
+| Holds | Full graph state snapshots | Individual memories (JSON documents) |
+| Passed as | `compile(checkpointer=...)` | `compile(store=...)` |
+
+## Working with a store
+
+Forget graphs for a moment and treat the store as a small database.
+
+### Namespaces
+
+Every memory lives in a **namespace**. If the store were Google Drive, a namespace would be a **folder path**. Namespaces are **tuples of strings**, as deep as you like:
+
+| Namespace | Holds |
+|---|---|
+| `("users", "u1")` | Everything about user u1 |
+| `("users", "u2")` | Everything about user u2 |
+| `("users", "u1", "profile")` | u1's name, job, location |
+| `("users", "u1", "preferences")` | u1 likes dark mode, prefers Python |
+| `("org", "acme", "policies")` | Facts shared by a whole organisation |
+
+Namespaces do two jobs: they **organise** memories (profile vs preferences vs episodes) and they **isolate** them, so u1's memories can never leak into u2's prompts as long as you always build the namespace from the current user's ID.
+
+### Writing memories with put
+
+`put` needs three things: the **namespace** (which folder), a **key** unique within that namespace (which file), and a **value**, which must be a dict:
+
+```python
+from langgraph.store.memory import InMemoryStore
+
+store = InMemoryStore()
+
+u1 = ("users", "u1")
+store.put(u1, "1", {"data": "User likes pizza"})
+store.put(u1, "2", {"data": "User prefers dark mode"})
+
+u2 = ("users", "u2")
+store.put(u2, "1", {"data": "User likes pasta"})
+store.put(u2, "2", {"data": "User prefers grid-style navigation"})
+```
+
+Keys only need to be unique **inside** a namespace, so both users can have a memory `"1"`. In real code you'll usually generate keys with `str(uuid.uuid4())`.
+
+### Reading one memory with get
+
+When you know exactly which memory you want, `get` it by namespace and key:
+
+```python
+item = store.get(u2, "1")
+print(item.value)        # {'data': 'User likes pasta'}
+print(item.key, item.namespace, item.updated_at)
+
+print(store.get(u2, "missing"))  # None
+```
+
+`get` returns an `Item` with the `value` plus metadata (key, namespace, timestamps), or `None` if nothing is there.
+
+### Listing memories with search
+
+When you want everything in a folder, use `search` with just a namespace:
+
+```python
+for item in store.search(u1):
+    print(item.key, item.value["data"])
+# 1 User likes pizza
+# 2 User prefers dark mode
+```
+
+Three details worth knowing:
+
+- The first argument is a namespace **prefix**. `store.search(("users",))` returns memories from `("users", "u1")` **and** `("users", "u2")`, because both start with `"users"`. Pass the full user namespace when you mean one user.
+- `search` returns at most **10 items by default**. Pass `limit=` (and `offset=` to page) when a namespace can hold more. Forgetting this is a classic bug: "the bot forgets things once a user has more than ten memories."
+- `filter=` matches on value fields, for example `store.search(u1, filter={"type": "preference"})`.
+
+### Updating and deleting
+
+There's no separate update method: `put` with an existing key **overwrites** it, which is how you correct a memory ("moved from Pune to Bengaluru"). `delete` removes one:
+
+```python
+store.put(u1, "2", {"data": "User prefers light mode"})  # update in place
+store.delete(u1, "1")                                    # forget the pizza
+```
+
+<LgMemoryStore />
+
+## Semantic search
+
+`get` needs an exact key and `search` without a query returns everything. Neither fits the most common situation.
+
+Suppose a user has a hundred memories (name, job, languages, UI preferences, pets) and today they're talking about their Mumbai trip in two months. Two or three memories are relevant. Fetching all hundred wastes tokens and distracts the model with irrelevant facts; fetching by key is impossible because you don't know which keys matter.
+
+You want to search by **meaning**: compare the current message with each memory and return the closest ones. That's **semantic search**, done with **embeddings**: each memory is turned into a vector when stored, the query is turned into a vector at search time, and the store returns the memories whose vectors are nearest.
+
+### Enabling an index
+
+Give the store an embedding model when you create it:
+
+```python
+from langchain.embeddings import init_embeddings
+from langgraph.store.memory import InMemoryStore
+
+embeddings = init_embeddings("openai:text-embedding-3-small")
+
+store = InMemoryStore(
+    index={
+        "embed": embeddings,   # the model that turns text into vectors
+        "dims": 1536,          # vector size produced by that model
+        "fields": ["data"],    # which value field(s) to embed (default: the whole value)
+    }
+)
+```
+
+Now every `put` also computes and stores an embedding.
+
+### Searching by meaning
+
+Store a varied set of memories, then pass a **query** and a **limit**:
+
+```python
+ns = ("users", "u1")
+facts = [
+    "User's name is Asha",
+    "User teaches backend engineering",
+    "User prefers dark mode in every app",
+    "User prefers bullet points over long paragraphs",
+    "User prefers concise answers",
+    "User is learning machine learning",
+    "User likes examples in Python",
+    "User is planning a trip to Mumbai in two months",
+]
+for i, text in enumerate(facts):
+    store.put(ns, str(i), {"data": text})
+
+for item in store.search(ns, query="What is the user currently studying?", limit=1):
+    print(item.value["data"], item.score)
+# User is learning machine learning  (followed by its similarity score)
+```
+
+`score` is the similarity between query and memory, and results come back best first. Ask "What are the user's preferences?" with `limit=3` and you get the three "prefers" memories. The query never shared a keyword with "learning machine learning" ("studying" vs "learning"); the embedding captured the meaning.
+
+So semantic search is the same `search` method with two extras: an index on the store, and `query=` plus `limit=` on the call.
+
+<Callout kind="tip">
+Pick `limit` deliberately. One or two memories is often too few for a broad question; twenty is usually too many for one prompt. Three to five is a sensible starting range.
+</Callout>
+
+## Reading memories in a graph
+
+Now connect a store to a chatbot. The first version only **reads** memories: the store is pre-filled, and the chatbot uses what it finds to personalise replies.
+
+### Passing the user ID
+
+The node needs two things it can't get from the messages: **which user** is chatting (to build the namespace), and **the store** itself. In current LangGraph both arrive through the **runtime**:
+
+- Declare a **context schema** for per-run data like the user ID, and pass it with `context=` when invoking.
+- Compile with `store=...`; LangGraph then exposes it as `runtime.store` inside any node that accepts a `runtime` argument.
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Context:
+    user_id: str
+```
+
+The user ID comes from your app (the logged-in user), never from the model. It's run configuration, not conversation state.
+
+### The system prompt template
+
+Memories reach the model through the prompt, so write a system prompt that says how to use them, with a slot to fill:
+
+```python
+SYSTEM_TEMPLATE = """You are a helpful assistant with memory of this user.
+
+What you know about the user:
+{user_details}
+
+Use these details to personalise your answer:
+- Address the user by name if you know it.
+- Connect explanations to their known projects, tools and preferences.
+- Follow their stated preferences for format and length.
+- Don't mention details that aren't relevant to the question.
+End with two follow-up questions they might want to ask next."""
+```
+
+### The chat node
+
+The node builds the user's namespace, reads their memories, fills the template, and prepends it as a system message:
+
+```python
+from langchain.chat_models import init_chat_model
+from langchain_core.messages import SystemMessage
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.runtime import Runtime
+from langgraph.store.memory import InMemoryStore
+
+chat_model = init_chat_model("openai:gpt-4.1-mini")
+
+def chat(state: MessagesState, runtime: Runtime[Context]):
+    namespace = ("users", runtime.context.user_id, "details")
+    items = runtime.store.search(namespace, limit=50)
+    user_details = "\n".join(f"- {it.value['data']}" for it in items) or "(nothing yet)"
+
+    system = SystemMessage(SYSTEM_TEMPLATE.format(user_details=user_details))
+    reply = chat_model.invoke([system] + state["messages"])
+    return {"messages": [reply]}
+
+builder = StateGraph(MessagesState, context_schema=Context)
+builder.add_node("chat", chat)
+builder.add_edge(START, "chat")
+builder.add_edge("chat", END)
+```
+
+Look at the last two lines of the node: this is the **injection** step from the memory lesson. Long-term memories are pulled out of the store and placed into this call's context, ahead of the short-term conversation. The system message is built fresh each time and never stored in the thread.
+
+For simplicity this version loads all the user's memories (up to 50). With a semantic index you'd search with the latest message instead: `runtime.store.search(namespace, query=state["messages"][-1].content, limit=5)`.
+
+### Running the personalised chatbot
+
+Pre-fill some memories, compile with the store, and invoke with a context:
+
+```python
+store = InMemoryStore()
+ns = ("users", "u1", "details")
+store.put(ns, "name", {"data": "User's name is Asha"})
+store.put(ns, "job", {"data": "Teaches backend engineering on YouTube"})
+store.put(ns, "style", {"data": "Prefers concise answers"})
+store.put(ns, "lang", {"data": "Likes examples in Python"})
+store.put(ns, "project", {"data": "Building MCP servers in Python"})
+
+graph = builder.compile(store=store)
+
+out = graph.invoke(
+    {"messages": [{"role": "user", "content": "Explain generative AI simply."}]},
+    context=Context(user_id="u1"),
+)
+print(out["messages"][-1].content)
+```
+
+The reply opens with "Sure, Asha", stays short, uses a Python example, and its follow-up questions mention teaching material and MCP servers. Nothing in the user's message asked for any of that; it all came from the store. Run the same question with `Context(user_id="u2")` and the answer is generic, because u2's namespace is empty.
+
+<Callout kind="remember">
+Older code reads the store and user ID with a node signature like `def chat(state, config: RunnableConfig, *, store: BaseStore)` and `config["configurable"]["user_id"]`. That still works, but the `Runtime` plus `context_schema` style is the current recommendation: the context is typed, and `runtime.store` is always there.
+</Callout>
+
+### Retrieving only relevant memories
+
+Loading every memory is fine while a user has a handful. Once they have hundreds, give the store an embedding index and let the latest message choose what to load:
+
+```python
+def chat(state: MessagesState, runtime: Runtime[Context]):
+    namespace = ("users", runtime.context.user_id, "details")
+    question = state["messages"][-1].content
+
+    items = runtime.store.search(namespace, query=question, limit=5)
+    user_details = "\n".join(f"- {it.value['data']}" for it in items) or "(nothing relevant)"
+
+    system = SystemMessage(SYSTEM_TEMPLATE.format(user_details=user_details))
+    return {"messages": [chat_model.invoke([system] + state["messages"])]}
+```
+
+The cost is one embedding call per turn, which is far cheaper than a chat-model call, and the prompt stays small no matter how much the store grows. A common hybrid is to always load a short core profile (name, language, format preferences) with `get`, and add the top few semantic matches on top.
+
+A short message like "and in Rust?" makes a poor query on its own. If retrieval quality matters, build the query from the last few messages, or ask a small model to rewrite the conversation into a standalone search query first.
+
+## Writing memories in a graph
+
+A chatbot that only reads a hand-filled store isn't much use. Memories should be **created from conversation**. We'll build a separate graph whose only job is to do that: `START → remember → END`. It doesn't chat; it reads the latest user message, decides whether anything is worth storing, and writes it.
+
+### Structured extraction
+
+Deciding "is there a durable fact in this message?" needs judgement, so an LLM does it. To make the output usable by code, ask for **structured output** with a Pydantic model:
+
+```python
+from pydantic import BaseModel, Field
+from langchain.chat_models import init_chat_model
+
+class MemoryDecision(BaseModel):
+    should_write: bool = Field(description="True if the message contains anything worth remembering")
+    memories: list[str] = Field(default_factory=list, description="Short, atomic facts about the user")
+
+extractor = init_chat_model("openai:gpt-4.1-mini", temperature=0).with_structured_output(MemoryDecision)
+```
+
+`with_structured_output` makes the model return a `MemoryDecision` object instead of free text. A list is used because one message can hold several facts ("I'm Asha, I teach AI, and I love Python" is three).
+
+### The remember node
+
+```python
+import uuid
+from langchain_core.messages import SystemMessage
+
+EXTRACT_PROMPT = """Extract long-term memories from the user's message.
+Only store stable, user-specific information: identity, preferences, ongoing projects.
+Do not store one-off requests, small talk or temporary details.
+Each memory must be one short, atomic sentence.
+If nothing is worth storing, set should_write to false."""
+
+def remember(state: MessagesState, runtime: Runtime[Context]):
+    namespace = ("users", runtime.context.user_id, "details")
+    last = state["messages"][-1]
+
+    decision = extractor.invoke([SystemMessage(EXTRACT_PROMPT), last])
+
+    if decision.should_write:
+        for text in decision.memories:
+            runtime.store.put(namespace, str(uuid.uuid4()), {"data": text})
+    return {}
+```
+
+The node returns `{}`: it changes the store, not the graph state. "Atomic" matters. One fact per memory makes each one easy to retrieve, update or delete on its own.
+
+Wire it up and feed it a few messages:
+
+```python
+builder = StateGraph(MessagesState, context_schema=Context)
+builder.add_node("remember", remember)
+builder.add_edge(START, "remember")
+builder.add_edge("remember", END)
+
+store = InMemoryStore()
+graph = builder.compile(store=store)
+ctx = Context(user_id="u1")
+
+for text in ["Hi, my name is Asha.", "I teach AI on YouTube.", "My favourite language is Python."]:
+    graph.invoke({"messages": [{"role": "user", "content": text}]}, context=ctx)
+
+for it in store.search(("users", "u1", "details")):
+    print(it.value["data"])
+# User's name is Asha.
+# User teaches AI on YouTube.
+# User's favourite programming language is Python.
+```
+
+### Checking the extractor's judgement
+
+The extraction prompt is effectively your memory **policy**, and it's worth testing like any other code. Keep a small table of messages and what should happen, and run the extractor over it whenever you change the prompt or the model:
+
+| Message | Expected |
+|---|---|
+| "I'm Asha and I teach backend engineering." | Two facts: name, job |
+| "Can you shorten this email?" | `should_write=false` (one-off task) |
+| "I'm exhausted today." | `should_write=false` (temporary state) |
+| "Never use emojis in replies to me." | One fact: a lasting format preference |
+| "My API key is sk-live-..." | `should_write=false` (secrets are never memories) |
+| "My sister likes Python." | Nothing about the user, or clearly attributed to the sister |
+
+```python
+cases = [
+    ("I'm Asha and I teach backend engineering.", True),
+    ("Can you shorten this email?", False),
+    ("I'm exhausted today.", False),
+]
+from langchain_core.messages import HumanMessage, SystemMessage
+
+for text, should in cases:
+    d = extractor.invoke([SystemMessage(EXTRACT_PROMPT), HumanMessage(text)])
+    status = "ok" if d.should_write == should else "WRONG"
+    print(f"{status:5} {text!r} -> {[m for m in d.memories]}")
+```
+
+The usual failure modes are **over-eager** extraction (storing moods, one-off tasks and pasted content), **under-eager** extraction (missing preferences that are phrased indirectly, like "ugh, Java again"), and **misattribution** (storing a friend's details as the user's). Concrete do and don't lists in the prompt, a temperature of 0, and a few worked examples fix most of them. LangSmith datasets and evaluators, covered earlier in the course, turn this table into a repeatable regression test.
+
+### The duplicate problem
+
+Send the same three messages again and list the store: there are now **six** memories, every fact twice. The extractor sees each message in isolation, so it has no idea the fact is already stored, and a fresh UUID key means `put` never overwrites. Over months, a store fills with near-identical copies ("likes Python", "prefers Python", "favourite language: Python"), which wastes prompt space and makes retrieval worse.
+
+### Deduplicating with existing memories
+
+There are several ways to deduplicate. A simple, effective one: **show the extractor what's already stored**, and have it mark each extracted fact as new or not. Only new ones get written.
+
+First make the output schema more expressive:
+
+```python
+class MemoryItem(BaseModel):
+    text: str = Field(description="One short, atomic fact about the user")
+    is_new: bool = Field(description="True only if this adds information not already in the known facts")
+
+class MemoryDecision(BaseModel):
+    should_write: bool
+    memories: list[MemoryItem] = Field(default_factory=list)
+
+extractor = init_chat_model("openai:gpt-4.1-mini", temperature=0).with_structured_output(MemoryDecision)
+```
+
+Then pass the existing memories into the prompt and filter on `is_new`:
+
+```python
+EXTRACT_PROMPT = """You maintain an accurate memory of the user.
+
+Facts already stored:
+{known}
+
+Read the user's latest message and extract stable, user-specific facts worth keeping
+long term (identity, preferences, ongoing projects).
+For each fact set is_new=true only if it adds information not already stored above.
+If it means the same as a stored fact, set is_new=false.
+Keep each memory a short, atomic sentence. No guesses, only what the user stated.
+If nothing is worth storing, return an empty list."""
+
+def remember(state: MessagesState, runtime: Runtime[Context]):
+    namespace = ("users", runtime.context.user_id, "details")
+    existing = runtime.store.search(namespace, limit=100)
+    known = "\n".join(f"- {it.value['data']}" for it in existing) or "(none)"
+
+    decision = extractor.invoke([
+        SystemMessage(EXTRACT_PROMPT.format(known=known)),
+        state["messages"][-1],
+    ])
+
+    if decision.should_write:
+        for mem in decision.memories:
+            if mem.is_new:
+                runtime.store.put(namespace, str(uuid.uuid4()), {"data": mem.text})
+    return {}
+```
+
+Now repeating "My name is Asha" extracts the fact again, but the model sees "User's name is Asha" in the known list and marks it `is_new=false`, so nothing is written. The store stays at one copy per fact.
+
+This strategy is easy to understand but has limits worth knowing. It relies on the model's judgement; it sends all known facts on every call (fine for dozens, not thousands); and it can only add, not **update** ("moved to Bengaluru" should replace "lives in Pune"). Production systems extend it by searching only the most similar existing memories, and letting the extractor return update and delete actions with the key to change. The `langmem` library packages this pattern as a memory manager if you'd rather not hand-roll it.
+
+<LgMemoryExtractor />
+
+## A complete memory chatbot
+
+Combine the two halves into one graph:
+
+```text
+START → remember → chat → END
+           │         │
+         writes     reads
+           └──► store ◄──┘
+```
+
+- `remember` extracts new facts from the latest user message and writes them.
+- `chat` reads the user's memories and answers with them in its system prompt.
+
+Two separate models are involved: a structured-output extractor and the chat model. You can use a smaller, cheaper model for extraction.
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+builder = StateGraph(MessagesState, context_schema=Context)
+builder.add_node("remember", remember)   # the deduplicating version
+builder.add_node("chat", chat)           # the memory-reading version
+builder.add_edge(START, "remember")
+builder.add_edge("remember", "chat")
+builder.add_edge("chat", END)
+
+graph = builder.compile(checkpointer=InMemorySaver(), store=InMemoryStore())
+```
+
+Notice that both kinds of memory are attached: the **checkpointer** keeps each thread's messages (short-term), the **store** keeps facts about the user (long-term). Put `remember` before `chat` so a fact stated in this very message ("I'm Asha, explain decorators") is already available when the reply is written.
+
+Watch them work together across threads:
+
+```python
+ctx = Context(user_id="u1")
+t1 = {"configurable": {"thread_id": "t1"}}
+t2 = {"configurable": {"thread_id": "t2"}}
+
+def say(text, config):
+    out = graph.invoke({"messages": [{"role": "user", "content": text}]}, config, context=ctx)
+    return out["messages"][-1].content
+
+say("Hi, my name is Asha.", t1)                 # "Hi Asha! How can I help?"
+say("I teach AI on YouTube.", t1)               # friendly reply plus questions about her videos
+say("Explain generative AI simply.", t2)        # new thread: "Sure, Asha..." in short bullet points
+```
+
+The third message is in a **brand-new thread**, so its short-term memory is empty, and yet the assistant knows Asha's name and job. That's exactly what thread-scoped memory could never do. And "Explain generative AI simply" adds nothing to the store, because the extractor finds no durable fact in it.
+
+## Persisting the store in Postgres
+
+`InMemoryStore` has the same weakness as `InMemorySaver`: restart the process and every memory is gone. That's fatal for long-term memory, whose whole point is to last. In production, use `PostgresStore` (or `RedisStore`).
+
+Run Postgres with the pgvector extension, which `PostgresStore` needs for semantic search:
+
+```bash
+docker run -d --name langgraph-pg \
+  -e POSTGRES_PASSWORD=postgres \
+  -p 5442:5432 \
+  pgvector/pgvector:pg16
+
+docker ps                     # the container should be running
+pip install -U langgraph-checkpoint-postgres "psycopg[binary,pool]"
+```
+
+`langgraph-checkpoint-postgres` contains both `PostgresSaver` and `PostgresStore`. Open them as context managers, run `setup()` once, and compile inside the block:
+
+```python
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
+
+DB_URI = "postgresql://postgres:postgres@localhost:5442/postgres?sslmode=disable"
+
+with (
+    PostgresStore.from_conn_string(DB_URI) as store,
+    PostgresSaver.from_conn_string(DB_URI) as checkpointer,
+):
+    store.setup()          # creates the store tables (run once; safe to repeat)
+    checkpointer.setup()
+
+    graph = builder.compile(checkpointer=checkpointer, store=store)
+
+    ctx = Context(user_id="u1")
+    config = {"configurable": {"thread_id": "t1"}}
+    graph.invoke({"messages": [{"role": "user", "content": "Hi, I'm Asha and I teach AI."}]},
+                 config, context=ctx)
+
+    for it in store.search(("users", "u1", "details")):
+        print(it.value["data"])
+```
+
+The nodes are unchanged; only the objects passed to `compile` differ. To prove it persists, restart Python, open the store again and just list the namespace without invoking anything: the memories are still there, and will be after a reboot.
+
+To enable semantic search in Postgres, pass the same index configuration you gave `InMemoryStore`:
+
+```python
+from langchain.embeddings import init_embeddings
+
+with PostgresStore.from_conn_string(
+    DB_URI,
+    index={
+        "embed": init_embeddings("openai:text-embedding-3-small"),
+        "dims": 1536,
+        "fields": ["data"],
+    },
+) as store:
+    store.setup()   # also creates the vector table and index (needs pgvector)
+    graph = builder.compile(checkpointer=checkpointer, store=store)
+```
+
+A few production notes:
+
+- **`setup()` is a migration step.** Run it once at deploy time (or at startup); it's idempotent, so repeated calls are harmless.
+- **Embedding dimensions are fixed** once the vector table exists. Switching to an embedding model with a different size means re-creating the index and re-embedding existing memories, so choose deliberately.
+- **Async servers** should use `AsyncPostgresStore` and `AsyncPostgresSaver` (same packages, `async with` and `await store.asetup()`), so database calls don't block other requests.
+- **Connection lifetime.** Open the store and checkpointer once when the app starts and close them at shutdown, rather than per request.
+
+## Beyond a list of facts
+
+Everything so far stored **semantic** memory as a growing list of one-line facts. The memory lesson named three kinds of long-term memory, and the same store, `put`, `get` and `search` cover all of them. What changes is how you shape the documents and when you read them.
+
+### Profiles vs collections
+
+There are two common shapes for semantic memory:
+
+| | Collection | Profile |
+|---|---|---|
+| Shape | Many small documents, one fact each | One document per user, with fields |
+| Write | `put` a new key per fact | `get` the profile, merge changes, `put` it back |
+| Read | `search`, often semantic | `get` by a fixed key |
+| Strength | Unbounded, captures anything | Compact, no duplicates, easy to show the user |
+| Weakness | Duplicates and contradictions creep in | Only holds the fields you planned for |
+
+A profile is a natural fit for things with a single current value (name, city, preferred language, plan tier). Updating it is a read-merge-write:
+
+```python
+def update_profile(store, user_id: str, changes: dict):
+    ns = ("users", user_id)
+    item = store.get(ns, "profile")
+    profile = item.value if item else {}
+    store.put(ns, "profile", {**profile, **changes})
+
+update_profile(store, "u1", {"name": "Asha", "city": "Pune"})
+update_profile(store, "u1", {"city": "Bengaluru"})   # the move overwrites, no contradiction
+print(store.get(("users", "u1"), "profile").value)
+# {'name': 'Asha', 'city': 'Bengaluru'}
+```
+
+For a profile, the extractor returns structured fields instead of free sentences: a Pydantic model with optional `name`, `city`, `preferred_language` and so on, where only the fields mentioned in the message are filled. Many apps use both shapes: a profile for core attributes, and a collection for everything else.
+
+### Episodic memory as examples
+
+Episodic memory records **what happened and how it went**. A practical form is a log of past situations with their outcomes, which you retrieve as examples when a similar situation comes up:
+
+```python
+episodes = ("users", "u1", "episodes")
+
+store.put(episodes, str(uuid.uuid4()), {
+    "situation": "Slow report query on the orders table",
+    "what_worked": "Rewrote the correlated subquery as a window function",
+    "what_failed": "Adding an index on created_at alone",
+})
+
+# Later, with an embedding index on the "situation" field:
+similar = store.search(episodes, query="dashboard SQL query is slow", limit=2)
+```
+
+Injected into the prompt ("Last time a query like this was slow, a window function fixed it; an index alone didn't"), these episodes act as few-shot examples drawn from this user's own history. Write episodes at the **end** of a task, when you know the outcome, rather than on every message.
+
+### Procedural memory as instructions
+
+Procedural memory is **how the agent should behave**, and in an LLM system that mostly means its instructions. Keep the system prompt itself in the store, read it at the start of each call, and let a separate step rewrite it when the user gives feedback:
+
+```python
+INSTRUCTIONS = ("agent", "instructions")
+DEFAULT = "You are a concise SQL assistant."
+
+def chat(state: MessagesState, runtime: Runtime[Context]):
+    item = runtime.store.get(INSTRUCTIONS, runtime.context.user_id)
+    instructions = item.value["text"] if item else DEFAULT
+    reply = chat_model.invoke([SystemMessage(instructions)] + state["messages"])
+    return {"messages": [reply]}
+
+def learn_from_feedback(store, user_id: str, feedback: str):
+    item = store.get(INSTRUCTIONS, user_id)
+    current = item.value["text"] if item else DEFAULT
+    prompt = (f"Current instructions:\n{current}\n\nUser feedback:\n{feedback}\n\n"
+              "Rewrite the instructions to follow this feedback. Return only the new instructions.")
+    new_text = chat_model.invoke(prompt).content
+    store.put(INSTRUCTIONS, user_id, {"text": new_text})
+```
+
+After `learn_from_feedback(store, "u1", "Stop using subqueries; I want window functions")`, every future conversation for u1 starts with instructions that already include the rule. This is the mechanism behind an agent that "gets better at working with you". Because a bad rewrite affects every later chat, review or version these instructions rather than overwriting them blindly.
+
+| Memory type | Typical namespace | Written | Read |
+|---|---|---|---|
+| Semantic | `("users", id, "details")` or a `"profile"` key | When the user states a fact | Every call, or by semantic search |
+| Episodic | `("users", id, "episodes")` | When a task finishes | By similarity to the current task |
+| Procedural | `("agent", "instructions")` | After feedback or reflection | At the start of every call |
+
+## Writing memories off the hot path
+
+In the complete chatbot, `remember` runs **before** `chat` on every turn. That's the simplest design and memories are available immediately, but every message now pays for an extra LLM call before the user sees anything, even "thanks!".
+
+Two alternatives move the work off the critical path:
+
+1. **After the reply.** Reorder to `START → chat → remember → END` and stream the chat node's output. The user sees the answer as soon as `chat` finishes; extraction runs afterwards. The trade-off: a fact stated in this message reaches the store one turn later.
+2. **In the background.** Don't extract inside the chat graph at all. When a conversation goes quiet (say, ten minutes without a message) or ends, run a separate extraction over the **whole thread**. Seeing a full conversation at once gives the extractor more context, makes it easier to merge and deduplicate, and costs one call per conversation instead of one per message.
+
+A background job only needs the thread's messages and the same store:
+
+```python
+def consolidate_thread(graph, thread_id: str, user_id: str, store):
+    messages = graph.get_state({"configurable": {"thread_id": thread_id}}).values["messages"]
+    transcript = "\n".join(f"{m.type}: {m.content}" for m in messages)
+
+    namespace = ("users", user_id, "details")
+    existing = store.search(namespace, limit=100)
+    known = "\n".join(f"- {it.value['data']}" for it in existing) or "(none)"
+
+    decision = extractor.invoke([
+        SystemMessage(EXTRACT_PROMPT.format(known=known)),
+        HumanMessage(f"Conversation:\n{transcript}"),
+    ])
+    for mem in decision.memories:
+        if mem.is_new:
+            store.put(namespace, str(uuid.uuid4()), {"data": mem.text})
+```
+
+(Import `HumanMessage` from `langchain_core.messages` alongside `SystemMessage`.) Notice how the pieces fit: the **checkpointer** supplies the raw conversation, and the **store** receives the distilled facts. Short-term memory feeds long-term memory.
+
+| Write strategy | Latency per turn | Freshness | Extraction quality |
+|---|---|---|---|
+| Before chat (hot path) | Highest | Same turn | One message of context |
+| After chat | Low if streamed | Next turn | One message of context |
+| Background per thread | None | After the conversation | Whole conversation |
+
+## Inspecting and managing memories
+
+A memory system needs operations around it, not just inside the graph: debugging what the bot believes, showing users their data, and cleaning up.
+
+```python
+# Which namespaces exist under "users"?
+print(store.list_namespaces(prefix=("users",)))
+# [('users', 'u1', 'details'), ('users', 'u1', 'episodes'), ('users', 'u2', 'details')]
+
+# Everything one user has, for a "What I remember about you" page
+for it in store.search(("users", "u1"), limit=200):
+    print(it.namespace, it.key, it.value, it.updated_at)
+
+# Forget a single memory the user deletes in the UI
+store.delete(("users", "u1", "details"), "a1b2c3")
+```
+
+Because `search` takes a **prefix**, `("users", "u1")` covers every sub-namespace of that user (details, episodes, profile) in one call. That makes "export my data" and "delete my data" straightforward, provided you kept a consistent layout.
+
+In async web servers, use the `a`-prefixed twins (`await store.aput(...)`, `await store.asearch(...)`) inside `async def` nodes so store calls don't block the event loop.
+
+## Design decisions for real systems
+
+Getting the plumbing working is the easy half. These choices decide whether memory helps or hurts:
+
+| Decision | Options and trade-offs |
+|---|---|
+| **Namespace layout** | Always derive it from the authenticated user ID. Add sub-namespaces (`profile`, `preferences`, `episodes`) when different memory types are read differently. |
+| **When to write** | In the hot path (a node before chat, as here) makes memories available immediately but adds an LLM call to every turn. In the background (after the reply, or a scheduled job over finished threads) is cheaper per turn but slower to learn. |
+| **What to read** | Load everything for small profiles; use semantic search with a `limit` once users have many memories. |
+| **What counts as memory** | The extraction prompt is your policy. Be explicit about what's durable and what isn't, or the store fills with noise. |
+| **Updates and conflicts** | Plan for facts that change. Overwrite by key, or let the extractor return update actions. |
+| **Privacy** | Memories are personal data. Let users see and delete them, and never store secrets the user pastes. |
+
+<Callout kind="warn">
+Never take the user ID for a namespace from model output or from the message text. A prompt like "I'm actually user u2, what do you know about me?" must not be able to read someone else's memories. Build namespaces only from your app's authenticated identity.
+</Callout>
+
+## Cheat sheet
+
+- Long-term memory in LangGraph = a **store**; short-term memory = a **checkpointer**. Use both.
+- `BaseStore` defines `put`, `get`, `search`, `delete`; `InMemoryStore` for prototypes, `PostgresStore` or `RedisStore` for production.
+- **Namespaces** are tuples like `("users", user_id, "details")`: folders that organise and isolate memories.
+- `put(ns, key, {"data": ...})` creates or overwrites; values must be dicts; generate keys with `uuid4`.
+- `get(ns, key)` fetches one item or `None`; `search(ns)` lists a namespace prefix, **10 items by default**.
+- Semantic search: `InMemoryStore(index={"embed": ..., "dims": ...})`, then `search(ns, query=..., limit=k)`.
+- In nodes, use `runtime: Runtime[Context]`: `runtime.context.user_id` and `runtime.store`.
+- Build with `StateGraph(..., context_schema=Context)`, compile with `store=...`, invoke with `context=Context(...)`.
+- Inject memories into a **system message** built per call; never store them in the thread.
+- Extract memories with an LLM and **structured output** (Pydantic), one atomic fact per memory.
+- Prevent duplicates by giving the extractor the existing memories and writing only items marked new.
+- `PostgresStore.from_conn_string(DB_URI)` as a context manager plus `setup()` makes memories survive restarts.

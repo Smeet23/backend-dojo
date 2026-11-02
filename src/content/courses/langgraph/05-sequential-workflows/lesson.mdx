@@ -1,0 +1,400 @@
+import { LgGraphStepper } from "@/components/widgets/LgGraphStepper";
+
+## What you'll build
+
+A **sequential workflow** is the simplest graph there is: tasks connected in a straight line from start to finish. Task one, then task two, then task three. No branches, no parallel paths, no loops.
+
+This lesson builds three of them, each adding one idea:
+
+1. A **BMI calculator** with no LLM at all, so you can focus entirely on LangGraph's syntax.
+2. A **single-call Q&A** workflow, to see how LangChain's model classes plug into a LangGraph node.
+3. A **prompt chain** that writes a blog post in two LLM calls (outline, then post), which is the first genuinely useful pattern.
+
+Using LangGraph for a straight line is overkill, honestly. Plain Python would do. The point is that every graph you'll ever build uses exactly the same five moves you'll practise here, and they're easiest to learn when nothing else is going on.
+
+## Setting up
+
+Create a project folder, a virtual environment and install the packages:
+
+```bash
+mkdir langgraph-course && cd langgraph-course
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+pip install -U langgraph langchain langchain-openai python-dotenv ipykernel
+```
+
+Why each package?
+
+| Package | Role |
+|---|---|
+| `langgraph` | The graph framework: `StateGraph`, `START`, `END`, the runtime |
+| `langchain` | LLM building blocks: chat models, prompts, structured output, loaders, splitters |
+| `langchain-openai` | The OpenAI integration that `langchain` loads when you ask for an `openai:` model |
+| `python-dotenv` | Reads API keys from a `.env` file into environment variables |
+| `ipykernel` | Lets a Jupyter notebook use this virtual environment |
+
+LangGraph orchestrates; LangChain supplies the LLM pieces. You'll use them together throughout the course.
+
+Put your key in a `.env` file at the project root (and add `.env` to `.gitignore`):
+
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+Working in a **Jupyter notebook** is convenient for this stage because you can render each graph as a picture right under the code. Later projects use ordinary `.py` files.
+
+A one-line smoke test confirms the install:
+
+```python
+from langgraph.graph import StateGraph, START, END
+print("LangGraph is ready")
+```
+
+## The five moves
+
+Every LangGraph program follows the same recipe:
+
+1. **Define the state**: a `TypedDict` listing the keys the workflow carries.
+2. **Create a builder**: `StateGraph(YourState)`.
+3. **Add nodes**: `builder.add_node("name", function)`.
+4. **Add edges**: `builder.add_edge("from", "to")`, using `START` and `END` for the entry and exit.
+5. **Compile, then invoke**: `graph = builder.compile()`, then `graph.invoke(initial_state)`.
+
+Keep this list in mind; the rest of the lesson is these five moves applied three times.
+
+## A BMI workflow
+
+Body-mass index is weight in kilograms divided by height in metres squared. The workflow takes a weight and a height, computes BMI in one node, and returns it.
+
+Before writing code, design the state. What does the workflow need to carry? The two inputs and the one output: `weight_kg`, `height_m` and `bmi`.
+
+### Define the state
+
+```python
+from typing import TypedDict
+
+class BMIState(TypedDict):
+    weight_kg: float
+    height_m: float
+    bmi: float
+```
+
+A `TypedDict` is an ordinary dictionary at run time. The class only declares which keys exist and what types they hold, which helps your editor, your teammates and LangGraph itself (it creates one storage slot, called a channel, per key).
+
+### Write the node
+
+A node is a function that receives the current state and returns **the keys it wants to change**:
+
+```python
+def calculate_bmi(state: BMIState) -> dict:
+    weight = state["weight_kg"]
+    height = state["height_m"]
+    bmi = weight / height**2
+    return {"bmi": round(bmi, 2)}
+```
+
+Notice it returns `{"bmi": ...}`, not the whole state. LangGraph merges this **partial update** into the existing state for you. You'll see code in the wild that writes `state["bmi"] = ...` and then `return state`. That happens to work in a straight line, but it breaks as soon as nodes run in parallel (the next lesson shows exactly how), so build the partial-update habit from your first node.
+
+### Build, wire and compile
+
+```python
+from langgraph.graph import StateGraph, START, END
+
+builder = StateGraph(BMIState)
+
+builder.add_node("calculate_bmi", calculate_bmi)
+
+builder.add_edge(START, "calculate_bmi")
+builder.add_edge("calculate_bmi", END)
+
+graph = builder.compile()
+```
+
+`START` and `END` are special marker nodes. An edge from `START` says where the run begins; an edge to `END` says a path is finished. Your graph must have at least one edge from `START`, or `compile()` refuses with "Graph must have an entrypoint".
+
+The first argument to `add_node` is the node's **name**, the string you use in edges. The second is the function that runs. They don't have to match; naming them the same just keeps things readable. If you pass only a function, `add_node(calculate_bmi)`, LangGraph uses the function's name as the node name.
+
+`compile()` checks the structure (an entry point exists, every edge points at a real node) and returns a runnable graph. It's the compiled object you invoke, not the builder.
+
+### Invoke
+
+```python
+initial_state = {"weight_kg": 80, "height_m": 1.73}
+final_state = graph.invoke(initial_state)
+print(final_state)
+# {'weight_kg': 80, 'height_m': 1.73, 'bmi': 26.73}
+```
+
+State goes **in** and state comes **out**. You pass a dictionary with whichever keys you have at the start (you don't need to supply `bmi`), and `invoke` returns the full final state after every node has run.
+
+### See the graph
+
+In a notebook, render the compiled graph as an image:
+
+```python
+from IPython.display import Image, display
+
+display(Image(graph.get_graph().draw_mermaid_png()))
+```
+
+You'll see `__start__` → `calculate_bmi` → `__end__`. `draw_mermaid_png()` renders through an online Mermaid service by default, so it needs internet access. Outside a notebook, `print(graph.get_graph().draw_mermaid())` prints the diagram's text, which you can paste into any Mermaid viewer, or you can write the PNG bytes to a file. For bigger graphs, looking at the picture is the fastest way to spot a missing or misplaced edge.
+
+## Adding a second node
+
+A number alone isn't very helpful, so extend the workflow to label the result: underweight, normal, overweight or obese. That means a second node after the first.
+
+Two changes are needed. First, the state gains a key for the label:
+
+```python
+class BMIState(TypedDict):
+    weight_kg: float
+    height_m: float
+    bmi: float
+    category: str
+```
+
+Second, a new node reads the BMI the previous node wrote and returns a category:
+
+```python
+def label_bmi(state: BMIState) -> dict:
+    bmi = state["bmi"]
+    if bmi < 18.5:
+        category = "underweight"
+    elif bmi < 25:
+        category = "normal"
+    elif bmi < 30:
+        category = "overweight"
+    else:
+        category = "obese"
+    return {"category": category}
+```
+
+Then add the node and re-wire the edges so the line goes through it:
+
+```python
+builder = StateGraph(BMIState)
+builder.add_node("calculate_bmi", calculate_bmi)
+builder.add_node("label_bmi", label_bmi)
+
+builder.add_edge(START, "calculate_bmi")
+builder.add_edge("calculate_bmi", "label_bmi")
+builder.add_edge("label_bmi", END)
+
+graph = builder.compile()
+print(graph.invoke({"weight_kg": 80, "height_m": 1.73}))
+# {'weight_kg': 80, 'height_m': 1.73, 'bmi': 26.73, 'category': 'overweight'}
+```
+
+This is the essence of state: `label_bmi` never received an argument called `bmi`. It read the value `calculate_bmi` left in the shared state. Neither function knows the other exists; the edges and the state connect them.
+
+<Callout kind="warn">
+Watch the boundary values when you write thresholds. With `bmi < 25` for "normal", a BMI of exactly 25.0 lands in "overweight", which matches the usual definition. Write ranges as a chain of `<` checks, as above, so there are no gaps or overlaps.
+</Callout>
+
+### Watching each node run
+
+`invoke` only shows you the end. While building, `stream` with `stream_mode="updates"` shows what each node returned, in order:
+
+```python
+for update in graph.stream({"weight_kg": 80, "height_m": 1.73}, stream_mode="updates"):
+    print(update)
+# {'calculate_bmi': {'bmi': 26.73}}
+# {'label_bmi': {'category': 'overweight'}}
+```
+
+Use `stream_mode="values"` instead to print the **full state** after each step. Step through the same graph below and compare the update each node returns with the state it produces.
+
+<LgGraphStepper initial="bmi" />
+
+### A shortcut for straight lines
+
+Wiring a long chain edge by edge gets repetitive. `add_sequence` adds a list of functions as nodes (named after the functions) and connects them in order; you still connect the ends:
+
+```python
+builder = StateGraph(BMIState)
+builder.add_sequence([calculate_bmi, label_bmi])
+builder.add_edge(START, "calculate_bmi")
+builder.add_edge("label_bmi", END)
+graph = builder.compile()
+```
+
+It produces exactly the same graph as the explicit version. Use whichever reads better; the explicit form is easier to modify when you later insert a branch in the middle.
+
+## Mistakes that bite early
+
+A handful of errors account for most first-week LangGraph frustration. All of them come from forgetting that nodes talk to each other **only through state**, and that LangGraph trusts what you return.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `KeyError: 'bmi'` inside a node | The node reads a key no earlier node has written and the input didn't include | Check edge order, or read optional keys with `state.get("bmi")` |
+| A value you returned never appears in the final state | The key isn't declared in the state class, so LangGraph drops it | Add the key to the `TypedDict` |
+| `InvalidUpdateError: Expected dict` | The node returned a bare value such as `26.73` or a string | Return a dict: `{"bmi": 26.73}` |
+| `TypeError` doing arithmetic on an input | `TypedDict` types aren't checked at run time, so `"80"` arrived as a string | Convert inputs yourself, or use a Pydantic state, which validates |
+| `ValueError: Found edge ending at unknown node` | A typo in an edge's node name | Copy names exactly; compile catches this one for you |
+
+Two of these fail **silently**: an undeclared key is simply discarded, and a node that returns `None` (for example, one that only prints) makes no update at all. If a value is mysteriously missing, stream with `stream_mode="updates"` and look at what each node really returned.
+
+<Callout kind="tip">
+`TypedDict` annotations help your editor and your teammates, but at run time the state is a plain dict. If inputs come from users or other services, validate them at the edge of your system, or declare the state as a Pydantic `BaseModel` so bad input is rejected with a `ValidationError` before any node runs.
+</Callout>
+
+## When a graph is worth it
+
+If the BMI calculator felt like a lot of ceremony for two lines of arithmetic, that instinct is right. For a fixed, short, linear process with no branching, plain functions are simpler. A graph starts paying for itself when any of these appear:
+
+- **Many steps** whose intermediate results you want to inspect, log or show.
+- **Branching or loops**, which later lessons add with one or two lines each.
+- **Parallel steps** that should run concurrently.
+- **Persistence**: pausing for a human, resuming after a crash, or keeping conversation history, all of which LangGraph provides at the graph level.
+- **Observability**: tracing tools can show each node's input, output and timing, because the steps are explicit.
+
+Since every realistic agent hits several of these, it's worth learning the graph style on toy problems where the mechanics are the only thing to think about.
+
+## A single LLM call as a node
+
+Now bring in a model. The workflow is one node, `answer_question`, which sends a question to an LLM and stores the answer. The state is just `question` and `answer`.
+
+```python
+from typing import TypedDict
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langgraph.graph import StateGraph, START, END
+
+load_dotenv()  # puts OPENAI_API_KEY from .env into the environment
+
+model = init_chat_model("openai:gpt-4.1-mini")
+
+class QAState(TypedDict):
+    question: str
+    answer: str
+```
+
+`init_chat_model` takes a `"provider:model"` string and returns a LangChain chat model. Switching to another provider later is a one-string change (plus installing that provider's package), and your nodes don't change at all. The API key is read from the environment, never typed into the code.
+
+The node follows a pattern you'll repeat constantly: **read from state, build a prompt, call the model, write to state**.
+
+```python
+def answer_question(state: QAState) -> dict:
+    prompt = f"Answer the following question concisely:\n{state['question']}"
+    response = model.invoke(prompt)
+    return {"answer": response.content}
+```
+
+`model.invoke` returns an `AIMessage` object carrying the text plus metadata such as token usage. `.content` is just the text, which is what belongs in state.
+
+```python
+builder = StateGraph(QAState)
+builder.add_node("answer_question", answer_question)
+builder.add_edge(START, "answer_question")
+builder.add_edge("answer_question", END)
+qa_graph = builder.compile()
+
+result = qa_graph.invoke({"question": "How far is the Moon from the Earth?"})
+print(result["answer"])
+# About 384,400 km on average.
+```
+
+Yes, `model.invoke(...)` on its own would have produced the same answer in one line. The value of the graph shows up as soon as there's more than one step.
+
+## Prompt chaining
+
+Prompt chaining means **several LLM calls in sequence, each building on the last**. The task: given a topic, write a blog post. Rather than asking for the post directly, split it:
+
+1. `create_outline`: ask the model for a detailed outline of a post on the topic.
+2. `write_blog`: ask the model to write the post from the topic **and** that outline.
+
+The outline step forces a structure, and the writing step can focus on prose instead of also planning. You also get a checkpoint between the calls where you could inspect or validate the outline.
+
+The state holds the input, the intermediate result and the output:
+
+```python
+class BlogState(TypedDict):
+    topic: str
+    outline: str
+    content: str
+```
+
+Each node reads what it needs and writes one key:
+
+```python
+def create_outline(state: BlogState) -> dict:
+    prompt = (
+        f"Create a detailed outline for a blog post on: {state['topic']}.\n"
+        "Use 4 to 6 numbered sections with one-line descriptions."
+    )
+    return {"outline": model.invoke(prompt).content}
+
+
+def write_blog(state: BlogState) -> dict:
+    prompt = (
+        f"Write a detailed, engaging blog post titled '{state['topic']}'.\n"
+        f"Follow this outline exactly:\n{state['outline']}"
+    )
+    return {"content": model.invoke(prompt).content}
+```
+
+Wire them in a line and run it:
+
+```python
+builder = StateGraph(BlogState)
+builder.add_node("create_outline", create_outline)
+builder.add_node("write_blog", write_blog)
+
+builder.add_edge(START, "create_outline")
+builder.add_edge("create_outline", "write_blog")
+builder.add_edge("write_blog", END)
+
+blog_graph = builder.compile()
+final_state = blog_graph.invoke({"topic": "How AI is changing monsoon forecasting"})
+
+print(final_state["outline"])
+print(final_state["content"])
+```
+
+This run makes two model calls, so it takes noticeably longer than the Q&A graph.
+
+### Why state beats a plain chain here
+
+Look at what `final_state` contains: the **topic**, the **outline** and the **content**. If you built the same thing as a simple LangChain pipeline (prompt, model, parser, piped into the next prompt), the final output would be only the blog text; the outline would have been consumed in the middle and lost unless you added plumbing to keep it.
+
+With LangGraph, every intermediate result lives in the state from the moment it's written until the run ends. Any later node can read it, and you can inspect all of it afterwards. That's a small convenience in a two-step chain and a huge one in a twenty-step agent where you need to know why step fourteen went wrong.
+
+### Designing a good chain
+
+A few habits make prompt chains noticeably better:
+
+- **Give each call one job.** "Outline" and "write" are separate skills; so are "extract facts" and "write persuasively". If a prompt contains the word "and" twice, it's probably two nodes.
+- **Pass forward only what the next step needs.** `write_blog` gets the topic and the outline, not every intermediate draft. Smaller prompts are cheaper, faster and less distracting for the model.
+- **Make intermediate output easy to consume.** Asking for "numbered sections with one-line descriptions" gives the writer node a predictable structure to follow.
+- **Leave room for a check.** Because the outline sits in state between the two calls, you can later add a node that rejects a weak outline (too few sections, off-topic) before paying for the long writing call. Turning that check into a decision is the subject of the conditional-workflows lesson.
+
+The cost model is simple: each node is one model call, so a chain of three costs roughly three calls and takes roughly the sum of their latencies. That's the price of quality and control; when steps don't depend on each other, the next lesson shows how to run them at the same time instead.
+
+<Callout kind="remember">
+The LLM-node recipe: **read state, build the prompt, call the model, return only the keys you changed**. Every model-backed node in this course follows it.
+</Callout>
+
+## Try it yourself
+
+Extend the blog chain with a third node, `evaluate_blog`, that rates the post against its outline:
+
+1. Add a `score: int` key to `BlogState`.
+2. Write `evaluate_blog`: prompt the model with the outline and the content, asking it to rate how well the post follows the outline from 1 to 10 and reply with **only the number**. Convert the reply with `int(...)` and return `{"score": ...}`.
+3. Re-wire the edges: `write_blog` → `evaluate_blog` → `END`.
+
+You'll notice step 2 is fragile: sometimes the model replies "8/10" or "Eight", and `int()` crashes. The next lesson fixes that properly with **structured output**, which makes the model return data in a schema you define.
+
+## Cheat sheet
+
+- A sequential workflow is a straight line of nodes from `START` to `END`.
+- Install `langgraph`, `langchain`, a provider package such as `langchain-openai`, and `python-dotenv`; keep keys in `.env`.
+- Five moves: **state** (`TypedDict`), **builder** (`StateGraph(State)`), **nodes**, **edges**, **compile then invoke**.
+- A node takes the state and **returns a dict of only the keys it changed**.
+- `START` marks the entry, `END` the exit; compile fails without an edge from `START`.
+- Node name and function name can differ; `add_node(fn)` uses the function's name; `add_sequence([...])` wires a straight line.
+- `invoke(initial_state)` returns the **final state**; inputs can be partial.
+- `stream(..., stream_mode="updates")` shows each node's update; `"values"` shows full state after each step.
+- `graph.get_graph().draw_mermaid_png()` draws the graph in a notebook; `draw_mermaid()` gives text anywhere.
+- `init_chat_model("openai:gpt-4.1-mini")` gives a provider-agnostic model; use `.content` for the text.
+- Prompt chaining keeps **every intermediate result in state**, unlike a plain chain.

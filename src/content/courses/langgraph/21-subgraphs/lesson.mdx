@@ -1,0 +1,227 @@
+import { LgSubgraphStateLab } from "@/components/widgets/LgSubgraphStateLab";
+
+## What a subgraph is
+
+Every graph so far has been flat: nodes that each do one task (call a model, query a vector store, run a tool) joined by edges. A **subgraph** is what you get when one of those nodes is itself a whole graph.
+
+> A subgraph is a graph that is embedded in, and executed as a node of, another graph.
+
+From the outer graph's point of view, the subgraph is just one step: state goes in, updates come out. Inside, it has its own nodes, edges, loops and possibly its own state. The outer graph is called the **parent**.
+
+## Why subgraphs matter
+
+Your first LLM app was probably one call: question in, answer out. Real systems grow. Add tools, retrieval, conditional routing, retries, memory, human approval, evaluation and guardrails, and a single graph turns into a tangle of dozens of nodes all reading and writing one big state.
+
+Consider a "software developer" agent that mirrors a real team:
+
+- a **planning** step that breaks a feature into tasks (the team lead)
+- **backend** and **frontend** coding steps
+- a **testing** step
+- a **code review** step
+- a **deploy and monitor** step (DevOps)
+
+Each of those is complex on its own, with its own tools, retry logic, memory and maybe its own human approval. As one flat graph it would be unmanageable. Split it so that **each role is its own subgraph**, and the parent graph becomes a short, readable pipeline: plan, code, test, review, deploy. This is exactly how **multi-agent systems** are built in LangGraph: each agent is a subgraph, and a parent graph coordinates them.
+
+### General software benefits
+
+- **Modularity.** Like breaking a long script into functions, each subgraph owns one responsibility and can be understood on its own.
+- **Reusability.** Backend and frontend coding are the same *kind* of work on different files. One compiled "coding agent" subgraph can be used for both, with different inputs.
+- **Maintainability.** When code review misbehaves, you open the review subgraph, test it in isolation, fix it, and plug it back in.
+
+### LangGraph-specific benefits
+
+- **State separation.** Each subgraph can have its **own state schema**. The coding agent's scratchpad, file lists and test logs don't need to live in the parent's state, where every other component could read or overwrite them.
+- **Observability.** In LangSmith a subgraph shows up as its own nested run, so you can see how the coding agent alone performs: its latency, its token usage, its failure rate.
+- **Contained failure handling.** A subgraph is a single step from the parent's point of view, so it's a natural boundary to catch errors at, retry, or give a different checkpointing strategy. Be precise about the default, though: an exception raised inside a subgraph **propagates to the parent** like any node's exception and stops the run unless you handle it. Isolation is something subgraphs make easy to build, not something you get for free.
+
+## Two ways to connect a subgraph
+
+When adding a subgraph you decide how parent and child exchange data. LangGraph offers two mechanisms:
+
+| | Invoke from inside a node | Add the subgraph as a node |
+|---|---|---|
+| How | A normal node function calls `subgraph.invoke(...)` | `builder.add_node("name", compiled_subgraph)` |
+| State | Parent and subgraph can have **completely different** schemas | Subgraph reads and writes the parent's keys that it **shares by name** |
+| Data mapping | You write it: parent state to subgraph input, subgraph output to parent update | Automatic, by matching key names |
+| Best for | Reusable agents with their own vocabulary; private internal state | Subgraphs designed to work on the parent's state, e.g. shared `messages` |
+
+Both run the same compiled subgraph; the difference is only in the wiring. A small use case shows each.
+
+## The example
+
+A user asks a question. One model answers in English. A second model translates the answer into Hindi, and the user sees both. Translation is a self-contained job that other apps could reuse, so it becomes a subgraph:
+
+- **Subgraph**: `START → translate → END`. Input: English text. Output: Hindi text.
+- **Parent graph**: `START → generate → translate → END`, where the `translate` step is the subgraph.
+
+<LgSubgraphStateLab />
+
+## Invoking a subgraph from a node
+
+In this version the two graphs are built independently, with **separate states**, and the parent calls the subgraph from inside an ordinary node.
+
+First the subgraph. Its state is about translation only:
+
+```python
+from typing import TypedDict
+from dotenv import load_dotenv
+from langchain.chat_models import init_chat_model
+from langgraph.graph import StateGraph, START, END
+
+load_dotenv()
+
+class SubState(TypedDict):
+    input_text: str
+    translated_text: str
+
+subgraph_llm = init_chat_model("openai:gpt-4.1-nano")
+
+def translate_text(state: SubState):
+    prompt = (
+        "Translate the following text into Hindi. Keep it natural and clear, "
+        "and do not add any extra content.\n\n" + state["input_text"]
+    )
+    return {"translated_text": subgraph_llm.invoke(prompt).content}
+
+sub_builder = StateGraph(SubState)
+sub_builder.add_node("translate_text", translate_text)
+sub_builder.add_edge(START, "translate_text")
+sub_builder.add_edge("translate_text", END)
+translator = sub_builder.compile()
+```
+
+Then the parent. Its state knows nothing about `input_text` or `translated_text`:
+
+```python
+class ParentState(TypedDict):
+    question: str
+    answer_eng: str
+    answer_hin: str
+
+parent_llm = init_chat_model("openai:gpt-4.1-mini")
+
+def generate_answer(state: ParentState):
+    answer = parent_llm.invoke(f"You are a helpful assistant. Answer clearly.\n\n{state['question']}")
+    return {"answer_eng": answer.content}
+
+def translate_answer(state: ParentState):
+    result = translator.invoke({"input_text": state["answer_eng"]})   # map parent -> subgraph
+    return {"answer_hin": result["translated_text"]}                  # map subgraph -> parent
+
+builder = StateGraph(ParentState)
+builder.add_node("generate_answer", generate_answer)
+builder.add_node("translate_answer", translate_answer)
+builder.add_edge(START, "generate_answer")
+builder.add_edge("generate_answer", "translate_answer")
+builder.add_edge("translate_answer", END)
+graph = builder.compile()
+
+graph.invoke({"question": "What is quantum physics?"})
+# {'question': 'What is quantum physics?', 'answer_eng': 'Quantum physics is ...', 'answer_hin': 'क्वांटम भौतिकी ...'}
+```
+
+The wrapper node `translate_answer` is an adapter. The subgraph returns its full final state (`input_text` and `translated_text`), and the wrapper picks out only what the parent needs. Neither graph depends on the other's key names, so the translator could be dropped into a different parent with a different schema, unchanged.
+
+## Adding a subgraph as a node
+
+In the second version there's no wrapper. The compiled subgraph **is** the node, and data flows through state keys that both graphs share by name. Design the subgraph's state to use the parent's key names for its inputs and outputs:
+
+```python
+class ParentState(TypedDict):
+    question: str
+    answer_eng: str
+    answer_hin: str
+
+class TranslateState(TypedDict):
+    answer_eng: str   # shared with the parent: read as input
+    answer_hin: str   # shared with the parent: written as output
+
+def translate_text(state: TranslateState):
+    prompt = (
+        "Translate the following text into Hindi. Keep it natural and clear, "
+        "and do not add any extra content.\n\n" + state["answer_eng"]
+    )
+    return {"answer_hin": subgraph_llm.invoke(prompt).content}
+
+sub_builder = StateGraph(TranslateState)
+sub_builder.add_node("translate_text", translate_text)
+sub_builder.add_edge(START, "translate_text")
+sub_builder.add_edge("translate_text", END)
+translator = sub_builder.compile()
+
+builder = StateGraph(ParentState)
+builder.add_node("generate_answer", generate_answer)
+builder.add_node("translate", translator)          # the compiled subgraph is the node
+builder.add_edge(START, "generate_answer")
+builder.add_edge("generate_answer", "translate")
+builder.add_edge("translate", END)
+graph = builder.compile()
+```
+
+The result is identical. When the parent reaches `translate`, LangGraph passes the subgraph the parent's values for the keys they share (`answer_eng`, `answer_hin`). When the subgraph finishes, its values for shared keys flow back as updates to the parent. A subgraph can also have **private keys** that the parent never sees, which is handy for scratch work, as long as its inputs and outputs use shared names.
+
+Shared keys follow the parent's **reducers**. If both use `messages: Annotated[list, add_messages]`, the subgraph's new messages are appended to the parent's conversation, which is why "add as node" is the natural choice for agents that all work on one shared chat history.
+
+<Callout kind="warn">
+With "add as node", key names **are** the interface. If the subgraph writes its result to `hindi_text` but the parent only has `answer_hin`, the value is silently dropped: the parent's `answer_hin` stays empty and nothing raises. When the schemas don't line up, use the wrapper-node approach and map keys explicitly.
+</Callout>
+
+## Choosing between them
+
+- The subgraph has its **own vocabulary** or is reused across parents with different schemas: **invoke from a node** and map explicitly.
+- The subgraph should keep **private state** that must never leak into the parent: **invoke from a node** (or keep those keys private).
+- The subgraph is **built for this parent** and works on the same keys, especially a shared `messages` list: **add it as a node**. Less code, and the shared reducer just works.
+- You need to transform data on the way in or out (summarise before passing, rename, filter): **invoke from a node**.
+
+## Persistence, inspection and streaming
+
+Subgraphs plug into the features from earlier lessons with little extra work.
+
+**Persistence.** Give the **parent** a checkpointer; you don't pass one to the subgraph. LangGraph propagates it, so a subgraph can still use interrupts, and a parent's thread captures the whole run:
+
+```python
+from langgraph.checkpoint.memory import InMemorySaver
+
+graph = builder.compile(checkpointer=InMemorySaver())
+```
+
+By default each subgraph call starts fresh (per-invocation state). If a subgraph agent should **remember its own state across calls on the same thread** (say, a research agent that keeps its notes between turns), compile it with `checkpointer=True`. Use `checkpointer=False` to opt a subgraph out of checkpointing entirely.
+
+**Inspecting subgraph state.** While a run is paused inside a subgraph, for example at an interrupt, ask for nested state:
+
+```python
+snapshot = graph.get_state(config, subgraphs=True)
+snapshot.tasks[0].state     # the subgraph's own state at the pause
+```
+
+**Streaming.** Pass `subgraphs=True` to include updates from inside subgraphs. Each item then comes with a **namespace** telling you where it came from:
+
+```python
+for namespace, update in graph.stream(
+    {"question": "What is quantum physics?"},
+    stream_mode="updates",
+    subgraphs=True,
+):
+    print(namespace, update)
+# ()                               {'generate_answer': {'answer_eng': '...'}}
+# ('translate:4f1c...',)           {'translate_text': {'answer_hin': '...'}}
+# ()                               {'translate': {'answer_hin': '...'}}
+```
+
+An empty namespace is the parent; `('translate:<id>',)` is inside the subgraph node. In a UI, that's how you show "translator agent is working..." while the parent waits. (Newer LangGraph versions also offer an event-streaming API, `stream_events(..., version="v3")`, that exposes subgraphs as their own streams.)
+
+<Callout kind="tip">
+Build and test each subgraph alone first: `translator.invoke({"answer_eng": "Hello"})` should work before it's ever plugged into a parent. That's the maintainability benefit in practice.
+</Callout>
+
+## Cheat sheet
+
+- A subgraph is a compiled graph used as a node inside a parent graph.
+- Subgraphs bring modularity, reuse and maintainability, plus per-subgraph state, nested traces and a natural boundary for error handling.
+- Multi-agent systems are built as subgraphs (one per agent) coordinated by a parent graph.
+- Option 1: call `subgraph.invoke(...)` inside a node; schemas can differ; you map keys in and out.
+- Option 2: `builder.add_node("name", compiled_subgraph)`; data flows through keys shared by name; private keys are allowed.
+- With option 2, shared keys use the parent's reducers, and mismatched key names silently drop data.
+- Exceptions inside a subgraph propagate to the parent unless you catch them.
+- Compile only the parent with a checkpointer; use `checkpointer=True` on a subgraph for per-thread subgraph memory.
+- `graph.get_state(config, subgraphs=True)` shows nested state; `graph.stream(..., subgraphs=True)` yields `(namespace, chunk)` pairs.
