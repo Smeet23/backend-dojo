@@ -3,7 +3,7 @@ import type { ReactNode } from "react";
 /** Shared frame for interactive widgets embedded in lessons. */
 export function Widget({ title, hint, children }: { title: string; hint?: string; children: ReactNode }) {
   return (
-    <section className="not-prose my-8 overflow-hidden rounded-xl border border-border bg-surface shadow-sm">
+    <section data-read-skip className="not-prose my-8 overflow-hidden rounded-xl border border-border bg-surface shadow-sm">
       <header className="border-b border-border bg-surface-2 px-4 py-2.5">
         <p className="text-xs font-semibold uppercase tracking-wide text-accent">Try it · {title}</p>
         {hint && <p className="mt-0.5 text-sm text-muted">{hint}</p>}

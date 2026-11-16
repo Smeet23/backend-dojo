@@ -8,6 +8,7 @@ import { VisitTracker } from "./VisitTracker";
 import { LessonTutor } from "@/components/ai/LessonTutor";
 import { ExplainIt } from "@/components/ai/ExplainIt";
 import { PrivateCourseGate } from "@/components/PrivateCourseGate";
+import { ReadAloud } from "@/components/lesson/ReadAloud";
 
 export function generateStaticParams() {
   return courses.flatMap((c) => c.lectures.filter((l) => l.available).map((l) => ({ course: c.course.id, slug: l.slug })));
@@ -52,7 +53,7 @@ async function LectureBody({ courseId, slug }: { courseId: string; slug: string 
   const lectureSlugs = Object.fromEntries(lectures.map((l) => [String(l.id), l.slug]));
 
   return (
-    <article>
+    <article data-read-root>
       <VisitTracker lectureKey={`${courseId}:${lecture.id}`} />
       <Link href={`/courses/${courseId}`} className="text-sm text-muted hover:text-text">← {course.title}</Link>
       <p className="mt-4 text-sm font-medium text-accent">Lecture {lecture.id}</p>
@@ -78,6 +79,7 @@ async function LectureBody({ courseId, slug }: { courseId: string; slug: string 
           <>Written from the topic for this course (the source video isn&apos;t publicly available)</>
         )}
       </p>
+      <ReadAloud />
 
       <div className="lesson prose prose-neutral mt-8 max-w-none prose-headings:tracking-tight prose-h2:mt-12 prose-pre:overflow-x-auto">
         <Lesson />

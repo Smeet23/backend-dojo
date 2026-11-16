@@ -107,6 +107,22 @@ h3[id] {
   overflow-wrap: anywhere;
 }
 
+/* Read aloud: the block being spoken, and room for the player bar. */
+[data-read-root] [data-reading] {
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 0.4rem var(--accent-soft);
+  border-radius: 0.25rem;
+  transition: background-color 0.2s, box-shadow 0.2s;
+}
+
+[data-read-active] {
+  padding-bottom: 7rem;
+}
+
+[data-read-active] .lesson :is(p, h2, h3, h4, li, blockquote) {
+  cursor: pointer;
+}
+
 .lesson pre {
   border: 1px solid var(--border);
   font-size: 0.8125rem;
