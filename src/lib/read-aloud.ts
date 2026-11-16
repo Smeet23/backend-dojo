@@ -1,6 +1,6 @@
 /** Pure helpers for the lesson read-aloud player (see docs/plans/2026-11-16-read-aloud-design.md). */
 
-/** Chrome stops speaking long utterances after ~15 s, so text is spoken in pieces this size. */
+/** Text is voiced in pieces this size, so playback can start after the first piece is ready. */
 export const MAX_CHUNK = 220;
 
 /** Normalises an element's text for speech. */
@@ -42,26 +42,18 @@ export function splitIntoChunks(text: string, max = MAX_CHUNK): string[] {
   return clean ? split(clean, max, 0) : [];
 }
 
-export function englishVoices(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice[] {
-  return voices.filter((v) => /^en([-_]|$)/i.test(v.lang));
-}
+/** Kokoro voices worth offering (graded B- or better on the model card). The first is the default. */
+export const VOICES = [
+  { id: "af_heart", label: "Heart (US, female)" },
+  { id: "af_bella", label: "Bella (US, female)" },
+  { id: "af_nicole", label: "Nicole (US, female, soft)" },
+  { id: "am_michael", label: "Michael (US, male)" },
+  { id: "am_fenrir", label: "Fenrir (US, male)" },
+  { id: "bf_emma", label: "Emma (UK, female)" },
+] as const;
 
-// macOS sound-effect voices: fun, but not for a lesson.
-const NOVELTY =
-  /^(Albert|Bad News|Bahh|Bells|Boing|Bubbles|Cellos|Deranged|Good News|Hysterical|Jester|Organ|Pipe Organ|Superstar|Trinoids|Whisper|Wobble|Zarvox)\b/i;
+export type VoiceId = (typeof VOICES)[number]["id"];
 
-function score(v: SpeechSynthesisVoice): number {
-  if (/natural|neural/i.test(v.name)) return 4;
-  if (/premium|enhanced/i.test(v.name)) return 3;
-  if (/google/i.test(v.name)) return 2;
-  return 0;
-}
-
-/** English voices with the most natural-sounding first (stable within a score). */
-export function rankVoices(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice[] {
-  return englishVoices(voices)
-    .filter((v) => !NOVELTY.test(v.name))
-    .map((v, i) => ({ v, i, s: score(v) }))
-    .sort((a, b) => b.s - a.s || a.i - b.i)
-    .map((x) => x.v);
+export function isVoiceId(id: unknown): id is VoiceId {
+  return VOICES.some((v) => v.id === id);
 }

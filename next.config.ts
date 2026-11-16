@@ -17,6 +17,21 @@ const nextConfig: NextConfig = {
       { source: "/practice", destination: "/courses/backend/practice", permanent: true },
     ];
   },
+  // Cross-origin isolation lets the read-aloud voice model run on several CPU threads
+  // (SharedArrayBuffer); single-threaded it's slower than real time. It's site-wide because
+  // in-app navigation keeps the first page's headers. Anything loaded from another origin
+  // must now allow it (CORS or Cross-Origin-Resource-Policy).
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          { key: "Cross-Origin-Opener-Policy", value: "same-origin" },
+          { key: "Cross-Origin-Embedder-Policy", value: "require-corp" },
+        ],
+      },
+    ];
+  },
   // Lets a phone on the same Wi-Fi open the dev server.
   allowedDevOrigins: ["192.168.*.*"],
   // AI routes read the generated lesson text at runtime to ground their answers.

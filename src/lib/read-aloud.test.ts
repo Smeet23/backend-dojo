@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cleanText, splitIntoChunks, rankVoices, englishVoices } from "./read-aloud";
+import { cleanText, splitIntoChunks, VOICES, isVoiceId } from "./read-aloud";
 
 describe("cleanText", () => {
   it("collapses whitespace and trims", () => {
@@ -44,28 +44,11 @@ describe("splitIntoChunks", () => {
   });
 });
 
-const v = (name: string, lang = "en-US", localService = true) =>
-  ({ name, lang, localService, voiceURI: name, default: false }) as SpeechSynthesisVoice;
-
-describe("englishVoices / rankVoices", () => {
-  it("keeps only English voices", () => {
-    const list = englishVoices([v("Amelie", "fr-FR"), v("Samantha"), v("Daniel", "en_GB")]);
-    expect(list.map((x) => x.name)).toEqual(["Samantha", "Daniel"]);
-  });
-
-  it("puts natural-sounding voices first", () => {
-    const ranked = rankVoices([
-      v("Fred"),
-      v("Microsoft Aria Online (Natural) - English (United States)", "en-US", false),
-      v("Samantha (Enhanced)"),
-      v("Google UK English Female", "en-GB", false),
-    ]);
-    expect(ranked[0].name).toContain("Natural");
-    expect(ranked.at(-1)!.name).toBe("Fred");
-  });
-
-  it("drops novelty voices", () => {
-    const ranked = rankVoices([v("Bubbles"), v("Zarvox"), v("Samantha")]);
-    expect(ranked.map((x) => x.name)).toEqual(["Samantha"]);
+describe("voices", () => {
+  it("defaults to a known voice and validates ids", () => {
+    expect(VOICES[0].id).toBe("af_heart");
+    expect(isVoiceId("bf_emma")).toBe(true);
+    expect(isVoiceId("nope")).toBe(false);
+    expect(isVoiceId(undefined)).toBe(false);
   });
 });
