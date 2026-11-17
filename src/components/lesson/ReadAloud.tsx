@@ -1,26 +1,27 @@
 "use client";
 
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
-import { isVoiceId, splitIntoChunks, VOICES, type VoiceId } from "@/lib/read-aloud";
+import { audioKey, collectBlocks, isVoiceId, VOICES, type LessonAudio, type VoiceId } from "@/lib/read-aloud";
 import { VoiceEngine } from "./voice-engine";
 
 /**
- * "Listen": reads the lesson aloud with Kokoro, a free open-source voice model that runs in
- * the learner's browser, and highlights each block as it's read.
- * Design: docs/plans/2026-11-16-read-aloud-design.md.
+ * "Listen": reads the lesson aloud and highlights each block as it's read.
+ *
+ * Pieces come from the lesson's pre-made MP3 when it has them (instant, any device), otherwise
+ * from Kokoro, a free open-source voice model running in the learner's browser (other voices,
+ * or paragraphs edited since the audio was made). Design: docs/plans/2026-11-16-read-aloud-design.md.
  */
 
 type Item = { block: number; text: string };
+type Range = { start: number; end: number };
 type Prefs = { rate: number; voice: VoiceId };
-type Status = "idle" | "loading" | "buffering" | "playing" | "paused" | "error";
+type Status = "idle" | "buffering" | "playing" | "paused" | "error";
 
 const RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
-/** How many pieces ahead to prepare while the current one plays. */
-const LOOKAHEAD = 3;
+/** How many pieces ahead the in-browser voice prepares while one plays. */
+const LOOKAHEAD = 4;
 const PREFS_KEY = "grokstack:read-aloud";
 const READ_ROOT = "[data-read-root]";
-const BLOCKS = "h1, .lesson :is(p, h2, h3, h4, li, blockquote)";
-const SKIP = "pre, table, [data-read-skip]";
 const INTERACTIVE = "a, button, input, select, textarea, label, summary, [data-read-skip]";
 /** Room taken by the sticky header (top) and the player bar (bottom). */
 const TOP_OFFSET = 72;
@@ -48,31 +49,19 @@ function savePrefs(prefs: Prefs) {
   }
 }
 
-/** Readable blocks in page order. When blocks nest (a list item's paragraph), the outermost wins. */
-function collectBlocks(root: HTMLElement): { el: HTMLElement; chunks: string[] }[] {
-  const kept = new Set<Element>();
-  const blocks: { el: HTMLElement; chunks: string[] }[] = [];
-  for (const el of root.querySelectorAll<HTMLElement>(BLOCKS)) {
-    if (el.closest(SKIP)) continue;
-    let parent = el.parentElement;
-    while (parent && parent !== root && !kept.has(parent)) parent = parent.parentElement;
-    if (parent && parent !== root) continue;
-    const chunks = splitIntoChunks(el.textContent ?? "");
-    if (chunks.length === 0) continue;
-    kept.add(el);
-    blocks.push({ el, chunks });
-  }
-  return blocks;
+function once(target: EventTarget, event: string) {
+  return new Promise<void>((resolve) => target.addEventListener(event, () => resolve(), { once: true }));
 }
 
 const noop = () => () => {};
-const canRun = () => typeof Worker !== "undefined" && typeof WebAssembly !== "undefined";
+const canRun = () => typeof Audio !== "undefined";
 
-export function ReadAloud() {
+export function ReadAloud({ audio: lessonAudio }: { audio?: LessonAudio }) {
   const supported = useSyncExternalStore(noop, canRun, () => false);
   const [open, setOpen] = useState(false);
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
+  const [engineReady, setEngineReady] = useState(false);
   const [error, setError] = useState("");
   const [current, setCurrent] = useState(0);
   const [total, setTotal] = useState(0);
@@ -84,11 +73,14 @@ export function ReadAloud() {
   const urlRef = useRef("");
   const elementsRef = useRef<HTMLElement[]>([]);
   const itemsRef = useRef<Item[]>([]);
+  /** Each item's place in the pre-made MP3 for the current voice, or null to generate it. */
+  const premadeRef = useRef<(Range | null)[]>([]);
   /** Index of each block's first item. */
   const blockStartRef = useRef<number[]>([]);
   const posRef = useRef(0);
-  /** Which item the audio element currently holds (-1: none). */
+  /** Which item the audio element is positioned on (-1: none). */
   const loadedRef = useRef(-1);
+  const modeRef = useRef<"premade" | "generated">("generated");
   const cacheRef = useRef(new Map<number, Promise<Blob | null>>());
   /** Bumped on every play/pause/jump so an outdated await can't start audio. */
   const tokenRef = useRef(0);
@@ -116,53 +108,101 @@ export function ReadAloud() {
     }
   }
 
-  function ensure(i: number) {
-    const engine = engineRef.current;
-    const item = itemsRef.current[i];
-    if (!engine || !item || cacheRef.current.has(i)) return;
-    const job = engine.generate(item.text, prefsRef.current.voice);
-    cacheRef.current.set(i, job);
-    job.then(
-      (wav) => {
-        if (!wav && cacheRef.current.get(i) === job) cacheRef.current.delete(i);
-      },
-      () => {
-        if (cacheRef.current.get(i) === job) cacheRef.current.delete(i);
-      },
-    );
+  /** The in-browser voice, started on first need (and kept for the page's lifetime). */
+  function engine(): VoiceEngine {
+    if (!engineRef.current) {
+      const e = new VoiceEngine(setProgress);
+      engineRef.current = e;
+      e.ready.then(
+        () => setEngineReady(true),
+        (err: unknown) => {
+          if (engineRef.current !== e) return;
+          e.dispose();
+          engineRef.current = null;
+          setError(err instanceof Error ? err.message : "Couldn't load the voice.");
+          setStatusBoth("error");
+        },
+      );
+    }
+    return engineRef.current;
   }
 
+  /** Which items the lesson's MP3 covers for the current voice. */
+  async function mapPremade(voice: VoiceId) {
+    const items = itemsRef.current;
+    if (!lessonAudio || lessonAudio.voice !== voice) {
+      premadeRef.current = items.map(() => null);
+      return;
+    }
+    const byKey = new Map(lessonAudio.items.map(([key, start, end]) => [key, { start, end }]));
+    premadeRef.current = await Promise.all(items.map(async (it) => byKey.get(await audioKey(voice, it.text)) ?? null));
+  }
+
+  function ensure(i: number) {
+    const item = itemsRef.current[i];
+    if (!item || premadeRef.current[i] || cacheRef.current.has(i)) return;
+    const job = engine().generate(item.text, prefsRef.current.voice);
+    cacheRef.current.set(i, job);
+    const forget = () => {
+      if (cacheRef.current.get(i) === job) cacheRef.current.delete(i);
+    };
+    job.then((wav) => !wav && forget(), forget);
+  }
+
+  /** Prepares upcoming pieces the MP3 doesn't cover, and drops ones far behind. */
   function prefetch(from: number) {
     for (let i = from; i <= from + LOOKAHEAD; i++) ensure(i);
-    // Keep only audio near the current position; WAV pieces are a few hundred KB each.
     for (const i of cacheRef.current.keys()) if (i < from - 1 || i > from + LOOKAHEAD) cacheRef.current.delete(i);
   }
 
-  /** Throws away queued audio (after a jump or a voice change). */
+  /** Throws away queued in-browser audio (after a jump or a voice change). */
   function discardQueued() {
     engineRef.current?.reset();
     cacheRef.current.clear();
   }
 
+  function finish() {
+    audioRef.current?.pause();
+    posRef.current = 0;
+    loadedRef.current = -1;
+    highlight(null);
+    setCurrent(0);
+    setStatusBoth("paused");
+  }
+
   async function playFrom(i: number) {
     const token = ++tokenRef.current;
-    const items = itemsRef.current;
     const audio = audioRef.current;
     if (!audio) return;
-    if (i >= items.length) {
-      // Finished: the next play starts from the top.
-      audio.pause();
-      posRef.current = 0;
-      loadedRef.current = -1;
-      highlight(null);
-      setCurrent(0);
-      setStatusBoth("paused");
-      return;
-    }
+    if (i >= itemsRef.current.length) return finish();
     posRef.current = i;
-    highlight(items[i].block);
+    highlight(itemsRef.current[i].block);
     prefetch(i);
     setStatusBoth("buffering");
+
+    const range = premadeRef.current[i];
+    if (range && lessonAudio) {
+      try {
+        if (audio.src !== lessonAudio.url) {
+          audio.src = lessonAudio.url;
+          if (audio.readyState < HTMLMediaElement.HAVE_METADATA) await once(audio, "loadedmetadata");
+          if (token !== tokenRef.current) return;
+        }
+        audio.currentTime = range.start;
+        audio.playbackRate = audio.defaultPlaybackRate = prefsRef.current.rate;
+        modeRef.current = "premade";
+        loadedRef.current = i;
+        await audio.play();
+        if (token === tokenRef.current) setStatusBoth("playing");
+      } catch (err) {
+        if (token !== tokenRef.current) return;
+        if (err instanceof DOMException && err.name === "NotAllowedError") return setStatusBoth("paused");
+        // The MP3 couldn't load: voice everything in the browser instead.
+        premadeRef.current = premadeRef.current.map(() => null);
+        void playFrom(i);
+      }
+      return;
+    }
 
     let wav: Blob | null;
     try {
@@ -170,8 +210,7 @@ export function ReadAloud() {
     } catch (err) {
       if (token !== tokenRef.current) return;
       setError(err instanceof Error ? err.message : "Couldn't generate the audio.");
-      setStatusBoth("error");
-      return;
+      return setStatusBoth("error");
     }
     if (token !== tokenRef.current) return;
     if (!wav) return void playFrom(i); // Dropped by a reset; ask again.
@@ -179,7 +218,8 @@ export function ReadAloud() {
     if (urlRef.current) URL.revokeObjectURL(urlRef.current);
     urlRef.current = URL.createObjectURL(wav);
     audio.src = urlRef.current;
-    audio.playbackRate = prefsRef.current.rate;
+    audio.playbackRate = audio.defaultPlaybackRate = prefsRef.current.rate;
+    modeRef.current = "generated";
     loadedRef.current = i;
     try {
       await audio.play();
@@ -189,11 +229,35 @@ export function ReadAloud() {
     }
   }
 
+  /**
+   * While the MP3 plays: move the highlight as pieces go by, and leave the MP3 when the next
+   * piece isn't in it (so it's voiced in the browser instead).
+   */
+  function trackPremade() {
+    const audio = audioRef.current;
+    if (!audio || modeRef.current !== "premade" || statusRef.current !== "playing") return;
+    const premade = premadeRef.current;
+    let i = posRef.current;
+    while (premade[i] && audio.currentTime >= premade[i]!.end - 0.02) {
+      const next = premade[i + 1];
+      if (next && Math.abs(next.start - premade[i]!.end) < 0.01) {
+        i++;
+        posRef.current = loadedRef.current = i;
+        highlight(itemsRef.current[i].block);
+        prefetch(i);
+      } else {
+        audio.pause();
+        void playFrom(i + 1);
+        return;
+      }
+    }
+  }
+
   function play() {
     const audio = audioRef.current;
     if (!audio) return;
     if (loadedRef.current === posRef.current && audio.src && !audio.ended) {
-      // Resume mid-sentence.
+      // Resume where it paused.
       tokenRef.current++;
       audio.playbackRate = prefsRef.current.rate;
       audio.play().then(
@@ -211,15 +275,21 @@ export function ReadAloud() {
     setStatusBoth("paused");
   }
 
-  function jumpToBlock(block: number) {
-    const starts = blockStartRef.current;
-    const b = Math.max(0, Math.min(starts.length - 1, block));
-    const wasActive = statusRef.current === "playing" || statusRef.current === "buffering";
+  /** Stops what's playing and forgets queued audio, before playing from somewhere else. */
+  function interrupt() {
     tokenRef.current++;
     audioRef.current?.pause();
     discardQueued();
-    posRef.current = starts[b];
     loadedRef.current = -1;
+  }
+
+  function jumpToBlock(block: number) {
+    const starts = blockStartRef.current;
+    if (!Number.isFinite(block) || starts.length === 0) return;
+    const b = Math.max(0, Math.min(starts.length - 1, block));
+    const wasActive = statusRef.current === "playing" || statusRef.current === "buffering";
+    interrupt();
+    posRef.current = starts[b];
     if (wasActive) void playFrom(posRef.current);
     else highlight(b);
   }
@@ -247,9 +317,13 @@ export function ReadAloud() {
     // Created and played inside the click so browsers allow it to play later.
     if (!audioRef.current) {
       const audio = new Audio();
+      // The MP3 lives on another origin; this site is cross-origin isolated, so it must load via CORS.
+      audio.crossOrigin = "anonymous";
+      audio.preload = "auto";
       audio.onended = () => {
         if (statusRef.current === "playing") void playFrom(posRef.current + 1);
       };
+      audio.ontimeupdate = trackPremade;
       audioRef.current = audio;
     }
     audioRef.current.src = SILENT_WAV;
@@ -263,20 +337,14 @@ export function ReadAloud() {
     setOpen(true);
     setError("");
     highlight(startBlock);
+    setStatusBoth("buffering");
 
-    engineRef.current ??= new VoiceEngine(setProgress);
-    setStatusBoth("loading");
     const token = ++tokenRef.current;
-    try {
-      await engineRef.current.ready;
-    } catch (err) {
-      engineRef.current?.dispose();
-      engineRef.current = null;
-      setError(err instanceof Error ? err.message : "Couldn't load the voice.");
-      setStatusBoth("error");
-      return;
-    }
-    if (token === tokenRef.current) void playFrom(posRef.current);
+    await mapPremade(prefs.voice);
+    if (token !== tokenRef.current) return;
+    // Warm up the in-browser voice now if any piece will need it.
+    if (premadeRef.current.some((r) => !r)) engine();
+    void playFrom(posRef.current);
   }
 
   function closePlayer() {
@@ -292,31 +360,39 @@ export function ReadAloud() {
     setRate(value);
     prefsRef.current = { ...prefsRef.current, rate: value };
     savePrefs(prefsRef.current);
-    if (audioRef.current) audioRef.current.playbackRate = value;
+    if (audioRef.current) audioRef.current.playbackRate = audioRef.current.defaultPlaybackRate = value;
   }
 
-  function changeVoice(id: VoiceId) {
+  async function changeVoice(id: VoiceId) {
     setVoice(id);
     prefsRef.current = { ...prefsRef.current, voice: id };
     savePrefs(prefsRef.current);
     const wasActive = statusRef.current === "playing" || statusRef.current === "buffering";
-    tokenRef.current++;
-    audioRef.current?.pause();
-    discardQueued();
-    loadedRef.current = -1;
+    interrupt();
+    const token = tokenRef.current;
+    await mapPremade(id);
+    if (token !== tokenRef.current) return;
+    if (premadeRef.current.some((r) => !r)) engine();
     if (wasActive) void playFrom(posRef.current);
   }
+
+  // While playing the MP3, follow along every frame (timeupdate covers background tabs).
+  useEffect(() => {
+    if (status !== "playing") return;
+    let frame = requestAnimationFrame(function tick() {
+      trackPremade();
+      frame = requestAnimationFrame(tick);
+    });
+    return () => cancelAnimationFrame(frame);
+  });
 
   // While open, clicking a paragraph reads from there.
   const clickRef = useRef<(target: HTMLElement) => void>(() => {});
   clickRef.current = (target) => {
     if (target.closest(INTERACTIVE) || window.getSelection()?.toString()) return;
     const block = elementsRef.current.findIndex((el) => el.contains(target));
-    if (block < 0 || statusRef.current === "loading" || statusRef.current === "error") return;
-    tokenRef.current++;
-    audioRef.current?.pause();
-    discardQueued();
-    loadedRef.current = -1;
+    if (block < 0 || statusRef.current === "error") return;
+    interrupt();
     void playFrom(blockStartRef.current[block]);
   };
   useEffect(() => {
@@ -345,28 +421,27 @@ export function ReadAloud() {
   if (!supported) return null;
 
   const active = status === "playing" || status === "buffering";
-  const busy = status === "loading" || status === "buffering";
+  const waitingOnEngine = status === "buffering" && modeRef.current !== "premade" && engineRef.current && !engineReady;
   const statusText =
-    status === "loading"
-      ? progress > 0 && progress < 1
-        ? `Downloading voice (first time only)… ${Math.round(progress * 100)}%`
-        : "Loading voice…"
-      : status === "buffering"
-        ? "Preparing audio…"
-        : status === "error"
-          ? `Voice unavailable: ${error}`
-          : null;
+    status === "buffering"
+      ? waitingOnEngine
+        ? progress > 0 && progress < 1
+          ? `Downloading voice (first time only)… ${Math.round(progress * 100)}%`
+          : "Loading voice…"
+        : "Preparing audio…"
+      : status === "error"
+        ? `Voice unavailable: ${error}`
+        : null;
 
   return (
     <>
       <button
         type="button"
         onClick={() => (open ? (active ? pause() : play()) : void openPlayer())}
-        disabled={status === "loading"}
-        className="mt-4 inline-flex min-h-10 items-center gap-2 rounded-lg border border-border bg-surface px-3 text-sm font-medium hover:bg-surface-2 disabled:opacity-60"
+        className="mt-4 inline-flex min-h-10 items-center gap-2 rounded-lg border border-border bg-surface px-3 text-sm font-medium hover:bg-surface-2"
       >
         <SpeakerIcon />
-        {!open ? "Listen to this lesson" : active ? "Pause" : status === "loading" ? "Loading voice…" : "Resume"}
+        {!open ? "Listen to this lesson" : active ? "Pause" : "Resume"}
       </button>
 
       {open && (
@@ -376,26 +451,26 @@ export function ReadAloud() {
           className="fixed inset-x-0 bottom-0 z-40 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]"
         >
           <div className="mx-auto max-w-2xl rounded-2xl border border-border bg-surface p-2 shadow-lg">
-            {status === "loading" && (
+            {waitingOnEngine && (
               <div className="mx-1 mb-2 h-1 overflow-hidden rounded-full bg-surface-2" aria-hidden>
                 <div className="h-full bg-accent transition-[width]" style={{ width: `${Math.round(progress * 100)}%` }} />
               </div>
             )}
             <div className="flex flex-wrap items-center gap-2">
               <div className="flex items-center gap-1">
-                <IconButton label="Previous paragraph" onClick={() => jumpToBlock(itemsRef.current[posRef.current]?.block - 1)}>
+                <IconButton label="Previous paragraph" onClick={() => jumpToBlock((itemsRef.current[posRef.current]?.block ?? 0) - 1)}>
                   <PrevIcon />
                 </IconButton>
                 <button
                   type="button"
                   onClick={active ? pause : play}
-                  disabled={status === "loading" || status === "error"}
+                  disabled={status === "error"}
                   aria-label={active ? "Pause" : "Play"}
                   className="flex size-11 items-center justify-center rounded-full bg-accent text-white disabled:opacity-50 dark:text-bg"
                 >
-                  {busy ? <Spinner /> : active ? <PauseIcon /> : <PlayIcon />}
+                  {status === "buffering" ? <Spinner /> : active ? <PauseIcon /> : <PlayIcon />}
                 </button>
-                <IconButton label="Next paragraph" onClick={() => jumpToBlock(itemsRef.current[posRef.current]?.block + 1)}>
+                <IconButton label="Next paragraph" onClick={() => jumpToBlock((itemsRef.current[posRef.current]?.block ?? -1) + 1)}>
                   <NextIcon />
                 </IconButton>
               </div>
@@ -433,12 +508,13 @@ export function ReadAloud() {
               <select
                 id="read-aloud-voice"
                 value={voice}
-                onChange={(e) => isVoiceId(e.target.value) && changeVoice(e.target.value)}
+                onChange={(e) => isVoiceId(e.target.value) && void changeVoice(e.target.value)}
                 className="min-h-10 w-32 rounded-lg border border-border bg-surface px-2 text-sm sm:w-48"
               >
                 {VOICES.map((v) => (
                   <option key={v.id} value={v.id}>
                     {v.label}
+                    {lessonAudio?.voice === v.id ? " · instant" : ""}
                   </option>
                 ))}
               </select>

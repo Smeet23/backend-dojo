@@ -1,4 +1,9 @@
-/** Pure helpers for the lesson read-aloud player (see docs/plans/2026-11-16-read-aloud-design.md). */
+/**
+ * Helpers shared by the read-aloud player and scripts/gen-lesson-audio.mjs (see
+ * docs/plans/2026-11-16-read-aloud-design.md). Both must split a lesson identically, so the
+ * pre-made audio lines up with the player's pieces. Keep this file free of path aliases:
+ * the script imports it directly with Node.
+ */
 
 /** Text is voiced in pieces this size, so playback can start after the first piece is ready. */
 export const MAX_CHUNK = 220;
@@ -57,3 +62,40 @@ export type VoiceId = (typeof VOICES)[number]["id"];
 export function isVoiceId(id: unknown): id is VoiceId {
   return VOICES.some((v) => v.id === id);
 }
+
+/** The voice used for pre-made lesson audio. */
+export const PREMADE_VOICE: VoiceId = "af_heart";
+
+// Relative to the read root ([data-read-root]).
+const BLOCKS = "h1, .lesson :is(p, h2, h3, h4, li, blockquote)";
+const SKIP = "pre, table, [data-read-skip]";
+
+export type Block<E extends Element = Element> = { el: E; chunks: string[] };
+
+/** Readable blocks in page order. When blocks nest (a list item's paragraph), the outermost wins. */
+export function collectBlocks<E extends Element>(root: E): Block<E>[] {
+  const kept = new Set<Element>();
+  const blocks: Block<E>[] = [];
+  for (const el of root.querySelectorAll(BLOCKS) as unknown as Iterable<E>) {
+    if (el.closest(SKIP)) continue;
+    const top: Element = root;
+    let parent: Element | null = el.parentElement;
+    while (parent && parent !== top && !kept.has(parent)) parent = parent.parentElement;
+    if (parent && parent !== top) continue;
+    const chunks = splitIntoChunks(el.textContent ?? "");
+    if (chunks.length === 0) continue;
+    kept.add(el);
+    blocks.push({ el, chunks });
+  }
+  return blocks;
+}
+
+/** Identifies one piece of audio: the same voice and text always give the same key. */
+export async function audioKey(voice: VoiceId, text: string): Promise<string> {
+  const bytes = new TextEncoder().encode(`${voice}\n${text}`);
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest).slice(0, 8), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Pre-made audio for one lesson: one MP3, plus where each piece starts and ends in it (seconds). */
+export type LessonAudio = { voice: VoiceId; url: string; items: [key: string, start: number, end: number][] };

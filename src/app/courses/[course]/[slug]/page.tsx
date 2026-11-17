@@ -9,6 +9,11 @@ import { LessonTutor } from "@/components/ai/LessonTutor";
 import { ExplainIt } from "@/components/ai/ExplainIt";
 import { PrivateCourseGate } from "@/components/PrivateCourseGate";
 import { ReadAloud } from "@/components/lesson/ReadAloud";
+import type { LessonAudio } from "@/lib/read-aloud";
+import readAloudAudio from "@/content/generated/read-aloud.json";
+
+/** Pre-made lesson audio, written by scripts/gen-lesson-audio.mjs. */
+const lessonAudio = readAloudAudio as unknown as Record<string, LessonAudio | undefined>;
 
 export function generateStaticParams() {
   return courses.flatMap((c) => c.lectures.filter((l) => l.available).map((l) => ({ course: c.course.id, slug: l.slug })));
@@ -79,7 +84,7 @@ async function LectureBody({ courseId, slug }: { courseId: string; slug: string 
           <>Written from the topic for this course (the source video isn&apos;t publicly available)</>
         )}
       </p>
-      <ReadAloud />
+      <ReadAloud audio={lessonAudio[`${courseId}/${slug}`]} />
 
       <div className="lesson prose prose-neutral mt-8 max-w-none prose-headings:tracking-tight prose-h2:mt-12 prose-pre:overflow-x-auto">
         <Lesson />

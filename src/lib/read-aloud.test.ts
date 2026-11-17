@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cleanText, splitIntoChunks, VOICES, isVoiceId } from "./read-aloud";
+import { audioKey, cleanText, collectBlocks, isVoiceId, splitIntoChunks, VOICES } from "./read-aloud";
 
 describe("cleanText", () => {
   it("collapses whitespace and trims", () => {
@@ -50,5 +50,47 @@ describe("voices", () => {
     expect(isVoiceId("bf_emma")).toBe(true);
     expect(isVoiceId("nope")).toBe(false);
     expect(isVoiceId(undefined)).toBe(false);
+  });
+});
+
+describe("collectBlocks", () => {
+  const html = `<article data-read-root>
+    <h1>Error analysis</h1>
+    <p class="summary">Not inside the lesson, so skipped.</p>
+    <div class="lesson">
+      <p>First paragraph.</p>
+      <ul><li><p>Item with a paragraph.</p></li><li>Plain item</li></ul>
+      <pre><code>const skipped = true;</code></pre>
+      <table><tbody><tr><td><p>In a table</p></td></tr></tbody></table>
+      <section data-read-skip><p>Inside a widget</p></section>
+      <aside><p>Tip</p><div><p>Callout body.</p></div></aside>
+      <h2>Next section</h2>
+      <p>   </p>
+    </div>
+  </article>`;
+
+  it("reads the title and lesson blocks once each, skipping code, tables and widgets", async () => {
+    const { parseHTML } = await import("linkedom");
+    const { document } = parseHTML(`<!doctype html><html><body>${html}</body></html>`);
+    const root = document.querySelector("[data-read-root]")!;
+    expect(collectBlocks(root).map((b) => b.chunks.join(" "))).toEqual([
+      "Error analysis",
+      "First paragraph.",
+      "Item with a paragraph.",
+      "Plain item",
+      "Tip",
+      "Callout body.",
+      "Next section",
+    ]);
+  });
+});
+
+describe("audioKey", () => {
+  it("is stable, short, and depends on voice and text", async () => {
+    const a = await audioKey("af_heart", "Hello.");
+    expect(a).toMatch(/^[0-9a-f]{16}$/);
+    expect(await audioKey("af_heart", "Hello.")).toBe(a);
+    expect(await audioKey("bf_emma", "Hello.")).not.toBe(a);
+    expect(await audioKey("af_heart", "Hello!")).not.toBe(a);
   });
 });
