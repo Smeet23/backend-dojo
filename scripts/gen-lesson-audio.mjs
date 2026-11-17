@@ -1,5 +1,5 @@
 // Pre-makes read-aloud audio: one MP3 per lesson in the default voice, uploaded to Vercel Blob,
-// plus src/content/generated/read-aloud.json (where each piece starts and ends in it). The player
+// plus src/content/read-aloud-audio.json (where each piece starts and ends in it). The player
 // plays these instantly and only generates audio in the browser for pieces missing here
 // (e.g. a paragraph edited since the last run). Design: docs/plans/2026-11-16-read-aloud-design.md
 //
@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 import { audioKey, PREMADE_VOICE } from "../src/lib/read-aloud.ts";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const manifestFile = path.join(root, "src", "content", "generated", "read-aloud.json");
+const manifestFile = path.join(root, "src", "content", "read-aloud-audio.json");
 const lessonTextFile = path.join(root, "src", "content", "generated", "lesson-text.json");
 
 const SAMPLE_RATE = 24000;

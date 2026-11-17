@@ -13,7 +13,7 @@ History: device voices (`speechSynthesis`) were rejected as too low quality. Pai
 
 ## Matching audio to text
 - `src/lib/read-aloud.ts` is shared by the player and the generator script. `collectBlocks` picks the title and the lesson's paragraphs, headings, list items, quotes and callouts. It skips code, tables and widgets (`[data-read-skip]`); when blocks nest, the outermost wins. `splitIntoChunks` cuts each block into ≤220-character pieces at sentence boundaries.
-- Each piece is identified by `audioKey(voice, text)`, the first 16 hex characters of a SHA-256 hash. `src/content/generated/read-aloud.json` maps each lesson to `{ voice, url, items: [key, start, end][] }`. A piece's range runs to the next piece's start, so consecutive pieces play seamlessly.
+- Each piece is identified by `audioKey(voice, text)`, the first 16 hex characters of a SHA-256 hash. `src/content/read-aloud-audio.json` maps each lesson to `{ voice, url, items: [key, start, end][] }`. A piece's range runs to the next piece's start, so consecutive pieces play seamlessly.
 - The player looks up each piece's key. A hit plays from the MP3 (seek to `start`); a miss is generated in the browser.
 
 ## Generating the audio
@@ -23,7 +23,7 @@ History: device voices (`speechSynthesis`) were rejected as too low quality. Pai
 3. Voices the rest in 3 worker processes (`onnxruntime-node`, fp32, ~7× real time in total on an M4). It inserts 0.12 s between pieces and 0.45 s between blocks, then encodes each lesson to a 40 kbps CBR mono MP3 (CBR keeps seeking exact; about 6 MB per 20 minutes).
 4. Uploads `read-aloud/<course>/<slug>-<voice>-<hash>.mp3` (content-hashed, cached for a year) and saves the manifest after each lesson.
 
-Run it with `node --env-file=.env.local scripts/gen-lesson-audio.mjs` (needs `BLOB_READ_WRITE_TOKEN` from `vercel env pull`, plus ffmpeg). Use `--only course/slug` for one lesson and `--dry-run` to see what would change. Commit the updated `read-aloud.json`. Old MP3s stay in the store until deleted.
+Run it with `node --env-file=.env.local scripts/gen-lesson-audio.mjs` (needs `BLOB_READ_WRITE_TOKEN` from `vercel env pull`, plus ffmpeg). Use `--only course/slug` for one lesson and `--dry-run` to see what would change. Commit the updated `read-aloud-audio.json`. Old MP3s stay in the store until deleted.
 
 ## Player (`src/components/lesson/ReadAloud.tsx`)
 - One `<audio>` element (`crossOrigin="anonymous"`), unlocked inside the first click for Safari. It plays the lesson MP3, or a WAV blob from the in-browser voice.

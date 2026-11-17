@@ -10,7 +10,7 @@ import { ExplainIt } from "@/components/ai/ExplainIt";
 import { PrivateCourseGate } from "@/components/PrivateCourseGate";
 import { ReadAloud } from "@/components/lesson/ReadAloud";
 import type { LessonAudio } from "@/lib/read-aloud";
-import readAloudAudio from "@/content/generated/read-aloud.json";
+import readAloudAudio from "@/content/read-aloud-audio.json";
 
 /** Pre-made lesson audio, written by scripts/gen-lesson-audio.mjs. */
 const lessonAudio = readAloudAudio as unknown as Record<string, LessonAudio | undefined>;
