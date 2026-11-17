@@ -6,9 +6,12 @@
 // Usage (needs the built site running, ffmpeg, and BLOB_READ_WRITE_TOKEN from `vercel env pull`):
 //   pnpm build && pnpm start -p 3917 &
 //   node --env-file=.env.local scripts/gen-lesson-audio.mjs [--base http://localhost:3917]
-//        [--only course/slug] [--workers 3] [--dry-run]
+//        [--only course/slug] [--workers 3] [--dry-run] [--engine onnx|mlx] [--python <path>]
+// Engines: "onnx" (default) runs Kokoro on the CPU via onnxruntime-node (~7x real time with 3
+// workers on an M4). "mlx" runs it on the Apple Silicon GPU through scripts/kokoro_mlx_worker.py
+// (~16x+ with 2 workers); --python is that worker's Python (see its setup notes).
 // Unchanged lessons are skipped, so re-running after editing lessons only redoes those.
-import { fork, execFileSync } from "node:child_process";
+import { fork, execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -96,7 +99,9 @@ async function main() {
   let done = 0;
   await Promise.all(
     Array.from({ length: Math.min(workers, jobs.length) }, () => {
-      const child = fork(fileURLToPath(import.meta.url), ["--worker"], { stdio: ["inherit", "inherit", "inherit", "ipc"] });
+      const child = fork(fileURLToPath(import.meta.url), ["--worker", "--engine", arg("engine", "onnx"), "--python", arg("python", "python3")], {
+        stdio: ["inherit", "inherit", "inherit", "ipc"],
+      });
       return new Promise((resolve, reject) => {
         let finished = false;
         const next = () => {
@@ -134,14 +139,12 @@ function save(manifest) {
 // ---------------------------------------------------------------------------------------------
 
 async function worker() {
-  const { KokoroTTS } = await import("kokoro-js");
   const { put } = await import("@vercel/blob");
-  // fp32 is the reference-quality model and, on CPU, the fastest build.
-  const tts = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", { dtype: "fp32", device: "cpu" });
+  const generate = arg("engine", "onnx") === "mlx" ? await mlxEngine(arg("python", "python3")) : await onnxEngine();
 
   process.on("message", async (job) => {
     try {
-      process.send({ lesson: job.lesson, entry: await voiceLesson(tts, put, job) });
+      process.send({ lesson: job.lesson, entry: await voiceLesson(generate, put, job) });
     } catch (err) {
       process.send({ lesson: job.lesson, error: err instanceof Error ? err.message : String(err) });
     }
@@ -149,19 +152,69 @@ async function worker() {
   process.on("disconnect", () => process.exit(0));
 }
 
-async function voiceLesson(tts, put, { lesson, items }) {
+/** Kokoro on the CPU. Returns text => 24 kHz float samples. */
+async function onnxEngine() {
+  const { KokoroTTS } = await import("kokoro-js");
+  // fp32 is the reference-quality model and, on CPU, the fastest build.
+  const tts = await KokoroTTS.from_pretrained("onnx-community/Kokoro-82M-v1.0-ONNX", { dtype: "fp32", device: "cpu" });
+  return async (text) => {
+    const audio = await tts.generate(text, { voice: PREMADE_VOICE });
+    if (audio.sampling_rate !== SAMPLE_RATE) throw new Error(`unexpected sample rate ${audio.sampling_rate}`);
+    return audio.audio;
+  };
+}
+
+/** Kokoro on the Apple Silicon GPU, via a Python worker. Returns text => 24 kHz float samples. */
+async function mlxEngine(python) {
+  const script = path.join(root, "scripts", "kokoro_mlx_worker.py");
+  const child = spawn(python, ["-I", script], { stdio: ["pipe", "pipe", "inherit"] });
+  const dir = mkdtempSync(path.join(tmpdir(), "kokoro-mlx-"));
+  process.on("exit", () => {
+    child.kill();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const replies = [];
+  let buffered = "";
+  child.stdout.setEncoding("utf8").on("data", (data) => {
+    buffered += data;
+    let nl;
+    while ((nl = buffered.indexOf("\n")) >= 0) {
+      const line = buffered.slice(0, nl);
+      buffered = buffered.slice(nl + 1);
+      replies.shift()?.(JSON.parse(line));
+    }
+  });
+  const exited = new Promise((_, reject) => child.on("exit", (code) => reject(new Error(`MLX worker exited (${code})`))));
+  exited.catch(() => {});
+  let n = 0;
+  return async (text) => {
+    const out = path.join(dir, `${n++}.f32`);
+    const reply = await Promise.race([
+      new Promise((resolve) => {
+        replies.push(resolve);
+        child.stdin.write(JSON.stringify({ text, voice: PREMADE_VOICE, out }) + "\n");
+      }),
+      exited,
+    ]);
+    if (reply.error) throw new Error(reply.error);
+    const bytes = readFileSync(out);
+    rmSync(out);
+    return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + reply.samples * 4));
+  };
+}
+
+async function voiceLesson(generate, put, { lesson, items }) {
   const parts = [];
   const timings = [];
   let at = 0;
   for (let i = 0; i < items.length; i++) {
-    const audio = await tts.generate(items[i].text, { voice: PREMADE_VOICE });
-    if (audio.sampling_rate !== SAMPLE_RATE) throw new Error(`unexpected sample rate ${audio.sampling_rate}`);
+    const samples = await generate(items[i].text);
     const last = i === items.length - 1;
     const gap = last ? 0 : items[i + 1].block !== items[i].block ? BLOCK_GAP : PIECE_GAP;
     const silence = new Float32Array(Math.round(gap * SAMPLE_RATE));
-    parts.push(audio.audio, silence);
+    parts.push(samples, silence);
     const start = at;
-    at += audio.audio.length + silence.length;
+    at += samples.length + silence.length;
     // A piece's range runs to the next piece's start, so consecutive pieces play seamlessly.
     timings.push([items[i].key, +(start / SAMPLE_RATE).toFixed(3), +(at / SAMPLE_RATE).toFixed(3)]);
   }

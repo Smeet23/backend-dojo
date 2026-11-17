@@ -20,10 +20,10 @@ History: device voices (`speechSynthesis`) were rejected as too low quality. Pai
 `scripts/gen-lesson-audio.mjs`:
 1. Opens every lesson of the built site (`pnpm build && pnpm start -p 3917`) in headless Chrome (Playwright) and runs the same `collectBlocks` in the page. Some lessons stream their content as data the browser renders, so their raw HTML isn't enough.
 2. Skips lessons whose piece keys match the manifest, so only edited lessons are redone.
-3. Voices the rest in 3 worker processes (`onnxruntime-node`, fp32, ~7× real time in total on an M4). It inserts 0.12 s between pieces and 0.45 s between blocks, then encodes each lesson to a 40 kbps CBR mono MP3 (CBR keeps seeking exact; about 6 MB per 20 minutes).
+3. Voices the rest. `--engine mlx` (fastest) runs Kokoro on the Apple Silicon GPU through `scripts/kokoro_mlx_worker.py` (MLX, bf16, misaki pronunciation; ~16× real time with 2 workers on an M4). The default `--engine onnx` uses `onnxruntime-node` on the CPU (fp32, ~7× with 3 workers). It inserts 0.12 s between pieces and 0.45 s between blocks, then encodes each lesson to a 40 kbps CBR mono MP3 (CBR keeps seeking exact; about 6 MB per 20 minutes).
 4. Uploads `read-aloud/<course>/<slug>-<voice>-<hash>.mp3` (content-hashed, cached for a year) and saves the manifest after each lesson.
 
-Run it with `node --env-file=.env.local scripts/gen-lesson-audio.mjs` (needs `BLOB_READ_WRITE_TOKEN` from `vercel env pull`, plus ffmpeg). Use `--only course/slug` for one lesson and `--dry-run` to see what would change. Commit the updated `read-aloud-audio.json`. Old MP3s stay in the store until deleted.
+Run it with `node --env-file=.env.local scripts/gen-lesson-audio.mjs --engine mlx --workers 2 --python ~/.cache/grokstack-tts/bin/python` (one-time Python setup is at the top of `kokoro_mlx_worker.py`) (needs `BLOB_READ_WRITE_TOKEN` from `vercel env pull`, plus ffmpeg). Use `--only course/slug` for one lesson and `--dry-run` to see what would change. Commit the updated `read-aloud-audio.json`. Old MP3s stay in the store until deleted.
 
 ## Player (`src/components/lesson/ReadAloud.tsx`)
 - One `<audio>` element (`crossOrigin="anonymous"`), unlocked inside the first click for Safari. It plays the lesson MP3, or a WAV blob from the in-browser voice.
